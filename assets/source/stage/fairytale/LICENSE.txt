@@ -1,0 +1,19 @@
+Fairy-Tale 2D Backgrounds
+=========================
+
+Author   : as credited on the source page below (OpenGameArt)
+Source   : https://opengameart.org/content/fairy-tale-2d-backgrounds
+Licence  : OGA-BY 3.0  (https://opengameart.org/content/oga-by-30-faq)
+Fetched  : 2026-09-20
+Files    : _PNG/2/background.png, _PNG/2/1.png .. 3.png (unmodified originals)
+
+The OpenGameArt page does not ship a separate licence file, so this note is the
+licence record for the copy archived in this directory.
+
+Status: the shipped stage 3 backdrop does NOT use these layers.  Reduced to the
+game's 640x600 target they carry thousands of edge tones and cost ~18 kB of RLE
+against a ~63 KiB firmware budget, so tools/build_stage_backgrounds.py draws a
+broadleaf silhouette instead.  The pack stays in the repository on purpose: it
+is the intended art for stage 3 if the firmware ever finds the room.
+
+Before a public release, re-check the source page once.

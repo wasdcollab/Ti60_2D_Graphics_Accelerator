@@ -1,0 +1,19 @@
+Winter Pixel Art Background With Mountain
+=========================================
+
+Author   : as credited on the source page below (OpenGameArt)
+Source   : https://opengameart.org/content/winter-pixel-art-background-with-mountain
+Licence  : OGA-BY 3.0  (https://opengameart.org/content/oga-by-30-faq)
+Fetched  : 2026-09-20
+Files    : background.png, plan_1.png .. plan_5.png  (unmodified originals)
+
+The OpenGameArt page does not ship a separate licence file, so this note is the
+licence record for the copy archived in this directory.  Attribution for the
+whole project is carried in ../../SOURCES.md and in the game's own credits.
+
+Used as: stage 1 backdrop ("STAGE 1  FROZEN SHRINE"), a 640x600 plate produced
+by tools/build_stage_backgrounds.py (nearest-neighbour scaling, per-asset
+32-colour palette, RLE).
+
+Before a public release, re-check the source page once: the fetch that archived
+these files could not retrieve a licence document from it.

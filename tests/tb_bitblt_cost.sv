@@ -1,0 +1,310 @@
+`timescale 1ns/1ps
+// tb_bitblt_cost.sv -- BitBlt single-command cost + read-channel concurrency.
+// For each (op, geometry, read latency) it reports the command's cycle count
+// and, from the AXI side, the AR->RLAST round trip and the request-queue
+// depth.  That ratio is what says whether a command is latency-bound:
+//     cycles_per_row  ~=  round_trip / effective_concurrency
+module tb_bitblt_cost;
+
+    reg clk = 0;
+    always #5 clk = ~clk;
+    reg rst_n = 0;
+    reg  [15:0] pa = 0;
+    reg         ps = 0, pe = 0, pw = 0;
+    reg  [31:0] pd = 0;
+    wire [31:0] pr;
+    wire        pre, per;
+    wire [3:0]  arid, awid, wid, bid;
+    wire [27:0] araddr, awaddr;
+    wire [7:0]  arlen, awlen;
+    wire [2:0]  arsize, awsize;
+    wire [1:0]  arburst, arlock, awburst, awlock;
+    wire        arvalid, arready;
+    wire [127:0] rdata;
+    wire [1:0]  rresp = 2'b00;
+    wire        rlast, rvalid, rready;
+    wire [127:0] wdata;
+    wire [15:0] wstrb;
+    wire        wlast, wvalid, wready;
+    wire        awvalid, awready;
+    wire        bvalid, bready;
+    wire [27:0] next_base, right_next_base;
+    wire [7:0]  cpu_fps, fpga_fps;
+    wire [6:0]  i2c_addr;
+    wire        hud_dis;
+`ifdef BITBLT_COST_MB
+    localparam integer MAXB = `BITBLT_COST_MB;
+`else
+    localparam integer MAXB = 64;
+`endif
+    localparam [3:0] RID = 4'd2;
+    localparam [27:0] SRC_BASE = 28'h0160_0000;
+    localparam [27:0] DST_BASE = 28'h0080_0000;
+
+    bitblt_top #(
+        .MAX_BURST_BEATS (MAXB), .READ_FIFO_DEPTH (448), .READ_FIFO_AW (9),
+        .DST_FIFO_DEPTH (448), .DST_FIFO_AW (9)
+    ) dut (
+        .clk(clk), .rst_n(rst_n),
+        .apb_paddr(pa), .apb_psel(ps), .apb_penable(pe), .apb_pwrite(pw),
+        .apb_pwdata(pd), .apb_prdata(pr), .apb_pready(pre), .apb_pslverr(per),
+        .m_axi_arid(arid), .m_axi_araddr(araddr), .m_axi_arlen(arlen),
+        .m_axi_arsize(arsize), .m_axi_arburst(arburst), .m_axi_arlock(arlock),
+        .m_axi_arvalid(arvalid), .m_axi_arready(arready),
+        .m_axi_rid(RID), .m_axi_rdata(rdata), .m_axi_rresp(rresp),
+        .m_axi_rlast(rlast), .m_axi_rvalid(rvalid), .m_axi_rready(rready),
+        .m_axi_awid(awid), .m_axi_awaddr(awaddr), .m_axi_awlen(awlen),
+        .m_axi_awsize(awsize), .m_axi_awburst(awburst), .m_axi_awlock(awlock),
+        .m_axi_awvalid(awvalid), .m_axi_awready(awready),
+        .m_axi_wid(wid), .m_axi_wdata(wdata), .m_axi_wstrb(wstrb),
+        .m_axi_wlast(wlast), .m_axi_wvalid(wvalid), .m_axi_wready(wready),
+        .m_axi_bid(bid), .m_axi_bvalid(bvalid), .m_axi_bready(bready),
+        .vdma_next_base(next_base), .vdma_active_base(28'h0100_0000),
+        .vdma_right_next_base(right_next_base),
+        .vdma_right_active_base(28'h0100_0000),
+        .cpu_fps_bcd(cpu_fps), .fpga_fps_bcd(fpga_fps),
+        .scan_diagnostics(32'd0), .vsync_flag(1'b0),
+        .gamepad_joy_x(8'd128), .gamepad_joy_y(8'd128), .gamepad_buttons(5'd0),
+        .gamepad_online(1'b0), .key_sw0_level(1'b0), .key_sw2_level(1'b0),
+        .key_sw0_pulse(1'b0), .key_sw2_pulse(1'b0),
+        .i2c_slave_addr(i2c_addr), .force_hud_disable(hud_dis),
+        .weather_ctrl(), .color_matrix_ctrl(), .bloom_ctrl()
+    );
+
+    integer LAT = 120;
+    localparam integer RDQ = 4;
+    reg arready_r = 0, awready_r = 0, wready_r = 0, rvalid_r = 0, bvalid_r = 0;
+    reg [127:0] rdata_r = 0;
+    reg [8:0]  rd_left = 0;
+    reg [27:0] rd_cur = 0;
+    reg        rd_streaming = 0;
+    reg [27:0] rq_addr [0:RDQ-1];
+    reg [8:0]  rq_left [0:RDQ-1];
+    integer    rq_wait [0:RDQ-1];
+    integer    rq_head = 0, rq_tail = 0, rq_cnt = 0;
+    integer    ii, b_delay = 0;
+    // ---- AXI write back-pressure, the video_write_guard behaviour ------
+    // On the real board the scanout asserts video_priority while its line FIFO
+    // needs refilling, and video_write_guard then admits at most ONE write.
+    // That stalls the BitBlt write channel for as long as the scanout needs.
+    // This models it so the engine can be tested under that condition.
+    integer W_CYC = 0;      // 0 = never stall, else stall for W_CYC of every 1000
+    integer wstall_ph = 0;
+    integer n_wstall = 0;
+    reg        wr_active = 0;
+    integer    n_rd = 0, n_wr = 0, n_ar = 0, n_aw = 0;
+    integer    rt_t0 [0:255];
+    integer    ar_seq = 0;
+    integer    rt_sum = 0, rt_n = 0, rt_max = 0, rt_min = 999999;
+    integer    out_sum = 0, out_n = 0, out_max = 0;
+    longint    cyc = 0;
+
+    assign arready = arready_r;
+    assign awready = awready_r;
+    assign wready  = wready_r;
+    assign bvalid  = bvalid_r;
+    assign rvalid  = rvalid_r;
+    assign rlast   = rvalid_r && (rd_left == 9'd1);
+    assign rdata   = rdata_r;
+    wire ar_hs = arvalid && arready;
+    wire w_hs  = wvalid && wready;
+    wire aw_hs = awvalid && awready;
+
+    always @(negedge clk) arready_r <= (rq_cnt < RDQ);
+
+    always @(posedge clk) begin
+        cyc = cyc + 1;
+        if (rst_n) begin
+            if (ar_hs) begin
+                n_ar = n_ar + 1;
+                out_sum = out_sum + rq_cnt;
+                out_n = out_n + 1;
+                if (rq_cnt > out_max) out_max = rq_cnt;
+                rq_addr[rq_tail] = araddr;
+                rq_left[rq_tail] = {1'b0, arlen} + 9'd1;
+                rq_wait[rq_tail] = LAT;
+                rt_t0[ar_seq % 256] = cyc;
+                ar_seq = ar_seq + 1;
+                rq_tail = (rq_tail + 1) % RDQ;
+                rq_cnt  = rq_cnt + 1;
+            end
+            for (ii = 0; ii < RDQ; ii = ii + 1)
+                if ((ii < rq_cnt) && (rq_wait[(rq_head + ii) % RDQ] > 0))
+                    rq_wait[(rq_head + ii) % RDQ] = rq_wait[(rq_head + ii) % RDQ] - 1;
+            if ((rq_cnt > 0) && !rd_streaming && (rq_wait[rq_head] == 0)) begin
+                rd_streaming = 1'b1;
+                rd_cur  = rq_addr[rq_head];
+                rd_left = rq_left[rq_head];
+            end
+            if (rd_streaming && !rvalid_r) begin
+                rvalid_r <= 1'b1;
+                rdata_r  <= {96'h0, rd_cur[27:0]};
+                rd_cur   <= rd_cur + 28'd16;
+            end
+            if (rvalid_r && rready) begin
+                n_rd = n_rd + 1;
+                rvalid_r <= 1'b0;
+                rd_left  = rd_left - 9'd1;
+                if (rd_left == 9'd0) begin
+                    integer rt;
+                    rt = cyc - rt_t0[rt_n % 256];
+                    rt_sum = rt_sum + rt;
+                    rt_n = rt_n + 1;
+                    if (rt > rt_max) rt_max = rt;
+                    if (rt < rt_min) rt_min = rt;
+                    rd_streaming = 1'b0;
+                    rq_head = (rq_head + 1) % RDQ;
+                    rq_cnt  = rq_cnt - 1;
+                end
+            end
+            awready_r <= (bvalid_r === 1'b0) && (b_delay == 0);
+            begin : wstall_model
+            integer ph;
+            ph = wstall_ph;
+            wstall_ph = (wstall_ph + 1) % 1000;
+            if ((W_CYC > 0) && (ph < W_CYC)) begin
+                wready_r <= 1'b0;
+                n_wstall = n_wstall + 1;
+            end else begin
+                wready_r <= wr_active;
+            end
+        end
+            if (aw_hs) begin n_aw = n_aw + 1; wr_active <= 1'b1; end
+            if (w_hs) begin
+                n_wr = n_wr + 1;
+                if (wlast) begin wr_active <= 1'b0; b_delay <= 6; end
+            end
+            if (b_delay > 0) begin
+                b_delay <= b_delay - 1;
+                if (b_delay == 1) bvalid_r <= 1'b1;
+            end
+            if (bvalid_r && bready) bvalid_r <= 1'b0;
+        end
+    end
+
+    task apb_write(input [15:0] a, input [31:0] d);
+        begin
+            @(negedge clk); pa = a; pd = d; ps = 1'b1; pe = 1'b0; pw = 1'b1;
+            @(negedge clk); pe = 1'b1;
+            @(negedge clk); ps = 1'b0; pe = 1'b0; pw = 1'b0;
+        end
+    endtask
+    task apb_read(input [15:0] a, output [31:0] d);
+        begin
+            @(negedge clk); pa = a; ps = 1'b1; pe = 1'b0; pw = 1'b0;
+            @(negedge clk); pe = 1'b1;
+            d = pr;
+            @(negedge clk); ps = 1'b0; pe = 1'b0;
+        end
+    endtask
+
+    reg [31:0] status;
+    integer guard, n_cmds = 0;
+    longint t0, worst = 0;
+    integer cc, cyc_per_row, rtb;
+
+    task run_cmd(input [1:0] op, input [27:0] src, input [27:0] dst,
+                 input [10:0] w, input [10:0] h,
+                 input [15:0] ss, input [15:0] ds, output integer ocyc);
+        begin
+            apb_write(16'h18, {30'd0, op});
+            apb_write(16'h68, 32'd1);
+            apb_write(16'h1C, src);
+            apb_write(16'h04, dst);
+            apb_write(16'h08, {21'd0, w});
+            apb_write(16'h0C, {21'd0, h});
+            apb_write(16'h30, {16'd0, ss});
+            apb_write(16'h48, {16'd0, ds});
+            t0 = cyc;
+            apb_write(16'h14, 32'd1);
+            guard = 0;
+            apb_read(16'h00, status);
+            while ((status[1] == 1'b0) && (guard < 2000000)) begin
+                apb_read(16'h00, status);
+                guard = guard + 1;
+            end
+            if (status[1] == 1'b0) $fatal(1, "DONE timeout op=%0d w=%0d h=%0d", op, w, h);
+            ocyc = cyc - t0;
+            n_cmds = n_cmds + 1;
+            if (ocyc > worst) worst = ocyc;
+            repeat (2) @(negedge clk);
+        end
+    endtask
+
+    task bench(input [1:0] op, input [10:0] w, input [10:0] h,
+               input [15:0] ss, input [15:0] ds, input [31:0] tag);
+        begin
+            rt_sum = 0; rt_n = 0; rt_max = 0; rt_min = 999999;
+            out_sum = 0; out_n = 0; out_max = 0;
+            run_cmd(op, SRC_BASE, DST_BASE, w, h, ss, ds, cc);
+            cyc_per_row = cc / h;
+            rtb = (rt_n > 0) ? (rt_sum / rt_n) : 0;
+            $display("COST %s op=%0d w=%0d h=%0d cyc=%0d cyc_row=%0d rt_avg=%0d rt_max=%0d qavg=%0d qmax=%0d bursts=%0d",
+                     tag, op, w, h, cc, cyc_per_row, rtb, rt_max,
+                     (out_n > 0) ? (out_sum * 100 / out_n) : 0, out_max, rt_n);
+        end
+    endtask
+
+    integer i;
+    initial begin
+        repeat (10) @(negedge clk);
+        rst_n = 1;
+        repeat (10) @(negedge clk);
+        LAT = 120;
+        $display("---- A: same geometry, three ops, LAT=%0d ----", LAT);
+        bench(2'd1, 11'd8,  11'd8,  16'd32,  16'd8192, "COPY8x8");
+        bench(2'd3, 11'd8,  11'd8,  16'd32,  16'd8192, "ADD_8x8");
+        bench(2'd2, 11'd8,  11'd8,  16'd32,  16'd8192, "ALPH8x8");
+        bench(2'd1, 11'd16, 11'd512, 16'd64, 16'd8192, "COPY16x512");
+        bench(2'd3, 11'd16, 11'd512, 16'd64, 16'd8192, "ADD_16x512");
+        bench(2'd1, 11'd112, 11'd112, 16'd448, 16'd8192, "COPY112x112");
+        bench(2'd0, 11'd4, 11'd768, 16'd8192, 16'd8192, "FILL4x768");
+        bench(2'd1, 11'd1005, 11'd8, 16'd8192, 16'd8192, "COPY1005x8");
+        bench(2'd1, 11'd1366, 11'd768, 16'd8192, 16'd8192, "COPYfull");
+        for (i = 0; i < 6; i = i + 1) begin
+            LAT = 60 + i * 600;
+            $display("---- B: latency sweep, LAT=%0d ----", LAT);
+            bench(2'd3, 11'd8,  11'd8,  16'd32,  16'd8192, "ADD_8x8");
+            bench(2'd3, 11'd16, 11'd512, 16'd64, 16'd8192, "ADD_16x512");
+            bench(2'd3, 11'd48, 11'd512, 16'd192, 16'd8192, "ADD_48x512");
+            bench(2'd3, 11'd64, 11'd512, 16'd256, 16'd8192, "ADD_64x512");
+            bench(2'd3, 11'd40, 11'd512, 16'd160, 16'd8192, "ADD_40x512");
+            bench(2'd3, 11'd32, 11'd512, 16'd128, 16'd8192, "ADD_32x512");
+            bench(2'd1, 11'd1366, 11'd768, 16'd8192, 16'd8192, "COPYfull");
+        end
+        // ---- write-stall stress: does the engine survive a blocked write? ----        $display("---- C: AXI write back-pressure (video_priority model) ----");
+        W_CYC = 200;   // stall the write channel 20% of the time
+        $display("WSTALL duty=20%% LAT=%0d", LAT);
+        bench(2'd1, 11'd1366, 11'd768, 16'd8192, 16'd8192, "w-stall-full");
+        bench(2'd3, 11'd16, 11'd512, 16'd64, 16'd8192, "w-stall-beam");
+        bench(2'd1, 11'd112, 11'd112, 16'd448, 16'd8192, "w-stall-burst");
+        bench(2'd1, 11'd177, 11'd88, 16'd8192, 16'd8192, "w-stall-hud");
+        W_CYC = 500;   // half the time - much harsher than the board
+        $display("WSTALL duty=50%% LAT=%0d", LAT);
+        bench(2'd1, 11'd1366, 11'd768, 16'd8192, 16'd8192, "w-stall-full");
+        bench(2'd3, 11'd16, 11'd512, 16'd64, 16'd8192, "w-stall-beam");
+        W_CYC = 0;
+        // SNPCHECK: does the stall snapshot actually capture a slow command?
+        begin
+            reg [31:0] sp_worst, sp_cnt, sp_op, sp_wh, sp_probe;
+            apb_read(16'h90, sp_worst);
+            apb_read(16'h94, sp_cnt);
+            apb_read(16'h98, sp_op);
+            apb_read(16'h9C, sp_wh);
+            apb_read(16'hA8, sp_probe);
+            $display("SNPCHECK worst=%0d cnt=%0d op=%0d wh=%0d probe=%h",
+                     sp_worst, sp_cnt, sp_op, sp_wh, sp_probe);
+            if (sp_cnt == 0)
+                $display("SNPCHECK NOTE: no command exceeded the 1 ms snapshot limit");
+            else
+                $display("SNPCHECK OK: snapshot captured %0d slow command(s)", sp_cnt);
+        end
+        $display("COSTPASS cmds=%0d worst=%0d", n_cmds, worst);
+        $finish;
+    end
+
+    initial begin
+        #1200000000;
+        $fatal(1, "global timeout");
+    end
+endmodule

@@ -1,0 +1,15 @@
+2D Platformer Volcano Pack 1.1
+==============================
+
+Author   : Tio Aimar
+Source   : https://opengameart.org/content/2d-platformer-volcano-pack-11
+Licence  : CC0  (public domain dedication)
+Fetched  : 2026-09-20
+Files    : bg_volcano.png, bg_volcano_layers/bg_volcano_1..6.png (unmodified)
+
+CC0 needs no attribution, but the project credits the author anyway - see
+../../SOURCES.md.
+
+Used as: stage 2 backdrop ("STAGE 2  VOLCANIC HOLLOW").  Only bg_volcano.png is
+read; tools/build_stage_backgrounds.py redraws the cone, the rock rims, the
+eruption and the lava lake at 640x600 from that pack's palette.

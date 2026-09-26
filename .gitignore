@@ -1,0 +1,44 @@
+# =============================================================================
+# Ti60 2D Graphics Accelerator
+#
+# Rule: SOURCES, TESTBENCHES, SCRIPTS and DOCUMENTS are tracked.  Anything a
+# build, a synthesis run or a simulation regenerates is not - an ignored file
+# stays on disk exactly where it is, it just never enters history.
+# =============================================================================
+
+# ---- Efinity synthesis / place & route / bitstream output --------------------
+/outflow/
+/work_syn/
+/work_pnr/
+/ooc/
+/tmp/
+/temp/
+
+# ---- RTL simulation scratch ---------------------------------------------------
+/work_sim/
+*.vvp
+*.vcd
+*.fst
+simulator/cache/
+simulator/output/
+*.pkl
+
+# ---- firmware build products (sw/build_firmware.bat regenerates them) ---------
+/sw/build/
+/sw/__pycache__/
+
+# ---- Efinity-generated SoC + BRAM image (regenerate_soc.bat) -----------------
+/ip/soc/
+/embedded_sw/soc/
+
+# ---- downloaded toolchain runtime (tools/setup_iverilog_portable.ps1) --------
+/tools/rtl_runtime/
+
+# ---- python bytecode ----------------------------------------------------------
+__pycache__/
+*.pyc
+
+# ---- editor / OS noise --------------------------------------------------------
+Thumbs.db
+desktop.ini
+*.swp
