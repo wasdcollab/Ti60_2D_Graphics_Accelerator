@@ -71,6 +71,10 @@ HARNESS_SYMBOLS = (
     # same frame - so "the ring is in the right place" can only be graded by
     # reading the anchor back, not by looking for the craft near it.
     "hit_ring_timer", "hit_ring_x", "hit_ring_y",
+    # the two end screens.  "GAME OVER" and "ALL CLEAR" are minutes of play
+    # apart, and what a scenario has to grade is the panel's weather occlusion
+    # box - so the state that raises the panel is forced, not played to.
+    "game_over", "restart_timer", "game_clear",
 )
 
 SOURCES = [

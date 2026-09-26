@@ -1353,6 +1353,17 @@ static void sprites_build(void)
 #define ITEM_SLOW         5
 #define ITEM_JAM          6
 
+/* Two of the seven drops are not prizes.  A slow or a jam used to pay the same
+ * 50 points as a heal, so a penalty the player failed to dodge read as a reward
+ * on the score popup and there was no reason to prefer missing one.  They now
+ * cost the effect and nothing else - no points either way - and the renderer
+ * asks the same predicate whether to paint them as a hazard, so "this one is
+ * bad for you" is decided in exactly one place. */
+static inline int item_is_debuff(uint8_t type)
+{
+    return type == ITEM_SLOW || type == ITEM_JAM;
+}
+
 #define BOSS_NONE         0
 #define BOSS_ENTER        1
 #define BOSS_FIGHT        2
@@ -2408,7 +2419,10 @@ static void take_hit(void)
 static void apply_item(uint8_t type)
 {
     items_taken++;
-    score_award(50u, player_x, player_y - 24);
+    /* The counter still counts a debuff - the player did take it - but the score
+     * does not: a penalty pays nothing, in either direction. */
+    if (!item_is_debuff(type))
+        score_award(50u, player_x, player_y - 24);
     switch (type) {
     case ITEM_HEAL:
         if (lives < 6) lives++;                          /* capped, no wrap */
@@ -4462,7 +4476,7 @@ static void game_render(uint32_t fb)
             "HEAL", "RATE", "ATK", "SHOT", "PTS", "SLOW", "JAM"
         };
         int x = it->x - 42, y = it->y - 8;
-        int bad = it->type == ITEM_SLOW || it->type == ITEM_JAM;
+        int bad = item_is_debuff(it->type);
         if (x < GAME_LEFT + 4) x = GAME_LEFT + 4;
         if (x > GAME_RIGHT - 92) x = GAME_RIGHT - 92;
         if (y > SCREEN_HEIGHT - 32) y = SCREEN_HEIGHT - 32;
@@ -5560,6 +5574,10 @@ static void game_render_pass(uint32_t fb)
 
     if (game_over && restart_timer) {
         r_fill(fb, SCREEN_WIDTH, SCREEN_HEIGHT, 0x00100010u, SCREEN_STRIDE);
+        /* A full-screen panel, and it is not the battlefield any more, so it
+         * claims the whole screen: a flake sitting on "GAME OVER" is the same
+         * defect as one sitting on the pause card. */
+        weather_box_cover(0, 0, (int)SCREEN_WIDTH - 1, (int)SCREEN_HEIGHT - 1);
         /* "GAME OVER" is 9 glyphs at scale 6: 9*7*6 = 378 wide, so the
          * centred anchor is 494, not the 372 the 1024-wide layout used.
          * Vertically it sits a little above centre. */
@@ -5585,6 +5603,9 @@ static void game_render_pass(uint32_t fb)
          * centred on its own width (9 and 22 glyphs at 7*scale of advance). */
         r_fill(fb + 300u * SCREEN_STRIDE + 411u * 4u, 544, 168,
                0x00171B34u, SCREEN_STRIDE);
+        /* The panel is opaque, so the snow layer has to be told to leave this
+         * rectangle alone - the same rule as the pause card. */
+        weather_box_cover(411, 300, 411 + 544 - 1, 300 + 168 - 1);
         draw_text(fb, (SCREEN_WIDTH - 9 * 7 * 5) / 2, 332, "ALL CLEAR", 5,
                   0x00FFE4A0u);
         draw_text(fb, (SCREEN_WIDTH - 22 * 7 * 2) / 2, 392,

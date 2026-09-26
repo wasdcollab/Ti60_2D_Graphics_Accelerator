@@ -1411,6 +1411,7 @@ SPELL_MAX_CHARGE = 8                    # must mirror BOMB_MAX_CHARGE in main.c
 ATK_MAX = 4
 WEAPON_CENTER, WEAPON_SPREAD, WEAPON_LASER, WEAPON_FAN = 0, 1, 2, 3
 ITEM_HEAL, ITEM_RATE, ITEM_ATK, ITEM_WEAPON = 0, 1, 2, 3
+ITEM_SCORE, ITEM_SLOW, ITEM_JAM = 4, 5, 6      # must mirror main.c's item table
 
 BOSS_ENTER, BOSS_FIGHT, BOSS_DIALOG = 1, 2, 4
 BOSS_FREEZE = 5                      # the hold before a spell card
@@ -3517,6 +3518,96 @@ def run_stage3_skills(code, output_dir=None):
     return vm
 
 
+def run_item_rewards(code, output_dir=None):
+    """Debuffs pay nothing, and both end screens claim their own snow-free box."""
+    print("\n" + "=" * 65)
+    print(" [TEST 25] Item rewards and the two end screens")
+    print("=" * 65)
+    vm = new_vm(code)
+    start_game(vm)
+    vm.btn = raw_btn()                  # no trigger held: nothing is being shot
+
+    def box_now(label):
+        """The occlusion box the firmware published, as (x0, y0, x1, y1)."""
+        x = vm.params.get(0x8C, 0)
+        assert x >> 31, "%s published no weather occlusion box" % label
+        y = vm.params.get(0xAC, 0)
+        return (x & 0x7FF, y & 0x7FF, (x >> 11) & 0x7FF, (y >> 11) & 0x7FF)
+
+    # ---- 1. what a pickup is worth ---------------------------------------
+    # A heal pays its flat 50; a SLOW or a JAM pays nothing at all.  The player
+    # still took it - the counter moves and the effect lands - but a penalty the
+    # player failed to dodge must not read as a reward on the score popup, and
+    # dodging one has to be worth something.
+    def pickup(type_, label):
+        clear_pool(vm, EBULLET_BASE, EBULLET_COUNT, 8, 6)
+        clear_pool(vm, ENEMY_BASE, ENEMY_COUNT, ENEMY_STRIDE, 13)
+        score0, taken0 = tlm(vm, 'score'), tlm(vm, 'taken')
+        assert feed_item(vm, tlm(vm, 'player_x'), tlm(vm, 'player_y'), type_), \
+            "%s was never picked up" % label
+        for _ in range(TICK * 2):
+            vm.step()
+        return tlm(vm, 'score') - score0, tlm(vm, 'taken') - taken0
+
+    gain, took = pickup(ITEM_HEAL, "HEAL")
+    assert took == 1, "the pickup counter missed the HEAL"
+    assert gain == 50, "a HEAL paid %d points, expected the flat 50" % gain
+    print("  -> HEAL: taken, +%d points" % gain)
+
+    gain, took = pickup(ITEM_SCORE, "PTS")
+    assert took == 1, "the pickup counter missed the PTS drop"
+    assert gain == 550, "a PTS drop paid %d, expected 50 + its own 500" % gain
+    print("  -> PTS : taken, +%d points" % gain)
+
+    for type_, label, field in ((ITEM_SLOW, "SLOW", 'slow'),
+                                (ITEM_JAM, "JAM", 'jam')):
+        gain, took = pickup(type_, label)
+        assert took == 1, "the pickup counter missed the %s" % label
+        assert gain == 0, \
+            "a %s paid %d points: a debuff is not a prize" % (label, gain)
+        assert tlm(vm, field) > 0, "the %s had no effect at all" % label
+        print("  -> %s: taken, +0 points, %s timer %d"
+              % (label, label, tlm(vm, field)))
+
+    # ---- 2. GAME OVER is a full-screen panel -----------------------------
+    # Both end screens are framebuffer pixels with the snow composited above
+    # them, so each has to publish the rectangle the scanout must leave alone.
+    # They are minutes of play apart, so the state that raises each one is
+    # forced and the box is what gets graded.
+    poke(vm, sym_addr('game_over'), 1, 1)
+    poke(vm, sym_addr('restart_timer'), 60, 1)
+    # Stepped rather than waited on: the game-frame counter is what wait_frames()
+    # watches, and it stops advancing the moment the run is over.  Three display
+    # frames is one more than the renderer needs to reach the GAME OVER branch.
+    for _ in range(TICK * 3):
+        vm.step()
+    x0, y0, x1, y1 = box_now("GAME OVER")
+    assert (x0, y0, x1, y1) == (0, 0, 1365, 767), \
+        "GAME OVER published the box %s, not the whole screen" % ((x0, y0, x1, y1),)
+    print("  -> GAME OVER: occlusion box x %d..%d y %d..%d" % (x0, x1, y0, y1))
+
+    # ---- 3. ALL CLEAR covers its own panel -------------------------------
+    poke(vm, sym_addr('game_over'), 0, 1)
+    poke(vm, sym_addr('game_clear'), 1, 1)
+    for _ in range(TICK * 3):
+        vm.step()
+    x0, y0, x1, y1 = box_now("ALL CLEAR")
+    # The stage banner shares the frame for the first 170 frames of a stage and
+    # the box is the union of everything that is up, so what is graded is "the
+    # panel is covered", not "the box is exactly the panel".
+    assert x0 <= 411 and y0 <= 300 and x1 >= 954 and y1 >= 467, \
+        "the ALL CLEAR panel (411..954 x 300..467) is not covered: box %s" % (
+            (x0, y0, x1, y1),)
+    print("  -> ALL CLEAR: occlusion box x %d..%d y %d..%d" % (x0, x1, y0, y1))
+
+    print("  [PASS] debuffs pay nothing; both end screens are punched out of "
+          "the weather layer")
+    if output_dir:
+        save_frame(vm, vm.right_request, Path(output_dir) / "test25_all_clear.bmp",
+                   Path(output_dir) / "test25_all_clear.png")
+    return vm
+
+
 def suite_catalog(code, out_dir):
     """(id, description, callable) for every scenario the workbench knows."""
     return [
@@ -3569,6 +3660,8 @@ def suite_catalog(code, out_dir):
         ("skills3",  "Stage 3 skills: sway / beams / death burst / tornado / "
                       "bouncing lance",
          lambda: run_stage3_skills(code, out_dir)),
+        ("rewards",  "Item rewards: debuffs pay nothing; end-screen boxes",
+         lambda: run_item_rewards(code, out_dir)),
     ]
 
 
@@ -3576,7 +3669,7 @@ GROUPS = {
     "render":   ["render", "colorkey", "alpha"],
     "play":     ["spawn", "controls", "clamp", "menu"],
     "regress":  ["weaponcap", "invuln", "hitsweep", "edge", "bulletpool",
-                 "sticknoise", "spellcard"],
+                 "sticknoise", "spellcard", "rewards"],
     "stage1":   ["impactfx", "hudfx", "bossdream", "bombbounds"],
     "stage2":   ["bossopener", "skills"],
     "stage3":   ["skills3"],
