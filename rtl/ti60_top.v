@@ -707,6 +707,8 @@ module ti60_top #(
     wire [31:0] blit_weather_ctrl;
     wire [31:0] blit_weather_mask_x;
     wire [31:0] blit_weather_mask_y;
+    wire [23:0] blit_laser_colx_lo;
+    wire [23:0] blit_laser_colx_hi;
     // Live BitBlt engine probe.  Sourced inside bitblt_top (read master queue
     // depth / AR pending / stride_gen state) and published on APB 0x74 so the
     // firmware can see WHERE the engine is stuck, not just THAT it is stuck.
@@ -753,6 +755,7 @@ module ti60_top #(
         .weather_ctrl   (blit_weather_ctrl),
         .weather_mask_x (blit_weather_mask_x),
         .weather_mask_y (blit_weather_mask_y),
+        .laser_colx     ({blit_laser_colx_hi, blit_laser_colx_lo}),
         .vsync_flag           (vdma_vsync_flag),
 
         // Video Output
@@ -898,6 +901,8 @@ module ti60_top #(
         .weather_ctrl       (blit_weather_ctrl),
         .weather_mask_x     (blit_weather_mask_x),
         .weather_mask_y     (blit_weather_mask_y),
+        .laser_colx_lo      (blit_laser_colx_lo),
+        .laser_colx_hi      (blit_laser_colx_hi),
         .color_matrix_ctrl  (blit_color_matrix_ctrl),
         .bloom_ctrl         (blit_bloom_ctrl)
     );

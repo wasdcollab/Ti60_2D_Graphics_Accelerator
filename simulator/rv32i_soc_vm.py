@@ -779,6 +779,11 @@ class SapphireSoCVM:
         elif off == 0xAC:
             # Weather occlusion box, Y half: {10'd0, y1[10:0], y0[10:0]}
             self.params[0xAC] = val
+        elif off == 0xB0 or off == 0xB4:
+            # Laser column centres, two 12-bit x per word.  The scanout draws the
+            # columns; the VM has no scanout, but a scenario can still read back
+            # where the firmware aimed them.
+            self.params[off] = val
         elif off == 0x80:
             # Asset ROM index (0x84 reads the byte back).  Modelled because the
             # firmware's boot path depends on it; see _load_asset_rom().

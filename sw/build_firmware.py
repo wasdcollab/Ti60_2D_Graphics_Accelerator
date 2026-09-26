@@ -75,6 +75,10 @@ HARNESS_SYMBOLS = (
     # apart, and what a scenario has to grade is the panel's weather occlusion
     # box - so the state that raises the panel is forced, not played to.
     "game_over", "restart_timer", "game_clear",
+    # the cut/beam lasers: a scenario has to raise one on demand to price what a
+    # beam frame costs the engine, without waiting for the boss to roll that
+    # attack.
+    "beam_x", "beam_timer", "beam_phase",
 )
 
 SOURCES = [

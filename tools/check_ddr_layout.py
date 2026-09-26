@@ -53,12 +53,12 @@ SIZES = {
     "MM_BOSS_DREAM":      (64 * 256,         "64x64, stride 256"),
     "MM_LASER_GLOW":      (16 * 4 * 768,     "16x768, stride 64"),
     "MM_SHADE_SPRITE":    (24 * 96,          "24x24, stride 96"),
-    "MM_EBULLET_TILE":    (8 * 48 * 9,       "eight 9x9 tiles at a 48 pitch"),
+    "MM_EBULLET_TILE":    (8 * 64 * 13,      "eight 13x13 tiles at a 64 pitch"),
     # The three banks the merged-tile work added.  They were checked by hand
     # when they landed and by nothing since, so they are exactly the class of
     # surface this file exists to police.
     "MM_PBULLET_TILE":    (8 * 32 * 26,      "eight 7x26 shot tiles at a 32 pitch"),
-    "MM_EBULLET_DIRTILE": (8 * 16 * 48 * 9,  "8 colours x 16 headings, 9x9 at 48"),
+    "MM_EBULLET_DIRTILE": (8 * 16 * 64 * 13, "8 colours x 16 headings, 13x13 at 64"),
     "MM_HUD_LABELS":      (22 * 512 * 8,     "22 captions, 128x8 at a 512 pitch"),
     "MM_PORTRAIT":        (240 * 240 * 4,    "portrait_build: 48x48 at scale 5"),
     "MM_FONT_TABLE":      (6 * 4,            "six uint32_t atlas bases"),

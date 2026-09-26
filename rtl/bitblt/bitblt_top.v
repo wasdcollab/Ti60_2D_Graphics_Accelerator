@@ -126,6 +126,9 @@ module bitblt_top #(
     // stop on the way out of the register file.
     output wire [31:0]  weather_mask_x,
     output wire [31:0]  weather_mask_y,
+    // Where the scanout's four laser columns stand (APB 0xB0 / 0xB4).
+    output wire [23:0]  laser_colx_lo,
+    output wire [23:0]  laser_colx_hi,
     output wire [31:0]  color_matrix_ctrl,
     output wire [31:0]  bloom_ctrl
 );
@@ -299,6 +302,8 @@ module bitblt_top #(
         .weather_ctrl           (weather_ctrl),
         .weather_mask_x         (weather_mask_x),
         .weather_mask_y         (weather_mask_y),
+        .laser_colx_lo          (laser_colx_lo),
+        .laser_colx_hi          (laser_colx_hi),
         .color_matrix_ctrl      (color_matrix_ctrl),
         .bloom_ctrl             (bloom_ctrl)
     );

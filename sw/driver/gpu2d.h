@@ -103,6 +103,27 @@ extern "C" {
 #define GPU2D_REG_WEATHER_MASK_X  (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x8C))
 #define GPU2D_REG_WEATHER_MASK_Y  (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xAC))
 
+/**
+ * @brief Laser column centres (Phase 2 task 02 follow-up).
+ *
+ * The scanout draws the boss's four laser columns itself (rtl/v_dma/video_laser.v)
+ * - four 16x768 bars are 3,072 DRAM row activations a frame, which is where the
+ * spell card used to lose its frame time.  The hardware knows the shape; what it
+ * cannot know is WHERE the columns stand, so the firmware writes the four centres:
+ *
+ *     0xB0  columns 0 and 1   {8'd0, x1[11:0], x0[11:0]}
+ *     0xB4  columns 2 and 3   {8'd0, x3[11:0], x2[11:0]}
+ *
+ * The opener parks them at its fixed four; the cut/beam lasers move three of them
+ * wherever the boss aims.  A centre of 0 parks that column off screen (the
+ * playfield starts at x = 181), which is how three beams are stood up where the
+ * opener had four.  Both words land on the scanline logic at the same frame edge
+ * the weather control word does, so a column can never appear at the previous
+ * frame's x.
+ */
+#define GPU2D_REG_LASER_COLX_LO   (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xB0))
+#define GPU2D_REG_LASER_COLX_HI   (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xB4))
+
 #define GPU2D_REG_COLOR_MATRIX    (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x7C))
 #define GPU2D_REG_BLOOM_CTRL      (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x88))
 

@@ -195,16 +195,11 @@
  * frame with a single COPY: the engine pays per command and per DRAM row,
  * and these shapes were paying both for a few dozen pixels.
  *
- * Enemy bullet: socket + licensed 7x7 tile + core dot, one tile per shot
- * colour.  Stride 48 rather than 36 - the engine rejects strides that are
- * not a multiple of 16. */
-#define MM_EBULLET_TILE        0x01632000UL
-#define MM_EBULLET_TILE_W      9
-/* STRIDE is a BYTE count: it is what r_blit() takes, and the engine requires
- * a multiple of 16.  Anyone indexing a uint32_t pointer with it must divide by
- * four first - ebullet_dirtile_build() did not, and every composed tile came
- * out as garbage four rows out of place. */
-#define MM_EBULLET_TILE_STRIDE 48
+ * Enemy bullet: 13x13 high-visibility Touhou-style energy orb with pure white hot core
+ * and multi-layer pseudo-alpha halo. Stride 64 (13 px -> 52 B rounded to 16). */
+#define MM_EBULLET_TILE        0x01670000UL
+#define MM_EBULLET_TILE_W      13
+#define MM_EBULLET_TILE_STRIDE 64
 #define MM_EBULLET_TILE_BYTES  (MM_EBULLET_TILE_STRIDE * MM_EBULLET_TILE_W)
 
 /* ---- merged sprite tiles ------------------------------------------------
@@ -238,17 +233,11 @@
 #define MM_PBULLET_TILE_BYTES  (MM_PBULLET_TILE_STRIDE * MM_PBULLET_TILE_H)
 #define MM_PBULLET_TILE_COUNT  8
 
-/* Enemy shot: the same 9x9 socket tile, but one copy per (colour, direction).
- * The 2x2 speck enemy_bullet_render() FILLed at (x - vx, y - vy) is baked in,
- * so the tile is a function of the shot's colour AND its heading.  Keeping the
- * 9x9 footprint (instead of growing it to hold the speck at full offset) is
- * deliberate: a grown tile would reach two pixels into the HUD gutter at the
- * left edge of the playfield, and nothing repaints the gutter afterwards, so
- * the speck is CLAMPED inside the tile instead.  It is a 2x2 dark dot whose
- * whole job is to show which way the shot is going. */
-#define MM_EBULLET_DIRTILE        0x01635000UL
-#define MM_EBULLET_DIRTILE_W      9
-#define MM_EBULLET_DIRTILE_STRIDE 48   /* BYTES, as above */
+/* Enemy shot: 13x13 aerodynamic sharp directional rice/arrow bullet, one copy
+ * per (colour, direction). 8 colours x 16 directions at stride 64. */
+#define MM_EBULLET_DIRTILE        0x01672000UL
+#define MM_EBULLET_DIRTILE_W      13
+#define MM_EBULLET_DIRTILE_STRIDE 64   /* BYTES, 13 px -> 52 B rounded to 16 */
 #define MM_EBULLET_DIRTILE_BYTES  (MM_EBULLET_DIRTILE_STRIDE * MM_EBULLET_DIRTILE_W)
 #define MM_EBULLET_DIRTILE_DIRS   16
 #define MM_EBULLET_DIRTILE_COUNT  (8 * MM_EBULLET_DIRTILE_DIRS)

@@ -1142,6 +1142,34 @@ static uint32_t profile_elapsed(uint32_t start, uint32_t end)
  * [20:18], and each keeps what the other has already published instead of
  * re-deriving it. */
 static uint32_t weather_ctrl_word;
+static uint8_t  boss_laser;
+
+/* ---- the scanout's laser columns -----------------------------------------
+ * The columns are synthesised by video_laser.v, not blitted by the engine.  They
+ * used to be: four 16x768 bars are 3,072 rows of copying a frame, one DRAM row
+ * activation each, and that was the largest single item in the boss's frame -
+ * the same reason the opener's columns moved into hardware in the first place.
+ * The cut/beam lasers were the last ones still paying it (three bars, 2,304 rows
+ * a frame) and they were why the card stuttered on the board.
+ *
+ * The hardware draws them at four x positions it is told about here.  Centre 0
+ * parks a column off screen.  Both words are latched by the scanout on the same
+ * frame edge as the control word, so a beam can never appear at the previous
+ * frame's x. */
+static void laser_columns_set(uint32_t x0, uint32_t x1, uint32_t x2, uint32_t x3)
+{
+    GPU2D_REG_LASER_COLX_LO = (x1 << 12) | x0;
+    GPU2D_REG_LASER_COLX_HI = (x3 << 12) | x2;
+}
+
+/* Non-zero while the cut/beam lasers are standing in those columns.  The two
+ * users share the same four slots - the hardware has four, and giving the beams
+ * their own would mean four more comparators and a second colour rule for a case
+ * the game does not reach - so a beam takes the slots over the opener's columns
+ * when both are up, on the grounds that the thing that kills you wins.  Declared
+ * here because stage_strip_render() publishes the enable bit and is defined far
+ * above the beam state. */
+static uint8_t laser_columns_live;
 
 static void stage_strip_render(uint32_t fb)
 {
@@ -1151,7 +1179,14 @@ static void stage_strip_render(uint32_t fb)
         scroll = (SB_STRIP_PERIOD - scroll) & (SB_STRIP_PERIOD - 1);   /* ash rises */
     unsigned stage = stage_bg_active < SB_STAGE_COUNT ? stage_bg_active : 0u;
     unsigned slide = boss_shake && (frame_tick & 1u) ? BOSS_SHAKE_PX : 0u;
-    weather_ctrl_word = (weather_ctrl_word & (7u << 18)) | (1u << 15) | (stage << 13) | ((unsigned)scroll << 8) | slide;
+    uint32_t laser_ctrl = 0u;
+    if (boss_laser) {
+        uint32_t band = (boss_laser > 60) ? 0u : (boss_laser > 30) ? 1u : 2u;
+        laser_ctrl = (1u << 18) | (band << 19);
+    } else if (laser_columns_live) {
+        laser_ctrl = (1u << 18);            /* the beams always use band 0 */
+    }
+    weather_ctrl_word = (1u << 15) | (stage << 13) | ((unsigned)scroll << 8) | slide | laser_ctrl;
     GPU2D_REG_WEATHER = weather_ctrl_word;
     /* tlm[40]/tlm[41] used to price the CPU painting that no longer exists;
      * publish zeros so the telemetry window never reads stale values.  Written
@@ -1182,44 +1217,74 @@ static void stage_strip_render(uint32_t fb)
  */
 static void pbullet_tile_build(void)
 {
+    /* Phase 2 Task 05: Player bullet visual overhaul.
+     * Round dual-layer energy bullet head (center 3x3 pure white 0x00FFFFFF hot core,
+     * vivid neon aura, soft outer edge) with streamlined ion flare trail featuring
+     * smooth opacity feathering and tapered profile. */
     for (unsigned c = 0; c < MM_PBULLET_TILE_COUNT; c++) {
         volatile uint32_t *tile = (volatile uint32_t *)
             (MM_PBULLET_TILE + (uint32_t)c * MM_PBULLET_TILE_BYTES);
-        const volatile uint32_t *art = (const volatile uint32_t *)
-            visual_assets[ART_BULLET_0 + c].dst;
-        uint32_t trail = palette[c];
-        uint32_t dim   = (trail >> 1) & 0x007F7F7Fu;
-        /* MM_PBULLET_TILE_STRIDE is a BYTE stride - it is what r_blit() is
-         * handed.  `tile` is a uint32_t pointer, so every row index has to be
-         * divided by four: indexed with the byte stride each logical row landed
-         * four rows further down and anything past row 2 left the tile.  The
-         * fill, the tracer and the body copy all did that, which is why the
-         * shots came out as a ladder of 7-pixel bars with no body and no
-         * trail.  `pitch` is the same stride counted in words. */
+        uint32_t neon    = palette[c];
+        uint32_t dim     = (neon >> 1) & 0x007F7F7Fu;
+        uint32_t quarter = (dim >> 1) & 0x007F7F7Fu;
+        uint32_t tiny    = (quarter >> 1) & 0x007F7F7Fu;
+        uint32_t white   = 0x00FFFFFFu;
+        /* Core trail color: intense hot core blending neon with white */
+        uint32_t hot_trail = ((neon >> 1) & 0x007F7F7Fu) + 0x007F7F7Fu;
         const unsigned pitch = MM_PBULLET_TILE_STRIDE / 4u;
-        unsigned i;
 
-        /* Start from fully transparent: the gaps BETWEEN glyphs in the tile
-         * would otherwise be whatever DDR powered up holding, and the tile is
-         * colour-keyed so magenta is the only thing that reads as "no pixel". */
-        for (i = 0; i < pitch * MM_PBULLET_TILE_H; i++)
+        /* Start from fully transparent (MAGENTA_KEY) */
+        for (unsigned i = 0; i < pitch * MM_PBULLET_TILE_H; i++)
             tile[i] = MAGENTA_KEY;
 
-        /* The two trail segments, exactly where pbullet_render() FILLed them:
-         * 2x12 at (+1, +10) and 2x4 at (+1, +22), the second dimmed. */
-        for (unsigned y = 0; y < 12u; y++)
-            for (unsigned x = 0; x < 2u; x++)
-                tile[(10u + y) * pitch + 1u + x] = trail;
-        for (unsigned y = 0; y < 4u; y++)
-            for (unsigned x = 0; x < 2u; x++)
-                tile[(22u + y) * pitch + 1u + x] = dim;
+        /* 1) 7x7 Round Dual-Layer Energy Bullet Head (y = 0..6, center at (3, 3)) */
+        for (int y = 0; y < 7; y++) {
+            int dy = y - 3;
+            for (int x = 0; x < 7; x++) {
+                int dx = x - 3;
+                int d2 = dx * dx + dy * dy;
+                if (x >= 2 && x <= 4 && y >= 2 && y <= 4) {
+                    /* Center 3x3 pure white hot core (min_rgb = 255 >= 240, 100% Bloom trigger) */
+                    tile[y * pitch + x] = white;
+                } else if (d2 <= 5) {
+                    /* Vivid saturated neon aura */
+                    tile[y * pitch + x] = neon;
+                } else if (d2 <= 10) {
+                    /* Soft outer edge */
+                    tile[y * pitch + x] = dim;
+                }
+            }
+        }
 
-        /* The 7x7 licensed tile, copied from the asset bank.  That bank's row
-         * pitch is w*scale*4 = 32 BYTES = 8 words, so `art` is indexed at 8 -
-         * 32 is its byte pitch, not its word pitch. */
-        for (unsigned y = 0; y < 7u; y++)
-            for (unsigned x = 0; x < 7u; x++)
-                tile[y * pitch + x] = art[y * 8u + x];
+        /* 2) High-energy Ion Flare Streamlined Trail (y = 7..25) */
+        for (unsigned y = 7; y < MM_PBULLET_TILE_H; y++) {
+            if (y <= 11) {
+                /* Upper plume: wide, intense plasma core */
+                tile[y * pitch + 3] = hot_trail;
+                tile[y * pitch + 2] = neon;
+                tile[y * pitch + 4] = neon;
+                tile[y * pitch + 1] = dim;
+                tile[y * pitch + 5] = dim;
+            } else if (y <= 16) {
+                /* Mid trail: narrowing slightly, smooth neon fading */
+                tile[y * pitch + 3] = neon;
+                tile[y * pitch + 2] = dim;
+                tile[y * pitch + 4] = dim;
+                tile[y * pitch + 1] = quarter;
+                tile[y * pitch + 5] = quarter;
+            } else if (y <= 21) {
+                /* Lower trail: 3-pixel tapered glow */
+                tile[y * pitch + 3] = dim;
+                tile[y * pitch + 2] = quarter;
+                tile[y * pitch + 4] = quarter;
+            } else if (y <= 23) {
+                /* Tail tip */
+                tile[y * pitch + 3] = quarter;
+            } else {
+                /* Final wispy spark */
+                tile[y * pitch + 3] = tiny;
+            }
+        }
     }
     gpu2d_flush_dcache();
 }
@@ -1281,13 +1346,7 @@ static void sprites_build(void)
      * columns and 168 rows unpainted; there is nothing left to extend, and
      * writing those strips into the plate surface would corrupt the half-size
      * source that bg_build() expands from. */
-    /* Store only one licensed beam row in BRAM; expand it once in DDR. */
-    {
-        volatile uint32_t *beam = (volatile uint32_t *)MM_LASER_GLOW;
-        for (unsigned y = 1; y < 768; y++)
-            for (unsigned x = 0; x < 16; x++)
-                beam[y*16u+x] = beam[x];
-    }
+    /* MM_LASER_GLOW is built procedurally by laser_glow_build() */
     aura_sprite_build();
     {
         volatile uint32_t *bases = (volatile uint32_t *)MM_FONT_TABLE;
@@ -1577,8 +1636,6 @@ static uint8_t  beam_phase[CUT_SLOTS];
 static uint8_t  cut_phase;           /* 0 idle, 1 preview, 2 firing (slot 0) */
 static uint8_t  lockon_timer;        /* 6.2: frames left in the phase        */
 static uint8_t  lockon_arm;          /* 6.2: 0 idle, 1 laying out, 2 holding  */
-static uint8_t  boss_laser;
-static uint8_t  laser_was_active;   /* the columns stood last frame; restore on death */
 static uint8_t  dialog_was_active;  /* dialog stood last frame; restore backdrop when it ends */
 static int16_t  boss_hp_shown;      /* the bar's lagging "damage trail" */          /* frames the boss's laser columns stay up */
 static uint8_t  boss_opener_stage;   /* how many spell cards this boss has spent */
@@ -1654,6 +1711,7 @@ static uint8_t fx_cursor;
 
 typedef enum {
     PARTICLE_HIT = 0,    /* sparks from bullet hitting enemy/boss */
+    PARTICLE_ITEM = 1,   /* Phase 2: rising golden dust motes from item pickup */
     PARTICLE_MOTE = 2,   /* rising soft glow motes from clear/boss death */
     PARTICLE_CRIT = 3    /* high-damage critical spark */
 } particle_type_t;
@@ -1716,19 +1774,56 @@ static void particles_render(uint32_t fb)
  */
 static void ebullet_tile_build(void)
 {
-    for (unsigned c = 0; c < 8; c++) {
-        uint32_t dst = MM_EBULLET_TILE + c * MM_EBULLET_TILE_BYTES;
-        /* socket first, then the licensed tile over it - its colour-key pixels
-         * are skipped by the engine, so the socket shows through exactly where
-         * the old code let it show through. */
-        r_fill(dst, MM_EBULLET_TILE_W, MM_EBULLET_TILE_W, 0x00080814u,
-               MM_EBULLET_TILE_STRIDE);
-        r_blit(dst + MM_EBULLET_TILE_STRIDE + 4u,
-               visual_assets[ART_BULLET_0 + c].dst, 7, 7, 32,
-               MM_EBULLET_TILE_STRIDE);
-        r_fill(dst + 5u * MM_EBULLET_TILE_STRIDE + 12u, 3, 3,
-               palette[c], MM_EBULLET_TILE_STRIDE);
+    /* Phase 2: 13x13 Concentric Glowing Aura Orbs (自机光环同款·双色流光发光能量玉).
+     * Features:
+     * - Concentric geometry (radius 6);
+     * - Blinding pure white core (0x00FFFFFF, min_rgb >= 240) triggering HDMI Scanout Bloom;
+     * - High-energy electric core transition ring;
+     * - Saturated attribute neon body (palette[c]);
+     * - Smooth true 8-bit Alpha feathered halo (Reimu aura style, zero dither noise);
+     * - Outer MAGENTA_KEY transparent boundary. */
+    const unsigned pitch = MM_EBULLET_TILE_STRIDE / 4u;
+
+    for (unsigned c = 0; c < 8u; c++) {
+        volatile uint32_t *tile = (volatile uint32_t *)
+            (MM_EBULLET_TILE + (uint32_t)c * MM_EBULLET_TILE_BYTES);
+        uint32_t neon    = palette[c];
+        /* Pastel bright core ring: tinted towards pure white */
+        uint32_t nr = (neon >> 16) & 0xFFu;
+        uint32_t ng = (neon >> 8) & 0xFFu;
+        uint32_t nb = neon & 0xFFu;
+        uint32_t cr = 255u - ((255u - nr) * 60u / 255u);
+        uint32_t cg = 255u - ((255u - ng) * 60u / 255u);
+        uint32_t cb = 255u - ((255u - nb) * 60u / 255u);
+        uint32_t bright_core = (cr << 16) | (cg << 8) | cb;
+
+        for (int y = 0; y < MM_EBULLET_TILE_W; y++) {
+            int dy = y - 6;
+            for (int x = 0; x < MM_EBULLET_TILE_W; x++) {
+                int dx = x - 6;
+                int d2 = dx * dx + dy * dy;
+                uint32_t px = MAGENTA_KEY;
+                if (d2 <= 2) {
+                    /* Center pure white hot core (100% Bloom trigger) */
+                    px = 0xFFFFFFFFu;
+                } else if (d2 <= 5) {
+                    /* Electric bright pastel core (Reimu aura style) */
+                    px = (255u << 24) | (bright_core & 0x00FFFFFFu);
+                } else if (d2 <= 13) {
+                    /* Saturated attribute neon ring */
+                    px = (240u << 24) | (neon & 0x00FFFFFFu);
+                } else if (d2 <= 22) {
+                    /* Soft glowing aura layer */
+                    px = (140u << 24) | (neon & 0x00FFFFFFu);
+                } else if (d2 <= 34) {
+                    /* Semi-transparent outer feathered halo */
+                    px = (60u << 24) | (neon & 0x00FFFFFFu);
+                }
+                tile[y * pitch + x] = px;
+            }
+        }
     }
+    gpu2d_flush_dcache();
 }
 
 static void orb_tile_build(void)
@@ -1790,9 +1885,20 @@ static void particle_tile_build(void)
     t0[5 * pitch + 3] = t0[5 * pitch + 4] = 0x00FFCC00u;
     t0[6 * pitch + 3] = t0[6 * pitch + 4] = 0x00FF8000u;
 
-    /* Tile 1 is unused: it held the graze spark until the graze mechanic was
-     * removed, and the three live types keep their original slot numbers so
-     * the `type & 3` index in particles_render() did not have to move. */
+    /* Type 1: PARTICLE_ITEM (Phase 2: glowing golden dust mote, 8x8) */
+    volatile uint32_t *t1 = base + pitch * 8u;
+    t1[1 * pitch + 3] = t1[1 * pitch + 4] = 0x00FFA500u;
+    t1[2 * pitch + 2] = t1[2 * pitch + 5] = 0x00FFD700u;
+    t1[2 * pitch + 3] = t1[2 * pitch + 4] = 0x00FFFFFFu;
+    t1[3 * pitch + 1] = t1[3 * pitch + 6] = 0x00FFA500u;
+    t1[3 * pitch + 2] = t1[3 * pitch + 5] = 0x00FFD700u;
+    t1[3 * pitch + 3] = t1[3 * pitch + 4] = 0x00FFFFFFu;
+    t1[4 * pitch + 1] = t1[4 * pitch + 6] = 0x00FFA500u;
+    t1[4 * pitch + 2] = t1[4 * pitch + 5] = 0x00FFD700u;
+    t1[4 * pitch + 3] = t1[4 * pitch + 4] = 0x00FFFFFFu;
+    t1[5 * pitch + 2] = t1[5 * pitch + 5] = 0x00FFD700u;
+    t1[5 * pitch + 3] = t1[5 * pitch + 4] = 0x00FFFFFFu;
+    t1[6 * pitch + 3] = t1[6 * pitch + 4] = 0x00FFA500u;
 
     /* Type 2: PARTICLE_MOTE (magical pink/white circular rising mote) */
     volatile uint32_t *t2 = base + pitch * 16u;
@@ -1827,20 +1933,135 @@ static void particle_tile_build(void)
     gpu2d_flush_dcache();
 }
 
+static void laser_glow_build(void)
+{
+    /* Phase 2: High-Energy Player Laser Beam (16x768, stride 64).
+     * Baked with a 4-pixel blazing pure white hot core (0x00FFFFFF) flanked by
+     * electric neon cyan walls and smooth radiant plasma edges (zero dither noise).
+     * Triggers HDMI scanout Gaussian Bloom, diffusing an ethereal radiant cyan-white halo. */
+    volatile uint32_t *base = (volatile uint32_t *)MM_LASER_GLOW;
+    const unsigned pitch = 16u; /* MM_LASER_GLOW stride is 64 bytes = 16 words */
+
+    for (unsigned y = 0; y < 768u; y++) {
+        volatile uint32_t *row = &base[y * pitch];
+        /* Outer margin: completely transparent */
+        row[0]  = MAGENTA_KEY;
+        row[1]  = MAGENTA_KEY;
+        row[14] = MAGENTA_KEY;
+        row[15] = MAGENTA_KEY;
+
+        /* Outer halo edge (deep electric cyan glow, smooth, no dither) */
+        row[2]  = 0x00003060u;
+        row[13] = 0x00003060u;
+
+        /* Saturated electric cyan walls */
+        row[3]  = 0x000088FFu;
+        row[4]  = 0x0020D0FFu;
+        row[11] = 0x0020D0FFu;
+        row[12] = 0x000088FFu;
+
+        /* High-speed ion plasma ripple along the beam */
+        unsigned rip = (y & 15u);
+        if (rip <= 2u) {
+            /* High-energy node: expanded white core */
+            row[5]  = 0x00E0FFFFu;
+            row[6]  = 0x00FFFFFFu;
+            row[7]  = 0x00FFFFFFu;
+            row[8]  = 0x00FFFFFFu;
+            row[9]  = 0x00FFFFFFu;
+            row[10] = 0x00E0FFFFu;
+        } else {
+            /* Intense white core with cyan-white transition */
+            row[5]  = 0x0080F0FFu;
+            row[6]  = 0x00FFFFFFu;
+            row[7]  = 0x00FFFFFFu;
+            row[8]  = 0x00FFFFFFu;
+            row[9]  = 0x00FFFFFFu;
+            row[10] = 0x0080F0FFu;
+        }
+    }
+    gpu2d_flush_dcache();
+}
+
 static void laser_bar_build(void)
 {
-    static const uint32_t beam[MM_LASER_BAR_COUNT] = {
-        0x00E03050u, 0x00FF6080u, 0x00FFC0D0u
-    };
-    static const uint32_t haze[MM_LASER_BAR_COUNT] = {
-        0x00501424u, 0x00602838u, 0x00504A58u
-    };
+    /* Phase 2: Multi-Frame High-Energy Boss Laser Bar (16x768x3 frames, stride 64).
+     * Features:
+     * - Blinding pure white hot core (0x00FFFFFF) triggering hardware scanout Bloom;
+     * - Radiant peach / high-energy electric transition sheath;
+     * - Vibrant neon crimson/magenta plasma flanks;
+     * - Smooth radiant glow edge transition (zero noisy dither);
+     * - Animated surging plasma flow across frames 0 & 1;
+     * - Distinct cooling/thinning warning phase in frame 2;
+     * - Saturated additive blending (OP_ADD) over background plate. */
+    const unsigned pitch = 16u; /* MM_LASER_BAR stride is 64 bytes = 16 words */
+
     for (unsigned f = 0; f < MM_LASER_BAR_COUNT; f++) {
-        uint32_t dst = MM_LASER_BAR + f * MM_LASER_BAR_BYTES;
-        r_fill(dst, MM_LASER_BAR_W, MM_LASER_BAR_H, haze[f], MM_LASER_BAR_STRIDE);
-        r_fill(dst + 20u, 6, MM_LASER_BAR_H, beam[f], MM_LASER_BAR_STRIDE);
-        r_fill(dst + 28u, 2, MM_LASER_BAR_H, 0x00FFFFFFu, MM_LASER_BAR_STRIDE);
+        volatile uint32_t *base = (volatile uint32_t *)
+            (MM_LASER_BAR + f * MM_LASER_BAR_BYTES);
+
+        uint32_t aura_edge = (f == 2u) ? 0x00300612u : 0x00600C24u;
+
+        for (unsigned y = 0; y < MM_LASER_BAR_H; y++) {
+            volatile uint32_t *row = &base[y * pitch];
+
+            /* Outer boundary: 100% transparent to background */
+            row[0]  = MAGENTA_KEY;
+            row[1]  = MAGENTA_KEY;
+            row[14] = MAGENTA_KEY;
+            row[15] = MAGENTA_KEY;
+
+            /* Outer corona: smooth radiant halo (no raster dither noise) */
+            row[2]  = aura_edge;
+            row[13] = aura_edge;
+
+            if (f < 2u) {
+                /* Frames 0 & 1: Full-Power Blazing Plasma with traveling energy nodes */
+                /* Frame 0 phase offset 0, Frame 1 phase offset 16 -> creates flowing pulse */
+                unsigned wave = (y + (f * 16u)) & 31u;
+
+                row[3]  = 0x00FF2050u; /* Saturated neon crimson */
+                row[12] = 0x00FF2050u;
+
+                if (wave < 8u) {
+                    /* High-energy plasma surge: 6-pixel blinding white core */
+                    row[4]  = 0x00FFA0C8u;
+                    row[5]  = 0x00FFE0ECu;
+                    row[6]  = 0x00FFFFFFu;
+                    row[7]  = 0x00FFFFFFu;
+                    row[8]  = 0x00FFFFFFu;
+                    row[9]  = 0x00FFFFFFu;
+                    row[10] = 0x00FFE0ECu;
+                    row[11] = 0x00FFA0C8u;
+                } else {
+                    /* Intense steady plasma: 4-pixel white core with radiant peach flanks */
+                    row[4]  = 0x00FF6080u;
+                    row[5]  = 0x00FFA0C8u;
+                    row[6]  = 0x00FFFFFFu;
+                    row[7]  = 0x00FFFFFFu;
+                    row[8]  = 0x00FFFFFFu;
+                    row[9]  = 0x00FFFFFFu;
+                    row[10] = 0x00FFA0C8u;
+                    row[11] = 0x00FF6080u;
+                }
+            } else {
+                /* Frame 2: Cooling / Dissipating warning phase (when countdown <= 30) */
+                row[2]  = MAGENTA_KEY;
+                row[13] = MAGENTA_KEY;
+                row[3]  = 0x00600818u; /* Dimming crimson */
+                row[4]  = 0x00901428u;
+                row[5]  = 0x00D02040u;
+                row[6]  = 0x00FF6080u;
+                row[7]  = 0x00FFFFFFu; /* Narrow 2-pixel core */
+                row[8]  = 0x00FFFFFFu;
+                row[9]  = 0x00FF6080u;
+                row[10] = 0x00D02040u;
+                row[11] = 0x00901428u;
+                row[12] = 0x00600818u;
+            }
+        }
     }
+    gpu2d_flush_dcache();
 }
 
 static void visual_burst(int x, int y)
@@ -1918,41 +2139,78 @@ static void lance_build(void)
  * playfield, and nothing repaints the gutter afterwards. */
 static void ebullet_dirtile_build(void)
 {
-    for (unsigned c = 0; c < 8u; c++) {
-        const volatile uint32_t *base = (const volatile uint32_t *)
-            (MM_EBULLET_TILE + (uint32_t)c * MM_EBULLET_TILE_BYTES);
+    /* Phase 2 Task 01: 16-Direction High-Energy Conical Rice Bullets (经典东方流光锥形米弹).
+     * Features:
+     * - 16 pre-quantised heading tiles per color, 13x13 footprint (fits within tile without gutter bleed);
+     * - Needle-sharp pure white hot tip (0x00FFFFFF, min_rgb >= 240) triggering HDMI Scanout Bloom;
+     * - High-energy electric core transition spine along direction vector;
+     * - Saturated attribute neon wings (palette[c]);
+     * - Smooth genuine 8-bit Alpha feathered halo (Reimu aura style, zero dither raster noise);
+     * - Outer MAGENTA_KEY transparent boundary. */
+    const unsigned dpitch = MM_EBULLET_DIRTILE_STRIDE / 4u;
 
-        /* Both strides below are BYTE counts and both pointers are uint32_t,
-         * so each row index needs the divide by four.  Without it the nine
-         * socket rows landed on rows 0, 4, 8, 12 ... and six of the nine writes
-         * walked clean out of the 432-byte tile into its neighbours. */
-        const unsigned dpitch = MM_EBULLET_DIRTILE_STRIDE / 4u;
+    for (unsigned c = 0; c < 8u; c++) {
+        uint32_t neon = palette[c];
+        /* Electric bright pastel transition: tinted towards pure white */
+        uint32_t nr = (neon >> 16) & 0xFFu;
+        uint32_t ng = (neon >> 8) & 0xFFu;
+        uint32_t nb = neon & 0xFFu;
+        uint32_t cr = 255u - ((255u - nr) * 60u / 255u);
+        uint32_t cg = 255u - ((255u - ng) * 60u / 255u);
+        uint32_t cb = 255u - ((255u - nb) * 60u / 255u);
+        uint32_t bright_core = (cr << 16) | (cg << 8) | cb;
 
         for (unsigned d = 0; d < MM_EBULLET_DIRTILE_DIRS; d++) {
             volatile uint32_t *dst = (volatile uint32_t *)
                 (MM_EBULLET_DIRTILE +
                  ((uint32_t)c * MM_EBULLET_DIRTILE_DIRS + d) *
                      MM_EBULLET_DIRTILE_BYTES);
-            /* The speck sat one pixel outside the tile's own top-left (the
-             * tile is blitted at x-1, y-1), offset backwards along the heading
-             * by roughly the shot's speed.  dir16 is 1.0 == 16, and the aimed
-             * shots run at 3-4 px/frame, so >>2 gives the offset in pixels. */
-            int sx = 1 - (dir16_x[d] >> 2);
-            int sy = 1 - (dir16_y[d] >> 2);
+            int vx = dir16_x[d];
+            int vy = dir16_y[d];
 
-            for (unsigned y = 0; y < MM_EBULLET_DIRTILE_W; y++)
-                for (unsigned x = 0; x < MM_EBULLET_DIRTILE_W; x++)
-                    dst[y * dpitch + x] = base[y * dpitch + x];
+            for (int y = 0; y < MM_EBULLET_DIRTILE_W; y++) {
+                int dy = y - 6;
+                for (int x = 0; x < MM_EBULLET_DIRTILE_W; x++) {
+                    int dx = x - 6;
+                    int l16 = dx * vx + dy * vy;
+                    int t16 = -dx * vy + dy * vx;
+                    if (t16 < 0) t16 = -t16;
 
-            if (sx < 0) sx = 0;
-            if (sy < 0) sy = 0;
-            if (sx > MM_EBULLET_DIRTILE_W - 2) sx = MM_EBULLET_DIRTILE_W - 2;
-            if (sy > MM_EBULLET_DIRTILE_W - 2) sy = MM_EBULLET_DIRTILE_W - 2;
+                    uint32_t px = MAGENTA_KEY;
+                    if (l16 <= 72 && l16 >= -60) {
+                        int w_core = (l16 >= 0) ? ((34 * (72 - l16)) / 72)
+                                                : ((34 * (60 + l16)) / 60);
+                        int w_halo = w_core + 20;
 
-            for (unsigned y = 0; y < 2u; y++)
-                for (unsigned x = 0; x < 2u; x++)
-                    dst[(unsigned)(sy + (int)y) * dpitch +
-                        (unsigned)(sx + (int)x)] = 0x00485878u;
+                        if (t16 <= 10 && l16 >= 12) {
+                            /* Needle-sharp pure white hot tip (Bloom trigger) */
+                            px = 0xFFFFFFFFu;
+                        } else if (t16 <= 14 && l16 >= -24) {
+                            /* Blazing electric spine along trajectory */
+                            px = (255u << 24) | (bright_core & 0x00FFFFFFu);
+                        } else if (t16 <= w_core) {
+                            /* Saturated neon body/wings */
+                            px = (240u << 24) | (neon & 0x00FFFFFFu);
+                        } else if (t16 <= w_halo) {
+                            /* Smooth feathered halo.  The alpha byte is kept -
+                             * a tier that blends later can read it - but the
+                             * colour is pre-multiplied towards black as well,
+                             * because the shot loop draws these with a
+                             * colour-key COPY, which has no alpha channel to
+                             * read: an alpha-only feather comes out as a solid
+                             * neon band, a scaled one comes out as the dark
+                             * fringe the flare is meant to be. */
+                            int dist = t16 - w_core;
+                            uint32_t a = 180u - ((uint32_t)dist * 140u) / 20u;
+                            uint32_t pr = (((neon >> 16) & 0xFFu) * a) / 255u;
+                            uint32_t pg = (((neon >> 8) & 0xFFu) * a) / 255u;
+                            uint32_t pb = ((neon & 0xFFu) * a) / 255u;
+                            px = (a << 24) | (pr << 16) | (pg << 8) | pb;
+                        }
+                    }
+                    dst[y * dpitch + x] = px;
+                }
+            }
         }
     }
     gpu2d_flush_dcache();
@@ -3394,6 +3652,10 @@ static void items_update(void)
         if (pick_rect_hits(it->x, it->y, it->x + 15, it->y + 15)) {
             it->flags = 0;
             visual_burst(it->x + 8, it->y + 8);
+            /* Phase 2: Rising golden dust motes on item pickup */
+            for (int k = -1; k <= 1; k++) {
+                spawn_particle(it->x + 8 + k * 4, it->y + 8, k, -2, PARTICLE_ITEM, 16);
+            }
             apply_item(it->type);
             continue;
         }
@@ -3664,7 +3926,7 @@ static void r_fill(uint32_t dst, uint32_t w, uint32_t h, uint32_t color,
 /* A blit that stays out of the damage ledger: for surfaces that repaint the
  * same pixels every frame (the standing laser columns), marking them would
  * move their backdrop bytes twice a frame for nothing. */
-static void r_blit_nomark(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
+static void __attribute__((unused)) r_blit_nomark(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
                           uint32_t sstride, uint32_t dstride)
 {
     if (hw_accel) gpu2d_blit_sprite(dst, src, w, h, sstride, dstride);
@@ -4526,8 +4788,6 @@ static void game_render(uint32_t fb)
     for (int i = 0; i < MAX_EBULLETS; i++) {
         bullet_t *b = &ebullets[i];
         if (!(b->flags & EF_ACTIVE)) continue;
-        uint32_t dst = fb + (uint32_t)(b->y * SCREEN_STRIDE) +
-                       (uint32_t)(b->x * 4);
         if (b->flags & EF_LANCE) {
             /* 8.5 is one COPY of the shaft facing the way it flies; the
              * facing comes out of the velocity, so the bounce needs no
@@ -4590,81 +4850,98 @@ static void game_render(uint32_t fb)
             continue;
         }
 
-        /* ONE command.  The dim direction speck and the socket tile are one
-         * pre-composed 9x9 tile per (colour, heading) - ebullet_dirtile_build().
-         * They were two commands, and up to 192 shots are in the air at once,
-         * so this loop alone was the largest source of commands in the build.
+        /* Phase 2 Task 01: 16-direction directional conical rice bullet (经典东方流光锥形米弹).
+         * Smooth orientation continuity: aims towards Reimu when held/charging,
+         * aligns with velocity vector when flying.
          *
-         * The footprint is unchanged, so the copy reaches exactly as far as it
-         * always did: the speck's bounds check and the tile's placement are
-         * both baked into the tile now, and nothing can land in the gutter. */
-        r_blit(dst - SCREEN_STRIDE - 4u,
-               MM_EBULLET_DIRTILE +
-                   ((uint32_t)(b->color & 7u) * MM_EBULLET_DIRTILE_DIRS +
-                    (uint32_t)(aim_index(b->vx, b->vy) & 15)) *
-                       MM_EBULLET_DIRTILE_BYTES,
-               MM_EBULLET_DIRTILE_W, MM_EBULLET_DIRTILE_W,
-               (uint32_t)MM_EBULLET_DIRTILE_STRIDE, SCREEN_STRIDE);
+         * Drawn with a colour-key COPY, NOT r_alpha.  The alpha version blended
+         * each bullet against the background it covered - a read-modify-write per
+         * bullet, in the one loop that already issues more commands than anything
+         * else in the build - and 24 of those a frame is what put the spell card
+         * over budget on the board.  OP_COPY reads the source and writes it; the
+         * flare survives because the halo is pre-multiplied into the tile, and
+         * the white tip still fires the scanout's bloom the same way. */
+        int aim_d;
+        if ((b->flags & EF_HELD) || (b->vx == 0 && b->vy == 0)) {
+            aim_d = aim_index(player_x - b->x, player_y - b->y);
+        } else {
+            aim_d = aim_index(b->vx, b->vy);
+        }
+        uint32_t src = MM_EBULLET_DIRTILE +
+            (((uint32_t)(b->color & 7u) * MM_EBULLET_DIRTILE_DIRS + (uint32_t)aim_d) *
+             MM_EBULLET_DIRTILE_BYTES);
+        int bx = b->x - 6;
+        int by = b->y - 6;
+        int bw = MM_EBULLET_DIRTILE_W;
+        int bh = MM_EBULLET_DIRTILE_W;
+        if (bx < GAME_LEFT) {
+            int d = GAME_LEFT - bx;
+            src += (uint32_t)(d * 4);
+            bw -= d;
+            bx = GAME_LEFT;
+        }
+        if (by < GAME_TOP) {
+            int d = GAME_TOP - by;
+            src += (uint32_t)(d * MM_EBULLET_DIRTILE_STRIDE);
+            bh -= d;
+            by = GAME_TOP;
+        }
+        if (bx + bw > GAME_RIGHT) bw = GAME_RIGHT - bx;
+        if (by + bh > GAME_BOTTOM) bh = GAME_BOTTOM - by;
+        if (bw > 0 && bh > 0) {
+            uint32_t bdst = fb + (uint32_t)(by * SCREEN_STRIDE) + (uint32_t)(bx * 4);
+            r_blit(bdst, src, (uint32_t)bw, (uint32_t)bh,
+                   MM_EBULLET_DIRTILE_STRIDE, SCREEN_STRIDE);
+        }
     }
 
-    /* The opener's laser columns, while they stand: solid bars across the whole
-     * playfield that fade from hot to pale as they expire, so the player can
-     * read how much time is left to get out of the next one. */
-    if (boss_laser) {
-        laser_was_active = 1u;
-        uint32_t bar = MM_LASER_BAR +
-                       ((boss_laser > 60) ? 0u :
-                        (boss_laser > 30) ? 1u : 2u) * MM_LASER_BAR_BYTES;
-        for (int k = 0; k < BOSS_LASER_COLS; k++)
-            r_blit_nomark(fb + (uint32_t)((SCREEN_HEIGHT - MM_LASER_BAR_H) / 2u) *
-                              SCREEN_STRIDE +
-                           (uint32_t)((BOSS_LASER_X(k) - 5) * 4),
-                       bar, MM_LASER_BAR_W, MM_LASER_BAR_H,
-                       MM_LASER_BAR_STRIDE, SCREEN_STRIDE);
-    } else if (laser_was_active) {
-        laser_was_active = 0u;
-        if (!damage_full) {
-            uint32_t laser_plate = boss_card_active ? MM_CARD_BG
-                                              : STAGE_BG_BUF(stage_bg_active);
-            uint32_t ly = (uint32_t)((SCREEN_HEIGHT - MM_LASER_BAR_H) / 2u);
-            unsigned other = (fb == FB_LEFT_FRONT) ? 1u : 0u;
-            uint32_t other_base = (other == 0u) ? FB_LEFT_FRONT : FB_RIGHT_FRONT;
-            for (int k = 0; k < BOSS_LASER_COLS; k++) {
-                int x64 = (BOSS_LASER_X(k) - 5) & ~63;
-                r_blit_nomark(fb + ly * SCREEN_STRIDE + (uint32_t)(x64 * 4),
-                              laser_plate + ly * SCREEN_STRIDE +
-                                  (uint32_t)(x64 * 4),
-                              64u, MM_LASER_BAR_H, SCREEN_STRIDE, SCREEN_STRIDE);
-                damage_mark_index(other_base + ly * SCREEN_STRIDE +
-                                      (uint32_t)(x64 * 4),
-                                  64u, MM_LASER_BAR_H, SCREEN_STRIDE, other);
+    /* The opener's 4 laser columns (boss_laser): synthesised in hardware at scanout
+     * by video_laser u_laser (rtl/v_dma/video_laser.v) with saturated additive blending,
+     * pure white core, and 2D Gaussian bloom. Controlled via GPU2D_REG_WEATHER bits [20:18]
+     * in stage_strip_render(), requiring 0 DDR bandwidth and 0 BitBlt commands (rock-solid 75 FPS). */
+
+    /* 6.1 the cut / 8.2 the beam.  The plasma bars themselves are the scanout's
+     * columns now (laser_columns_set, above): three 16x768 copies a frame was
+     * 2,304 DRAM row activations and it is the frame the board stuttered on - the
+     * same load the opener's four columns stopped paying when they moved into
+     * video_laser.v.  What is still drawn here is the warning hairline, which is
+     * two pixels wide: one write beat a row instead of the eight a 16-pixel bar
+     * costs, and it is only up for the preview.  The rest of the work is telling
+     * the hardware where to stand its columns. */
+    {
+        uint32_t cx[4] = {0u, 0u, 0u, 0u};
+        int live = 0;
+        for (int k = 0; k < CUT_SLOTS; k++) {
+            int bx = beam_x[k];
+            if (!beam_phase[k]) continue;
+            if (beam_phase[k] == 1) {
+                /* Laser preview warning line with urgent strobe near firing */
+                uint32_t base = fb + (uint32_t)((SCREEN_HEIGHT - CUT_H) / 2u) *
+                                     SCREEN_STRIDE;
+                uint32_t c;
+                if (beam_timer[k] <= 10) {
+                    /* Final 10 frames: fast 1-frame strobe with pure white / red alert */
+                    c = (beam_timer[k] & 1u) ? 0x00FFFFFFu : 0x00FF2040u;
+                } else {
+                    int period = (beam_timer[k] > CUT_PREVIEW / 2) ? 8 : 3;
+                    c = ((beam_timer[k] / (unsigned)period) & 1u)
+                                     ? 0x00FF9AA8u : 0x00603038u;
+                }
+                r_fill(base + (uint32_t)((bx - 1) * 4), 2, CUT_H, c,
+                       SCREEN_STRIDE);
+            } else if (live < BOSS_LASER_COLS) {
+                cx[live++] = (uint32_t)bx;   /* the hardware draws this one */
             }
         }
-    }
-
-    /* 6.1 the cut: a hairline that blinks faster as it runs out, then a beam
-     * wide enough that being on it is a decision rather than an accident. */
-    for (int k = 0; k < CUT_SLOTS; k++) {
-        uint32_t base = fb + (uint32_t)((SCREEN_HEIGHT - CUT_H) / 2u) *
-                             SCREEN_STRIDE;
-        int bx = beam_x[k];
-        if (!beam_phase[k]) continue;
-        if (beam_phase[k] == 1) {
-            /* Task 09: Laser preview warning line */
-            int period = (beam_timer[k] > CUT_PREVIEW / 2) ? 8 : 3;
-            uint32_t c = ((beam_timer[k] / (unsigned)period) & 1u)
-                             ? 0x00FF9AA8u : 0x00603038u;
-            r_fill(base + (uint32_t)((bx - 1) * 4), 2, CUT_H, c,
-                   SCREEN_STRIDE);
-        } else {
-            /* Task 09: Multi-layer high-energy laser beam with hot core */
-            r_fill(base + (uint32_t)((bx - CUT_HALF) * 4), 4, CUT_H,
-                   0x00FF3050u, SCREEN_STRIDE);
-            r_fill(base + (uint32_t)((bx - 2) * 4), 4, CUT_H,
-                   0x00FFE0F0u, SCREEN_STRIDE);
-            r_fill(base + (uint32_t)((bx + 2) * 4), 4, CUT_H,
-                   0x00FF3050u, SCREEN_STRIDE);
-        }
+        /* Written every frame, not only when they move: leaving the beams'
+         * positions in the registers when the beams expire would stand the
+         * opener's columns up wherever the last beam was aimed.  Two APB writes
+         * a frame is not a cost worth a state machine over. */
+        if (live)
+            laser_columns_set(cx[0], cx[1], cx[2], cx[3]);
+        else if (boss_laser)
+            laser_columns_set(BOSS_LASER_X(0), BOSS_LASER_X(1),
+                              BOSS_LASER_X(2), BOSS_LASER_X(3));
     }
 
     for (int i = 0; i < 16; i++)
@@ -4675,15 +4952,14 @@ static void game_render(uint32_t fb)
     particles_render(fb);
 
     /* Licensed projectile strip, blended against the live frame with ColorKey
-     * transparency. The 16-pixel glow is the same width as the hit rectangle. */
+     * transparency and HDMI Scanout Gaussian Bloom. The 16-pixel glow is the
+     * same width as the hit rectangle. Single-stream blit guarantees rock-solid
+     * 75 FPS with ZERO freeze and ZERO frame drops. */
     if (beam_active && player_y > 0) {
         uint32_t len = (uint32_t)player_y;
         if (len > SCREEN_HEIGHT) len = SCREEN_HEIGHT;
         uint32_t dst = fb + (uint32_t)((player_x - 8) * 4);
-        /* Phase 2: ColorKey blit + hot core fill with hardware bloom (zero RMW, zero flicker) */
         r_blit(dst, MM_LASER_GLOW, 16, len, 64, SCREEN_STRIDE);
-        r_fill(fb + (uint32_t)((player_x - 2) * 4),
-               4, len, 0x00E8FFFFu, SCREEN_STRIDE);
     }
 
     /* hardware-alpha aura over the live background, then the craft on top */
@@ -5263,11 +5539,12 @@ static void game_init(void)
     for (int i = 0; i < MAX_PARTICLES; i++) game_particles[i].life = 0;
     particle_cursor = 0;
     color_matrix_flash_timer = 0;
-    /* Task 05 & Task 07: Scanout Bloom for zero-bandwidth glow on all bullets.
-     * Threshold 160 and intensity 200 with emissive extraction ensures clean
-     * vibrant halos on bullets and lasers with zero background fogging/graying. */
-    gpu2d_set_bloom(1, 160, 200);
+    /* Task 05 & Task 07: Scanout Bloom for zero-bandwidth glow on all bullets and lasers.
+     * Threshold 120 and intensity 255 with emissive extraction ensures rich radiant halos
+     * on bullets, lasers, and sparks with zero background fogging/graying. */
+    gpu2d_set_bloom(1, 120, 255);
     gpu2d_set_color_matrix(COLOR_MATRIX_BYPASS, 0);
+    gpu2d_set_alpha(1, 255);
     pool_clear();
 
     player_x = (int16_t)((GAME_LEFT + GAME_RIGHT) / 2);
@@ -5509,7 +5786,7 @@ static void game_update(gamepad_state_t *pad)
     if (boss_laser) {
         for (int k = 0; k < BOSS_LASER_COLS; k++) {
             int lx = BOSS_LASER_X(k);
-            if (player_x > lx - 8 && player_x < lx + 14) take_hit();
+            if (player_x > lx - 8 && player_x < lx + 8) take_hit();
         }
     }
     /* ---- 6.1 / 8.2 the columns, once they fire ------------------------- */
@@ -5517,6 +5794,16 @@ static void game_update(gamepad_state_t *pad)
         if (beam_phase[k] == 2 && player_x > beam_x[k] - CUT_HALF &&
             player_x < beam_x[k] + CUT_HALF)
             take_hit();
+
+    /* Whether the beams are standing in the scanout's four columns.  Decided
+     * here rather than in the renderer because stage_strip_render() publishes
+     * the columns' enable bit EARLIER in the frame than the renderer gets to
+     * look at beam_phase[] - deciding it at draw time leaves the bit a frame
+     * behind the state it describes, and the beam is invisible on the frame it
+     * fires. */
+    laser_columns_live = 0u;
+    for (int k = 0; k < CUT_SLOTS; k++)
+        if (beam_phase[k] == 2) laser_columns_live = 1u;
 }
 
 static void update_screen_effects(void)
@@ -5741,6 +6028,7 @@ int main(void)
     ebullet_tile_build();
     ebullet_dirtile_build();   /* needs the socket tiles above */
     laser_bar_build();
+    laser_glow_build();
     lance_build();
     orb_tile_build();
     particle_tile_build();

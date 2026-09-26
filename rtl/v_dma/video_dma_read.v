@@ -60,6 +60,9 @@ module video_dma_read #(
     // bitblt_apb_regs 0x8C / 0xAC).  Zero = no box, layer as it always was.
     input  wire [31:0]               weather_mask_x,
     input  wire [31:0]               weather_mask_y,
+    // Where the four laser columns stand, 4 x 12 bits (APB 0xB0 / 0xB4,
+    // core_clk domain).  Centre 0 parks a column off screen.
+    input  wire [47:0]               laser_colx,
     output wire [31:0] scan_diagnostics,
     output reg video_read_priority,
     output wire                      vsync_flag,
@@ -429,6 +432,7 @@ module video_dma_read #(
     reg [31:0] wctl_latched;
     reg [31:0] wbox_x_s1, wbox_x_s2, wbox_x_latched;
     reg [31:0] wbox_y_s1, wbox_y_s2, wbox_y_latched;
+    reg [47:0] lcol_s1, lcol_s2, lcol_latched;
     wire w_visible;
     wire [23:0] w_rgb;
     always @(posedge pixel_clk or negedge pixel_rst_n) begin
@@ -442,6 +446,9 @@ module video_dma_read #(
             wbox_y_s1    <= 32'd0;
             wbox_y_s2    <= 32'd0;
             wbox_y_latched <= 32'd0;
+            lcol_s1      <= 48'd0;
+            lcol_s2      <= 48'd0;
+            lcol_latched <= 48'd0;
         end else begin
             wctl_s1 <= weather_ctrl;
             wctl_s2 <= wctl_s1;
@@ -449,10 +456,13 @@ module video_dma_read #(
             wbox_x_s2 <= wbox_x_s1;
             wbox_y_s1 <= weather_mask_y;
             wbox_y_s2 <= wbox_y_s1;
+            lcol_s1   <= laser_colx;
+            lcol_s2   <= lcol_s1;
             if (v_cnt == V_ACT && h_cnt == 12'd0) begin
                 wctl_latched  <= wctl_s2;
                 wbox_x_latched <= wbox_x_s2;
                 wbox_y_latched <= wbox_y_s2;
+                lcol_latched  <= lcol_s2;
             end
         end
     end
@@ -473,8 +483,24 @@ module video_dma_read #(
         .pixel_clk(pixel_clk), .pixel_rst_n(pixel_rst_n),
         .x(pixel_x_d1), .y(pixel_y_d1), .de(t_de_d1),
         .ctrl(wctl_latched),
+        .colx(lcol_latched),
         .visible(l_visible), .rgb(l_rgb)
     );
+
+    // Laser saturated additive blending over weather/framebuffer:
+    // Core white (24'hFFFFFF) clamps to 255 to trigger scanout bloom filter;
+    // Sheath & beam add saturated energy over live background.
+    wire [7:0] l_bg_r = w_visible ? w_rgb[23:16] : cur_pixel[23:16];
+    wire [7:0] l_bg_g = w_visible ? w_rgb[15:8]  : cur_pixel[15:8];
+    wire [7:0] l_bg_b = w_visible ? w_rgb[7:0]   : cur_pixel[7:0];
+
+    wire [8:0] l_sum_r = {1'b0, l_bg_r} + {1'b0, l_rgb[23:16]};
+    wire [8:0] l_sum_g = {1'b0, l_bg_g} + {1'b0, l_rgb[15:8]};
+    wire [8:0] l_sum_b = {1'b0, l_bg_b} + {1'b0, l_rgb[7:0]};
+
+    wire [7:0] l_add_r = l_sum_r[8] ? 8'd255 : l_sum_r[7:0];
+    wire [7:0] l_add_g = l_sum_g[8] ? 8'd255 : l_sum_g[7:0];
+    wire [7:0] l_add_b = l_sum_b[8] ? 8'd255 : l_sum_b[7:0];
     reg [15:0] underflow_count, background_errors;
     reg [31:0] scan_snapshot, scan_sync1, scan_sync2;
     always @(posedge pixel_clk or negedge pixel_rst_n) begin
@@ -532,18 +558,19 @@ module video_dma_read #(
             de_out     <= t_de_d1;
 
             if (t_de_d1) begin
-                // Layer order: HUD > laser > weather > framebuffer.  The laser
-                // is an object the player must read, the weather is atmosphere.
+                // Layer order: HUD > laser (saturated add on background) > weather > framebuffer.
+                // Saturated addition produces blinding white core (min >= 240) which activates
+                // downstream u_bloom_filter, plus glowing semi-transparent plasma walls.
                 red_out   <= (hud_visible && hud_en_sync2) ? hud_rgb[23:16]
-                           : (l_visible                  ? l_rgb[23:16]
+                           : (l_visible                  ? l_add_r
                            : (w_visible                  ? w_rgb[23:16]
                                                          : cur_pixel[23:16]));
                 green_out <= (hud_visible && hud_en_sync2) ? hud_rgb[15:8]
-                           : (l_visible                  ? l_rgb[15:8]
+                           : (l_visible                  ? l_add_g
                            : (w_visible                  ? w_rgb[15:8]
                                                          : cur_pixel[15:8]));
                 blue_out  <= (hud_visible && hud_en_sync2) ? hud_rgb[7:0]
-                           : (l_visible                  ? l_rgb[7:0]
+                           : (l_visible                  ? l_add_b
                            : (w_visible                  ? w_rgb[7:0]
                                                          : cur_pixel[7:0]));
             end else begin

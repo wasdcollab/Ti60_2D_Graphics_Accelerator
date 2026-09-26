@@ -1465,6 +1465,23 @@ MM_CARD_BG = mm_value("MM_CARD_BG")      # the card's own sky
 BURST_W, BURST_STRIDE, BURST_COUNT = 112, 448, 24
 OPENER_FILL_CAP = 200
 
+# ...and the cap on the OTHER command the opener frame used to be full of.  The
+# entrance volley is 48 shots on top of whatever is already in the air, and each
+# shot is one command either way; what decides whether the frame fits is WHICH
+# command.  OP_COPY reads the source and writes the destination; OP_ALPHA reads
+# the destination it is about to cover as well, i.e. a read-modify-write per
+# bullet, and the bus is what pays for it.  Measured: a per-bullet OP_ALPHA put
+# the entrance back over budget on the board ("BOSS 开大卡"), and the FILL cap
+# above could not see it - it only ever counted FILLs.
+OPENER_ALPHA_CAP = 24
+
+# ...and on how much of the framebuffer a frame with the cut/beam lasers up may
+# copy.  Measured 2,861 rows with the beams blitted by the engine, 1,603 with
+# them synthesised at scanout; what is left is the bullets, the HUD and the
+# player's own laser.  2,000 leaves room for a busy frame while still catching a
+# return to blitting the beams.
+BEAM_ROW_CAP = 2000
+
 # Player art: six 48x48 poses, stride 192.  player_pose 2 is ART_REIMU_2, and
 # holding A pins the animation there while the craft stays put.
 PLAYER_POSE_DST = (0x01610000, 0x01612400, 0x01614800,
@@ -2934,12 +2951,26 @@ def run_stage2_skills(code, output_dir=None):
     assert wait_published(vm), "the frame carrying the beam was never published"
     assert peek(vm, 'cut_phase', 1) == 2, \
         "the beam expired before its frame could be graded"
-    fb = vm.fb[vm.right_request]
-    beam = sum(1 for y in range(110, 570, 13)
-               if (fb[y * SCREEN_PITCH + px] & 0xFFFFFF) in CUT_BEAM_COLOURS)
-    print("  -> 6.1 beam fired %d simulated steps later: %d of 36 rows lit"
-          % (spent, beam))
-    assert beam >= 10, "the cut fired but left no beam (%d of 36 rows)" % beam
+    # The beam is a scanout column now, not framebuffer pixels: the engine
+    # issues nothing for it (four 16x768 copies a frame was 3,072 DRAM row
+    # activations, and the board lost its frame time to it), so there is nothing
+    # in the frame to count.  What the firmware controls - and therefore what is
+    # graded - is that the column is enabled and standing where the boss aimed
+    # it, which is the x the scenario read off the player before the cut.
+    ctrl_word = vm.params.get(0x78, 0)
+    cols = []
+    for w in (0xB0, 0xB4):
+        v = vm.params.get(w, 0)
+        cols += [v & 0xFFF, (v >> 12) & 0xFFF]
+    live = [c for c in cols if c != 0]
+    print("  -> 6.1 beam fired %d simulated steps later: columns %s (ctrl %#x), "
+          "craft at x=%d" % (spent, cols, ctrl_word, px))
+    assert ctrl_word & (1 << 18), (
+        "the cut fired but never enabled the scanout's laser columns")
+    assert live, "the cut enabled the columns but stood none of them up"
+    assert any(abs(c - px) <= 2 for c in live), (
+        "the beam is at %s but the craft it is aimed at is at x=%d"
+        % (live, px))
     assert wait_frames(vm, 4), "the game stopped producing frames"
     assert tlm(vm, 'invuln') > 0 or tlm(vm, 'lives') < 3, (
         "standing in the beam cost nothing: invuln=%d lives=%d"
@@ -3143,6 +3174,51 @@ def run_boss_opener(code, output_dir=None):
           "%d frames of laser columns" % (ent_frames, ent_shots,
                                           tlm(vm, 'laser')))
 
+    # ---- what a beam frame costs ----------------------------------------
+    # The cut/beam lasers are drawn by the CPU: three 16x768 bars copied into
+    # the framebuffer every frame they stand.  768 rows is 768 DRAM row
+    # activations and the engine pays one per row - the same load the boss's
+    # four opener columns used to be before they moved into the scanout
+    # (rtl/v_dma/video_laser.v).
+    for k in range(3):
+        poke(vm, sym_addr('beam_x') + k * 2, 380 + k * 120, 2)
+        poke(vm, sym_addr('beam_timer') + k, 60, 1)
+        poke(vm, sym_addr('beam_phase') + k, 2, 1)
+    assert wait_frames(vm, 2), "the game stopped producing frames"
+    c0, n0 = len(vm.copy_log), tlm(vm, 'frames')
+    assert wait_frames(vm, 3), "the game stopped producing frames"
+    dn = max(1, tlm(vm, 'frames') - n0)
+    rows = sum(c[1] for c in vm.copy_log[c0:])
+    bars = sum(1 for c in vm.copy_log[c0:] if c[0] == MM_LASER_BAR_W)
+    print("  -> beam frame: %.0f rows copied, %d of them %d-wide bars"
+          % (rows / dn, bars, MM_LASER_BAR_W))
+    # 2,861 rows a frame before the beams moved into the scanout (three 16x768
+    # bars are 2,304 of them, one DRAM row activation each), 1,603 after.
+    assert rows / dn <= BEAM_ROW_CAP, (
+        "a beam frame copies %.0f rows into the framebuffer; the beams are the "
+        "scanout's columns now and should not be here at all (cap %d)"
+        % (rows / dn, BEAM_ROW_CAP))
+
+    # ---- what that volley costs the engine ------------------------------
+    # Graded here, while the 48 shots are still in the air, because that is the
+    # frame the bus actually struggles with.  A bullet drawn with OP_ALPHA is a
+    # read-modify-write, and the shot loop is the largest single source of
+    # commands in the build, so one alpha per bullet is exactly how the opener
+    # goes over budget.
+    a0, c0, f0, n0 = (vm.blit_alpha_calls, vm.blit_copy_calls,
+                      vm.blit_fill_calls, tlm(vm, 'frames'))
+    assert wait_frames(vm, 4), "the game stopped producing frames"
+    dn = max(1, tlm(vm, 'frames') - n0)
+    alphas = (vm.blit_alpha_calls - a0) / dn
+    copies = (vm.blit_copy_calls - c0) / dn
+    fills = (vm.blit_fill_calls - f0) / dn
+    print("  -> entrance frame: %.1f ALPHA, %.1f COPY, %.1f FILL commands a "
+          "frame" % (alphas, copies, fills))
+    assert alphas <= OPENER_ALPHA_CAP, (
+        "the entrance frame issues %.1f OP_ALPHA commands a frame; a "
+        "read-modify-write per bullet is what stalls the bus with the field "
+        "full (cap %d)" % (alphas, OPENER_ALPHA_CAP))
+
     # Clear the entrance volley: it is 90 frames of laser and 48 shots, and the
     # pixel assertions below grade a different card entirely.
     poke(vm, sym_addr('boss_laser'), 0, 1)
@@ -3252,41 +3328,35 @@ def run_boss_opener(code, output_dir=None):
     fb = vm.fb[vm.right_request]
 
     # ---- the laser columns, column by column ---------------------------
-    # Two kinds of evidence, because the columns are a COMMAND as much as a
-    # picture:
-    #
-    #   1. the engine must have issued the 16x480 COPYs - one per column per
-    #      frame, source MM_LASER_BAR.  This is what the firmware controls and
-    #      it is what the player sees on the board.
-    #   2. the bar colour must be on screen somewhere in the playfield.
-    #
-    # Asserting (1) alone would pass a build that draws off-screen; asserting
-    # (2) alone would pass a build whose columns came from somewhere else.
-    bar_copies = [c for c in getattr(vm, "copy_log", [])
-                  if c[0] == MM_LASER_BAR_W and c[1] == MM_LASER_BAR_H]
-    print("  -> %d bar COPYs issued (16x480 from MM_LASER_BAR)" % len(bar_copies))
-    assert len(bar_copies) >= 4, (
-        "the card never issued its columns: %d 16x480 COPYs during the opener"
-        % len(bar_copies))
-    srcs = {c[2] for c in bar_copies}
-    assert all(MM_LASER_BAR <= s < MM_LASER_BAR + 3 * MM_LASER_BAR_BYTES
-               for s in srcs), (
-        "the columns copied from somewhere other than MM_LASER_BAR: %s"
-        % sorted(hex(s) for s in srcs))
-    dsts = sorted({c[3] for c in bar_copies})
-    print("  -> %d distinct destinations, first %d columns"
-          % (len(dsts), min(4, len(dsts))))
+    # The columns are not framebuffer pixels any more.  They are synthesised by
+    # the scanout (rtl/v_dma/video_laser.v) from the weather control word's
+    # enable/band bits and the four x centres in APB 0xB0 / 0xB4 - four 16x768
+    # copies a frame was 3,072 DRAM row activations, which is the frame the
+    # board lost, and the whole point of the move is that the engine now issues
+    # nothing at all for them.  The VM has no scanout, so there is no bar COPY
+    # to look for and no column pixel to sample anywhere in the frame: what the
+    # firmware controls, and what this can still grade, is that it stands the
+    # four columns up and tells the hardware where they are.
+    ctrl_word = vm.params.get(0x78, 0)
+    assert ctrl_word & (1 << 18), (
+        "the opener never enabled the hardware laser columns (ctrl %#x)"
+        % ctrl_word)
 
-    bar_hits = 0
-    for y in range(150, 620, 3):
-        row = y * SCREEN_PITCH
-        for x in range(GAME_LEFT, GAME_RIGHT, 2):
-            if (fb[row + x] & 0xFFFFFF) in LASER_COLOURS:
-                bar_hits += 1
-    print("  -> %d screen pixels carry a bar colour" % bar_hits)
-    assert bar_hits >= 200, (
-        "the columns left no colour on screen: only %d pixels carry a bar "
-        "colour in the whole playfield" % bar_hits)
+    def columns():
+        out = []
+        for w in (0xB0, 0xB4):
+            v = vm.params.get(w, 0)
+            out += [v & 0xFFF, (v >> 12) & 0xFFF]
+        return out
+
+    cols = columns()
+    print("  -> hardware columns at %s, band %d"
+          % (cols, (ctrl_word >> 19) & 3))
+    expect = [GAME_LEFT + (GAME_RIGHT - GAME_LEFT) * (2 * k + 1) // 8
+              for k in range(4)]
+    assert cols == expect, (
+        "the opener's columns stand at %s; main.c's BOSS_LASER_X puts them at "
+        "%s" % (cols, expect))
 
     # ---- the impact bursts --------------------------------------------
     bx, by = tlm(vm, 'boss_x'), tlm(vm, 'boss_y')

@@ -116,6 +116,16 @@ module bitblt_apb_regs #(parameter CLOCK_HZ = 100000000) (
     output reg  [31:0] weather_mask_x,
     output reg  [31:0] weather_mask_y,
 
+    // Laser column centres, 2 x 12 bits each, written at
+    //     0xB0  columns 0 and 1   {8'd0, x1[11:0], x0[11:0]}
+    //     0xB4  columns 2 and 3   {8'd0, x3[11:0], x2[11:0]}
+    // The scanout draws the columns itself (video_laser.v); what it cannot know
+    // is WHERE they stand, and the cut/beam lasers move, so the firmware writes
+    // the four centres whenever the set of standing columns changes.  A centre of
+    // 0 parks that column off screen - the playfield starts at x = 181.
+    output reg  [23:0] laser_colx_lo,
+    output reg  [23:0] laser_colx_hi,
+
     // Video stream 3x3 color matrix control (0x7C, Phase 1 Task 03).
     // Packed as [3:0] mode, [15:8] intensity
     output reg  [31:0] color_matrix_ctrl,
@@ -286,6 +296,8 @@ module bitblt_apb_regs #(parameter CLOCK_HZ = 100000000) (
             weather_ctrl         <= 32'd0;
             weather_mask_x       <= 32'd0;
             weather_mask_y       <= 32'd0;
+            laser_colx_lo        <= 24'd0;
+            laser_colx_hi        <= 24'd0;
             color_matrix_ctrl    <= 32'd0;
             bloom_ctrl           <= 32'd0;
             asset_addr           <= 14'd0;
@@ -364,6 +376,8 @@ module bitblt_apb_regs #(parameter CLOCK_HZ = 100000000) (
                     8'h7C: color_matrix_ctrl <= apb_pwdata[31:0];
                     8'h8C: weather_mask_x    <= apb_pwdata[31:0];
                     8'hAC: weather_mask_y    <= apb_pwdata[31:0];
+                    8'hB0: laser_colx_lo     <= apb_pwdata[23:0];
+                    8'hB4: laser_colx_hi     <= apb_pwdata[23:0];
                     8'h80: asset_addr        <= apb_pwdata[13:0];
                     8'h88: bloom_ctrl        <= apb_pwdata[31:0];
                     default: ;
@@ -420,6 +434,8 @@ module bitblt_apb_regs #(parameter CLOCK_HZ = 100000000) (
                 // explains a flake sitting on the menu.
                 8'h8C: apb_prdata = weather_mask_x;
                 8'hAC: apb_prdata = weather_mask_y;
+                8'hB0: apb_prdata = {8'd0, laser_colx_lo};
+                8'hB4: apb_prdata = {8'd0, laser_colx_hi};
                 8'h84: apb_prdata = {24'd0, asset_data};  // asset ROM byte
                 8'h88: apb_prdata = bloom_ctrl;
                 8'h90: apb_prdata = snp_worst_cyc;
