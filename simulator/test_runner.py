@@ -1195,6 +1195,23 @@ def run_stage_progression(code, output_dir=None):
     assert tlm(vm, 'boss_st') != 0, "the boss never appeared after the quota"
     print("  -> boss entered (hp %d)" % tlm(vm, 'boss_hp'))
 
+    # ---- 3b. the dialogue card publishes the occlusion box --------------
+    # The boss's arrival card is framebuffer pixels like the pause card, and the
+    # snow layer is composited above the framebuffer, so the card is only clean
+    # because the firmware hands the scanout its rectangle to leave alone
+    # (0x8C / 0xAC).  800x176 centred in the playfield: DIALOG_* in main.c.
+    if tlm(vm, 'boss_st') == 4:
+        dialog_box = (283, 1082, 296, 471)
+        box_x = vm.params.get(0x8C, 0)
+        box_y = vm.params.get(0xAC, 0)
+        assert box_x >> 31, "a dialogue is on screen but no occlusion box is published"
+        now_box = (box_x & 0x7FF, (box_x >> 11) & 0x7FF,
+                   box_y & 0x7FF, (box_y >> 11) & 0x7FF)
+        assert now_box == dialog_box, \
+            "dialogue occlusion box is %s, the card is %s" % (now_box, dialog_box)
+        print("  -> dialogue occlusion box x %d..%d y %d..%d follows the card"
+              % dialog_box)
+
     # Story V3 pauses gameplay for three pages before the boss fights. Exercise
     # the real centre-button skip path so the old regression still reaches
     # attack patterns without waiting for the automatic page timeouts.
@@ -1284,6 +1301,25 @@ def run_settings_menu(code, output_dir=None):
         "the world kept running while paused (%d -> %d)" % (frames0, tlm(vm, 'frames'))
     print("  -> B opened the menu, world frozen at frame %d" % frames0)
 
+    # ---- 1b. the card publishes the weather occlusion box ---------------
+    # The scanout composites the snow ABOVE the framebuffer, so the card - which
+    # is only pixels in the framebuffer - keeps clean lettering only because the
+    # firmware hands the scanline logic the rectangle to leave alone.
+    # 0x8C is {enable, x1[10:0], x0[10:0]}; 0xAC is {10'd0, y1[10:0], y0[10:0]}.
+    card_w, card_h = 512, 352
+    card_x, card_y = (1366 - card_w) // 2, (768 - card_h) // 2
+    box_x = vm.params.get(0x8C, 0)
+    box_y = vm.params.get(0xAC, 0)
+    assert box_x >> 31, "the pause card published no weather occlusion box"
+    assert (box_x & 0x7FF, (box_x >> 11) & 0x7FF) == (card_x, card_x + card_w - 1), \
+        "occlusion box x is %d..%d, the card is %d..%d" % (
+            box_x & 0x7FF, (box_x >> 11) & 0x7FF, card_x, card_x + card_w - 1)
+    assert (box_y & 0x7FF, (box_y >> 11) & 0x7FF) == (card_y, card_y + card_h - 1), \
+        "occlusion box y is %d..%d, the card is %d..%d" % (
+            box_y & 0x7FF, (box_y >> 11) & 0x7FF, card_y, card_y + card_h - 1)
+    print("  -> weather occlusion box x %d..%d y %d..%d follows the card" % (
+        card_x, card_x + card_w - 1, card_y, card_y + card_h - 1))
+
     # ---- 2. hardware acceleration toggle --------------------------------
     before = vm.starts
     for _ in range(TICK * 2):
@@ -1328,7 +1364,21 @@ def run_settings_menu(code, output_dir=None):
     for _ in range(TICK * 3):
         vm.step()
     assert tlm(vm, 'frames') > frames1, "the world did not resume"
-    print("  -> RESUME closed the menu, world running again (frame %d)" % tlm(vm, 'frames'))
+    # The box follows whichever panel is actually up.  The pause card is gone; on
+    # screen now is the stage title card, which is up for the first 170 frames of
+    # a stage - so the box must be either cleared or the banner's own rectangle,
+    # and never the card's.
+    box_x = vm.params.get(0x8C, 0)
+    box_y = vm.params.get(0xAC, 0)
+    now_box = (box_x & 0x7FF, (box_x >> 11) & 0x7FF,
+               box_y & 0x7FF, (box_y >> 11) & 0x7FF)
+    banner_box = (473, 892, 196, 259)   # stage_banner_render(): 420x64, y = 196
+    assert not (box_x >> 31) or now_box == banner_box, \
+        "after RESUME the occlusion box is %s: neither cleared nor the stage " \
+        "banner %s" % (now_box, banner_box)
+    print("  -> RESUME closed the menu, world running again (frame %d); "
+          "occlusion box now %s" % (tlm(vm, 'frames'),
+                                    "cleared" if not (box_x >> 31) else "on the stage banner"))
 
     # ---- 5. EXIT returns to the boot menu -------------------------------
     press_until('b', 'paused', 1)

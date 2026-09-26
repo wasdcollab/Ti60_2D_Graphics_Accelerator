@@ -4064,6 +4064,97 @@ static void burst_render(uint32_t fb, int x, int y, int age)
                MM_BURST_FRAME_STRIDE, SCREEN_STRIDE);
 }
 
+/* ---- UI weather occlusion -------------------------------------------------
+ *
+ * The weather layer is synthesised by the scanout ABOVE the framebuffer, so every
+ * panel that exists only as pixels in the framebuffer - the pause card, the
+ * boss's dialogue card, the stage title card - has snow falling through its
+ * lettering.  Switching the layer off for the whole screen whenever a panel is up
+ * buys clean text and an empty sky, and the battlefield is supposed to keep its
+ * snow, so the scanline logic is handed the panel's bounding box instead
+ * (rtl/v_dma/video_weather.v) and stops compositing the dots that fall inside it.
+ * A flake one pixel outside the border falls exactly as it did before.
+ *
+ * One frame, one box.  A panel declares its own rectangle while it paints
+ * (weather_box_cover) and the frame publishes the union of what was declared
+ * (weather_box_publish), so two panels up at once - the pause card over a
+ * dialogue, say - are both covered without either one having to know about the
+ * other, and a frame with no panel up clears the box with the single write that
+ * drops its enable.  A box the scanout already holds is not re-sent, which is
+ * what keeps this at zero writes on the frames where nothing moves.  None of it
+ * touches the weather control word, which keeps running underneath. */
+static uint8_t weather_box_on;       /* the scanout is holding a box right now */
+static uint8_t weather_box_staged;   /* this frame declared at least one panel */
+static int16_t weather_box_x0, weather_box_y0, weather_box_x1, weather_box_y1;
+static int16_t weather_sent_x0, weather_sent_y0, weather_sent_x1, weather_sent_y1;
+
+/* The box fields are 11 bits wide and the screen sits well inside them; clamping
+ * is here so a panel that hangs off an edge degrades to its visible part instead
+ * of wrapping into the far side of the screen. */
+#define WEATHER_BOX_MAX 2047
+
+static void weather_box_begin(void)
+{
+    weather_box_staged = 0u;
+}
+
+static void weather_box_cover(int x0, int y0, int x1, int y1)
+{
+    if (x1 < 0 || y1 < 0 || x0 > WEATHER_BOX_MAX || y0 > WEATHER_BOX_MAX)
+        return;                                  /* none of it is on screen */
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > WEATHER_BOX_MAX) x1 = WEATHER_BOX_MAX;
+    if (y1 > WEATHER_BOX_MAX) y1 = WEATHER_BOX_MAX;
+
+    if (!weather_box_staged) {
+        weather_box_x0 = (int16_t)x0;
+        weather_box_y0 = (int16_t)y0;
+        weather_box_x1 = (int16_t)x1;
+        weather_box_y1 = (int16_t)y1;
+        weather_box_staged = 1u;
+        return;
+    }
+    if (x0 < weather_box_x0) weather_box_x0 = (int16_t)x0;
+    if (y0 < weather_box_y0) weather_box_y0 = (int16_t)y0;
+    if (x1 > weather_box_x1) weather_box_x1 = (int16_t)x1;
+    if (y1 > weather_box_y1) weather_box_y1 = (int16_t)y1;
+}
+
+static void weather_box_publish(void)
+{
+    if (weather_box_staged) {
+        if (weather_box_on &&
+            weather_box_x0 == weather_sent_x0 &&
+            weather_box_y0 == weather_sent_y0 &&
+            weather_box_x1 == weather_sent_x1 &&
+            weather_box_y1 == weather_sent_y1)
+            return;                              /* the scanout already holds it */
+        GPU2D_REG_WEATHER_MASK_Y = ((uint32_t)weather_box_y1 << 11) |
+                                   (uint32_t)weather_box_y0;
+        GPU2D_REG_WEATHER_MASK_X = (1u << 31) |
+                                   ((uint32_t)weather_box_x1 << 11) |
+                                   (uint32_t)weather_box_x0;
+        weather_sent_x0 = weather_box_x0;
+        weather_sent_y0 = weather_box_y0;
+        weather_sent_x1 = weather_box_x1;
+        weather_sent_y1 = weather_box_y1;
+        weather_box_on = 1u;
+    } else if (weather_box_on) {
+        GPU2D_REG_WEATHER_MASK_X = 0u;   /* the enable lives here: one write clears it */
+        weather_box_on = 0u;
+    }
+}
+
+/* Used when the game leaves the screen entirely (boot menu): the next screen is
+ * not a panel over the battlefield, so nothing of this must survive into it. */
+static void weather_box_release(void)
+{
+    if (!weather_box_on) return;
+    GPU2D_REG_WEATHER_MASK_X = 0u;
+    weather_box_on = 0u;
+}
+
 /* Stage title card.  The backdrop already changed when the previous boss
  * died, so a short banner is what tells the player that the scenery is
  * deliberate and not a glitch.  It fades out over its last 40 frames by
@@ -4196,6 +4287,10 @@ static void stage_banner_render(uint32_t fb)
     if (w < 8 || h < 4) return;
 
     uint32_t base = fb + (uint32_t)(y * SCREEN_STRIDE) + (uint32_t)(x * 4);
+    /* Same deal as the pause card: the banner is framebuffer pixels, so the
+     * scanout has to be told to leave this rectangle alone.  The box follows the
+     * shrink, so the flakes come back with the edges as the banner fades. */
+    weather_box_cover(x, y, x + w - 1, y + h - 1);
     r_fill(base, (uint32_t)w, (uint32_t)h, 0x00101830u, SCREEN_STRIDE);
     r_fill(base, (uint32_t)w, 3, 0x00FFE4A0u, SCREEN_STRIDE);
     r_fill(base + (uint32_t)((h - 3) * SCREEN_STRIDE), (uint32_t)w, 3,
@@ -4926,6 +5021,10 @@ static void game_render(uint32_t fb)
             "TIME TO WAKE FROM THIS DREAM."
         };
         uint32_t base = fb + DIALOG_Y * SCREEN_STRIDE + DIALOG_X * 4u;
+        /* The card is framebuffer pixels like everything else here, so the snow
+         * would fall straight through its text; punch it out of the layer. */
+        weather_box_cover(DIALOG_X, DIALOG_Y,
+                          DIALOG_X + DIALOG_W - 1, DIALOG_Y + DIALOG_H - 1);
         r_fill(base, DIALOG_W, DIALOG_H, 0x00141A32u, SCREEN_STRIDE);
         r_fill(base, DIALOG_W, 4, accent, SCREEN_STRIDE);
         r_fill(base + (DIALOG_W - 4u) * 4u, 4, 4, accent, SCREEN_STRIDE);
@@ -4961,37 +5060,6 @@ static void game_render(uint32_t fb)
 #define SET_CARD_W  512
 #define SET_CARD_H  352
 
-/* ---- pause-card weather occlusion ----------------------------------------
- *
- * The weather layer is synthesised by the scanout ABOVE the framebuffer, so the
- * card - which is only pixels in the framebuffer - has snow falling on its
- * lettering.  Turning the layer off for the whole screen while paused buys clean
- * text and an empty sky, and the frozen battlefield is supposed to keep its snow,
- * so the scanline logic is handed the card's exact bounding box instead and stops
- * compositing the dots that fall inside it (video_weather.v).  A flake one pixel
- * outside the border falls exactly as it did before.
- *
- * Publishing is once per pause: the geometry is a compile-time constant, so the
- * flag makes the second and later paused frames free, and releasing is a single
- * write that the first unpaused frame performs.  Neither touches the weather
- * control word, which keeps running - frozen - underneath. */
-static uint8_t weather_box_on;
-
-static void weather_box_set(int x0, int y0, int x1, int y1)
-{
-    if (weather_box_on) return;
-    GPU2D_REG_WEATHER_MASK_Y = ((uint32_t)y1 << 11) | (uint32_t)y0;
-    GPU2D_REG_WEATHER_MASK_X = (1u << 31) | ((uint32_t)x1 << 11) | (uint32_t)x0;
-    weather_box_on = 1;
-}
-
-static void weather_box_release(void)
-{
-    if (!weather_box_on) return;
-    GPU2D_REG_WEATHER_MASK_X = 0u;   /* the enable lives here; clear it and the box is gone */
-    weather_box_on = 0;
-}
-
 static const char * const settings_labels[SET_ITEMS] = {
     "INF RESPAWN", "HW ACCEL", "RESUME", "EXIT"
 };
@@ -5026,7 +5094,7 @@ static void settings_render(uint32_t fb)
     pause_card(fb, px, py, pw, ph);
     /* The card is the one thing on this screen the weather must not paint on;
      * everything outside the box keeps its flakes. */
-    weather_box_set(px, py, px + pw - 1, py + ph - 1);
+    weather_box_cover(px, py, px + pw - 1, py + ph - 1);
     draw_text(fb, px + 20, py + 14, "PAUSED", 5, 0x00FFE4A0u);
     draw_text(fb, px + 20, py + 64, "WORLD TIME IS FROZEN", 2, 0x00FFFFFFu);
     draw_text(fb, px + 20, py + ph - 30, "Y / A SELECT   X CONFIRM", 2,
@@ -5968,6 +6036,9 @@ int main(void)
                 }
             }
 
+            /* Every panel that paints into the framebuffer this pass declares its
+             * own rectangle; what the scanout gets is their union. */
+            weather_box_begin();
             if (paused) {
                 int act = settings_input(&pad);
                 if (act == ACT_RESUME) {
@@ -5994,9 +6065,6 @@ int main(void)
                 r_sync();
                 gpu2d_flush_dcache();
             } else {
-                /* The card is off the screen again, so the sky gets its middle
-                 * back.  One write, and only on the frame after a pause. */
-                weather_box_release();
                 /* Fixed-step catch-up: 75 logic ticks a second whatever the
                  * scanout did or did not show.  LOGIC_MAX_STEPS bounds the
                  * burst, so a pathologically slow frame loses time instead of
@@ -6024,6 +6092,7 @@ int main(void)
                     continue;
                 }
             }
+            weather_box_publish();
 
             /* Publish telemetry at the END of the pass and BEFORE the
              * scanout flip.  The workbench's frame gate waits for the frame

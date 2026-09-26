@@ -769,6 +769,16 @@ class SapphireSoCVM:
         elif off == 0x88:
             # Bloom filter control (scanout post-processing, no-op in VM)
             self.params[0x88] = val
+        elif off == 0x8C:
+            # Weather occlusion box, X half: {enable, x1[10:0], x0[10:0]}.  The
+            # scanout is what composites the layer, so the VM has nothing to
+            # paint - but the box is stored, because "the firmware asked for this
+            # rectangle" is exactly what a panel scenario wants to check.  Read
+            # back through the generic window above.
+            self.params[0x8C] = val
+        elif off == 0xAC:
+            # Weather occlusion box, Y half: {10'd0, y1[10:0], y0[10:0]}
+            self.params[0xAC] = val
         elif off == 0x80:
             # Asset ROM index (0x84 reads the byte back).  Modelled because the
             # firmware's boot path depends on it; see _load_asset_rom().
