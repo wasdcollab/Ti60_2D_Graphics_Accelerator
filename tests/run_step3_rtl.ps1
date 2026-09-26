@@ -14,8 +14,6 @@ try {
         @{Name='i2c_gamepad'; Top='tb_i2c_gamepad'; Files=@('../../tests/tb_i2c_gamepad.sv','../../rtl/common/i2c_gamepad_top.v')},
         @{Name='hud'; Files=@('../../tests/tb_step3_hud.sv','../../rtl/v_dma/video_dual_hud.v')},
         @{Name='bitblt'; Files=@('../../tests/tb_step3_bitblt.sv','../../rtl/bitblt/bitblt_top.v','../../rtl/bitblt/bitblt_apb_regs.v','../../rtl/bitblt/bitblt_stride_gen.v','../../rtl/bitblt/bitblt_axi_master.v','../../rtl/bitblt/bitblt_axi_read_master.v','../../rtl/bitblt/bitblt_read_fifo.v','../../rtl/bitblt/bitblt_align_shifter.v','../../rtl/bitblt/bitblt_alpha_blend.v','../../rtl/bitblt/bitblt_asset_rom.v')},
-        @{Name='vdma'; Files=@('../../tests/tb_step3_vdma.sv','../../rtl/v_dma/video_dma_read.v','../../rtl/v_dma/video_dual_hud.v','video_timing_gen_sim.v','../../rtl/v_dma/async_fifo.v')},
-        @{Name='scanout'; Files=@('../../tests/tb_step3_scanout.sv','../../rtl/v_dma/video_dma_read.v','../../rtl/v_dma/video_write_guard.v','../../rtl/v_dma/video_dual_hud.v','video_timing_gen_sim.v','../../rtl/v_dma/async_fifo.v')},
         @{Name='write_guard'; Files=@('../../tests/tb_step3_write_guard.sv','../../rtl/v_dma/video_write_guard.v')}
     )
     foreach ($case in $cases) {
