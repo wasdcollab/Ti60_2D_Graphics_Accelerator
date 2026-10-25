@@ -97,7 +97,11 @@ def run(path, out_path=None, verbose=True):
     for idx, (op, so, do, w, h, ss, ds, col) in enumerate(vecs):
         snap = bytes(src)                       # source snapshot before the op
         dst = bytearray(MEMSZ)
-        if op == 0:
+        # parse_op_type() is the single place that says which opcode means what.
+        # This used to test op == 0 here while the helper tested op & 3 == 0, so a
+        # value like op = 4 would have been a fill for one and a copy for the other.
+        kind = parse_op_type(op)
+        if kind == "fill":
             written = blit_fill(dst, do, w, h, ds, col)
         else:
             written = blit_copy(snap, dst, so, do, w, h, ss, ds)

@@ -1,0 +1,2 @@
+PASS bounded write service: continuous video priority, stalled AW, 16-beat W, stalled B, next request
+tests/tb_write_guard_liveness.sv:35: $finish called at 5340000 (1ps)

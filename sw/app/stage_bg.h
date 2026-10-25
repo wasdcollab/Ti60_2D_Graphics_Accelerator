@@ -50,5 +50,6 @@ typedef struct {
 
 extern const stage_asset_t stage_assets[SB_COUNT];
 extern const uint8_t *stage_rle[SB_COUNT];
+void stress_bg_build(void);
 
 #endif /* STAGE_BG_H */

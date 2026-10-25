@@ -1,0 +1,2 @@
+PASS additive blend: 8192 pixels, saturation, key holes, destination alpha and stalls
+tests/tb_alpha_fade.sv:70: $finish called at 24700000 (1ps)

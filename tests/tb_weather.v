@@ -295,7 +295,7 @@ module tb_weather;
         $display("checked=%0d pixels, errors=%0d", checked, errors);
         if (errors == 0) $display("RESULT: PASS");
         else             $display("RESULT: FAIL");
-        $finish;
+        $finish(errors ? 1 : 0);
     end
 
 endmodule

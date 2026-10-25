@@ -21,3 +21,171 @@ const stage_asset_t stage_assets[SB_COUNT] = {
  * uploaded keeps a NULL here, so a missed upload decodes nothing
  * instead of walking off the end of a stale pointer. */
 const uint8_t *stage_rle[SB_COUNT];
+
+#include "memory_map.h"
+#include "gpu2d.h"
+
+void stress_bg_build(void)
+{
+    static const uint32_t sky_bands[20] = {
+        0x00020510u, 0x00030718u, 0x00040A22u, 0x00060E2Eu,
+        0x0008133Au, 0x000B1948u, 0x000F2056u, 0x00142764u,
+        0x001A2D70u, 0x0022327Au, 0x002C3580u, 0x00363582u,
+        0x0040337Eu, 0x004A2F76u, 0x0054296Au, 0x005C235Cu,
+        0x00621E4Eu, 0x00641A40u, 0x00601634u, 0x0056122Au
+    };
+    static const int16_t bg_peaks[17] = {
+        260, 210, 175, 230, 195, 275, 330, 375, 375, 340, 275, 205, 170, 215, 185, 245, 260
+    };
+    static const int16_t fg_peaks[17] = {
+        430, 390, 340, 300, 335, 380, 435, 470, 470, 435, 380, 335, 300, 340, 390, 430, 450
+    };
+
+    volatile uint32_t *row = (volatile uint32_t *)MM_STRESS_BG;
+
+    for (unsigned y = 0; y < SB_BG_H; y++) {
+        unsigned b_idx = (y * 20u) / 460u;
+        if (b_idx >= 20u) b_idx = 19u;
+        uint32_t sky_c = sky_bands[b_idx];
+        uint32_t sr = (sky_c >> 16) & 0xFFu;
+        uint32_t sg = (sky_c >> 8) & 0xFFu;
+        uint32_t sb = sky_c & 0xFFu;
+        int dy_caldera = (int)y - 470;
+        int dy_cr = (int)y - 580;
+
+        for (unsigned x = 0; x < SB_BG_W; x++) {
+            uint32_t r = sr, g = sg, b = sb;
+
+            if (y < 280u) {
+                uint32_t h = (x * 1664525u + y * 1013904223u) ^ 0x20261011u;
+                h ^= h >> 16;
+                if ((h & 0x7FFu) == 0x123u) {
+                    r = 255u; g = 255u; b = 255u;
+                } else if ((h & 0x7FFu) == 0x456u) {
+                    r = 160u; g = 208u; b = 255u;
+                }
+            }
+
+            int dx_c = (int)x - 683;
+            if (dx_c < 0) dx_c = -dx_c;
+            int dist_sq = dx_c * dx_c + dy_caldera * dy_caldera * 3;
+            if (dist_sq < 260 * 260) {
+                int glow = (260 * 260 - dist_sq) / 450;
+                if (glow > 90) glow = 90;
+                r += (uint32_t)glow;
+                g += (uint32_t)(glow / 4);
+                if (b > (uint32_t)(glow / 3)) b -= (uint32_t)(glow / 3);
+                else b = 0;
+                if (r > 255u) r = 255u;
+                if (g > 255u) g = 255u;
+            }
+
+            unsigned seg_bg = (x * 16u) / SB_BG_W;
+            if (seg_bg >= 16u) seg_bg = 15u;
+            unsigned rem_bg = (x * 16u) - seg_bg * SB_BG_W;
+            int base_bg = bg_peaks[seg_bg] + ((bg_peaks[seg_bg + 1u] - bg_peaks[seg_bg]) * (int)rem_bg) / (int)SB_BG_W;
+            int noise_bg = (int)((x * 37u + 13u) & 15u) - 7;
+            int by = base_bg + noise_bg;
+
+            if ((int)y >= by) {
+                int dy = (int)y - by;
+                if (dy < 36) {
+                    int shade = (36 - dy) * 3;
+                    r = 195u + (uint32_t)shade;
+                    g = 220u + (uint32_t)shade;
+                    b = 248u + (uint32_t)(shade / 2);
+                    if (((x ^ (y >> 1)) & 3u) == 0u) {
+                        r = (r > 30u) ? r - 30u : 0u;
+                        g = (g > 25u) ? g - 25u : 0u;
+                        b = (b > 15u) ? b - 15u : 0u;
+                    }
+                    if (r > 255u) r = 255u;
+                    if (g > 255u) g = 255u;
+                    if (b > 255u) b = 255u;
+                } else {
+                    int dep = (dy - 36 < 50) ? (dy - 36) : 50;
+                    r = 24u + (uint32_t)(dep / 4);
+                    g = 38u + (uint32_t)(dep / 3);
+                    b = 62u + (uint32_t)(dep / 2);
+                }
+            }
+
+            unsigned seg_fg = (x * 16u) / SB_BG_W;
+            if (seg_fg >= 16u) seg_fg = 15u;
+            unsigned rem_fg = (x * 16u) - seg_fg * SB_BG_W;
+            int base_fg = fg_peaks[seg_fg] + ((fg_peaks[seg_fg + 1u] - fg_peaks[seg_fg]) * (int)rem_fg) / (int)SB_BG_W;
+            int noise_fg = (int)((x * 53u + 19u) & 15u) - 7;
+            int fy = base_fg + noise_fg;
+
+            if ((int)y >= fy) {
+                int dy = (int)y - fy;
+                /* The caldera used to be a WINDOW: every pixel inside
+                 * x 430..936 with y >= 440 took the magma palette, so the
+                 * rock face carried a hard-edged rectangle of it - two
+                 * vertical seams and one horizontal, dead straight, on a
+                 * slope that is otherwise all curves.  On the board it
+                 * reads as a rendering fault rather than as rock.
+                 *
+                 * The region is now the very ellipse the lava rings are
+                 * drawn from, so the shape of the area matches the shape
+                 * of the thing in it.  Its outermost ring is a dark
+                 * basalt whose channels (28,14,16) sit within a few
+                 * levels of the wall the branch below paints at the same
+                 * place - 24+dx_c/20, 16+dx_c/35, 22+dx_c/25 - so the
+                 * seam that was a straight line becomes a soft curve in
+                 * near-identical tones, and stops reading as an edge. */
+                int dx_cr = (int)x - 683;
+                int d_magma_sq = dx_cr * dx_cr + dy_cr * dy_cr * 4;
+
+                if (d_magma_sq < 200 * 200) {
+                    if (d_magma_sq < 55 * 55) {
+                        r = 255u; g = 246u; b = 190u;
+                    } else if (d_magma_sq < 90 * 90) {
+                        r = 255u; g = 160u; b = 24u;
+                    } else if (d_magma_sq < 135 * 135) {
+                        r = 210u; g = 40u; b = 10u;
+                    } else if (d_magma_sq < 170 * 170) {
+                        r = 90u; g = 18u; b = 12u;
+                    } else {
+                        r = 28u; g = 14u; b = 16u;
+                    }
+
+                    if ((((x >> 3) ^ (y >> 2)) % 7u == 0u) &&
+                        (d_magma_sq > 45 * 45) && (d_magma_sq < 160 * 160)) {
+                        r = 38u; g = 12u; b = 14u;
+                    }
+
+                    if ((x * 5u + y * 11u) % 89u < 3u) {
+                        r = 255u; g = 120u; b = 20u;
+                    }
+                } else {
+                    if (dy < 30 && y < 350u) {
+                        int shade = (30 - dy) * 4;
+                        r = 185u + (uint32_t)shade;
+                        g = 210u + (uint32_t)shade;
+                        b = 242u + (uint32_t)(shade / 2);
+                        if (r > 255u) r = 255u;
+                        if (g > 255u) g = 255u;
+                        if (b > 255u) b = 255u;
+                    } else {
+                        int off_x = (dx_c / 20 < 40) ? dx_c / 20 : 40;
+                        int off_gx = (dx_c / 35 < 20) ? dx_c / 35 : 20;
+                        int off_bx = (dx_c / 25 < 30) ? dx_c / 25 : 30;
+                        r = 24u + (uint32_t)off_x;
+                        g = 16u + (uint32_t)off_gx;
+                        b = 22u + (uint32_t)off_bx;
+
+                        if (y >= 460u && dx_c < 420 && ((x * 7u + y * 13u) % 113u < 3u)) {
+                            r = 245u; g = 75u; b = 15u;
+                        }
+                    }
+                }
+            }
+
+            row[x] = (r << 16) | (g << 8) | b;
+        }
+        row += SCREEN_STRIDE / 4u;
+    }
+
+    gpu2d_flush_dcache();
+}

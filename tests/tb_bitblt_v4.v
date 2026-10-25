@@ -461,7 +461,7 @@ module tb_bitblt_v4;
                  u_mux.U3_Axi_Mux_Rd_Ctrl.AR2R_Error);
         $display("    bitblt rdy: bb_arvalid=%b bb_arready=%b bb_rvalid=%b bb_rready=%b bb_rlast=%b",
                  bb_arvalid, bb_arready, bb_rvalid, bb_rready, bb_rlast);
-        $finish;
+        $finish(1);   // stuck: the caller has to hear about it
       end
     end
 

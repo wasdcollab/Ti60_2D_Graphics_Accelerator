@@ -3,4 +3,4 @@
 // a base it does not document, whereas the SoC IP generator uses absolute
 // paths for its own $readmemb calls.  That is the one form this project
 // has seen work, and the tool that writes the data writes the path.
-`define BG_ROM_INIT_FILE "E:/FPGA/Ti60_2D_Graphics_Accelerator/rtl/bitblt/bg_rle.hex"
+`define BG_ROM_INIT_FILE "D:/Ti60_Recovery_20261024/Ti60_2D_Graphics_Accelerator/rtl/bitblt/bg_rle.hex"

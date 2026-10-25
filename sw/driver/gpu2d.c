@@ -29,19 +29,41 @@ void (*gpu2d_idle_hook)(void);
  * under 0.2% of the frame it measures. */
 uint32_t gpu2d_wait_cyc;
 
+/* Latch: the engine stayed busy far past any legitimate command.  From then
+ * on the driver stops waiting (and stops launching) instead of spinning
+ * forever.  A wedged BitBlt used to take the whole game down: every blit
+ * waited on cmd_busy, and cmd_busy only falls when the outstanding write
+ * responses arrive.  This is a safety net, not a recovery - the picture may
+ * stop updating - but the CPU, the scanout and the menus keep running. */
+uint32_t gpu2d_stalled;
+
+#define GPU2D_IDLE_GUARD 800000u    /* ~8 M cycles, timed ahead of hw watchdog */
+
 void gpu2d_wait_idle(void) {
     uint32_t t0 = GPU2D_REG_CORE_TICKS;
+    uint32_t guard = GPU2D_IDLE_GUARD;
+    /* Already timed out: do not pay the guard again on every command.  Probe
+     * once; if the engine has come back, resume normal operation. */
+    if (gpu2d_stalled) {
+        if (GPU2D_REG_STATUS & GPU2D_STATUS_BUSY_MASK) goto out;
+        gpu2d_stalled = 0u;
+    }
     if (gpu2d_idle_hook) {
         while (GPU2D_REG_STATUS & GPU2D_STATUS_BUSY_MASK) {
+            if (--guard == 0u) { gpu2d_stalled = 1u; goto out; }
             gpu2d_idle_hook();
         }
     } else {
         while (GPU2D_REG_STATUS & GPU2D_STATUS_BUSY_MASK) {
-            // Spin wait until hardware completes
+            if (--guard == 0u) { gpu2d_stalled = 1u; goto out; }
         }
     }
-    uint32_t t1 = GPU2D_REG_CORE_TICKS;
-    gpu2d_wait_cyc += (t1 >= t0) ? (t1 - t0) : (t1 + (100000000u - t0));
+    gpu2d_stalled = 0u;             /* it went idle: the engine is alive */
+out:
+    {
+        uint32_t t1 = GPU2D_REG_CORE_TICKS;
+        gpu2d_wait_cyc += (t1 >= t0) ? (t1 - t0) : (t1 + (100000000u - t0));
+    }
 }
 
 void gpu2d_finish(void) {
@@ -55,7 +77,9 @@ void gpu2d_finish(void) {
      * is ~700 commands, so this removes ~700 APB status polls and the
      * engine-idle bubble in front of each of them. */
     gpu2d_wait_idle();
-    GPU2D_REG_START = 1;
+    /* Do not launch into an engine that just timed out; the register set would
+     * sit there and the next command would overwrite it anyway. */
+    if (!gpu2d_stalled) GPU2D_REG_START = 1;
 }
 
 void gpu2d_fill(uint32_t dst_addr, uint32_t w, uint32_t h, uint32_t color, uint32_t dst_stride) {
@@ -105,8 +129,21 @@ void gpu2d_set_color_matrix(uint8_t mode, uint8_t intensity) {
     GPU2D_REG_COLOR_MATRIX = ((uint32_t)intensity << 8) | ((uint32_t)mode & 0x0Fu);
 }
 
+/* Must agree with bloom_style_sel in main.c, which is what game_init() pushes
+ * down on entry.  Both are 0 now: the tight round kernel, because the stage
+ * this build is judged on carries 192 shots at once. */
+static uint8_t current_bloom_style = 0u;
+
+void gpu2d_set_bloom_style(uint8_t style) {
+    current_bloom_style = style & 1u;
+    uint32_t reg = GPU2D_REG_BLOOM_CTRL;
+    reg = (reg & ~0x02u) | ((uint32_t)current_bloom_style << 1);
+    GPU2D_REG_BLOOM_CTRL = reg;
+}
+
 void gpu2d_set_bloom(uint8_t enable, uint8_t threshold, uint8_t intensity) {
-    GPU2D_REG_BLOOM_CTRL = ((uint32_t)intensity << 16) | ((uint32_t)threshold << 8) | (enable ? 1u : 0u);
+    GPU2D_REG_BLOOM_CTRL = ((uint32_t)intensity << 16) | ((uint32_t)threshold << 8) |
+                           ((uint32_t)current_bloom_style << 1) | (enable ? 1u : 0u);
 }
 
 void gpu2d_wait_vsync(void) {

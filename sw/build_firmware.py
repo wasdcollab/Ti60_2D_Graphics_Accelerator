@@ -18,7 +18,7 @@ The build is deliberately strict:
     extension is safe to enable.  Still no A, no C.
   * -Werror                  : warnings are build failures.
   * hard size gate           : the linked image must end at or below
-    0xF900FC00, because the SoC has 64 KiB of RAM and the top 1 KiB is
+    0xF900FD00, because the SoC has 64 KiB of RAM and the top 768 bytes are
     the stack.  The linker script enforces it; this script re-checks the
     symbol so a link that silently overflows can never ship.
 
@@ -35,9 +35,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-DEFAULT_GCC_DIR = os.environ.get("RISCV_GCC_DIR", r"E:\FPGA\toolchain\riscv-gcc")
+DEFAULT_GCC_DIR = os.environ.get("RISCV_GCC_DIR", r"D:\FPGAqiansai\toolchain")
 
-IMAGE_LIMIT = 0xF900FC00          # 64 KiB OCR; preserve the 1 KiB stack
+IMAGE_LIMIT = 0xF900FD00
 STACK_TOP = 0xF9010000
 
 # Symbols the simulation workbench writes to set up a situation it cannot
@@ -61,6 +61,7 @@ HARNESS_SYMBOLS = (
     # the boot menu is seven rows now and the workbench has to know which row
     # the D-pad is on to drive it.
     "menu_sel",
+    "hud_sig",                       # stress counters: verify rendered digits
     # phase 2 task 02: a hit now clears the field and leaves a mote of light on
     # every shot it removed.  The motes are the only evidence that the sweep ran
     # rather than the bullets merely expiring, and the ring they live in is a
@@ -79,12 +80,17 @@ HARNESS_SYMBOLS = (
     # beam frame costs the engine, without waiting for the boss to roll that
     # attack.
     "beam_x", "beam_timer", "beam_phase",
+    # ...and the craft's own beam, which A3 moved to the scanout alongside them.
+    # "is the beam up this frame" is what tells the overlay scenario that the
+    # register it is looking at is supposed to be enabled at all.
+    "beam_active",
 )
 
 SOURCES = [
     "startup/crt0.S",
     "driver/gpu2d.c",
     "driver/gamepad.c",
+    "driver/audio_stream.c",
     "app/main.c",
     "app/visual_assets.c",
     # The three stage plates are back, re-proportioned for 1366x768 and trimmed
@@ -108,7 +114,7 @@ LDFLAGS = [
     "-flto",
     "-Wl,--gc-sections",
     "-Wl,--build-id=none",
-    "-Wl,--no-relax",
+    "-Wl,--relax,--no-relax-gp",
     "-Wl,--no-warn-rwx-segments",
     "-lgcc",
 ]
@@ -153,6 +159,8 @@ def main():
     # only one of them would leave the decoder decoding another plate's stream.
     if run([sys.executable, os.path.join(ROOT,"tools","build_stage_backgrounds.py")]).returncode != 0:
         raise SystemExit("stage background generation failed (requires Pillow)")
+    if run([sys.executable, os.path.join(ROOT, "tools", "build_asset_rom.py")]).returncode != 0:
+        raise SystemExit("shared background/font asset ROM generation failed")
     # B2: the HUD table in main.c must not collide with the labels the asset
     # build just baked into the backdrop.
     if run([sys.executable, os.path.join(ROOT,"tools","check_hud_layout.py")]).returncode != 0:

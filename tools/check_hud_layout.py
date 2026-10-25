@@ -126,8 +126,20 @@ def main():
             bad.append("HUD %s %s is not fully on screen (%dx%d)"
                        % (a, boxes[a], sw, sh))
 
-    print("  HUD layout: %d elements, %d baked labels, playfield band x=%d..%d "
-          "on a %dx%d screen" % (len(names), len(labels), gl, gr, sw, sh))
+    print("  HUD layout: %d elements, %d baked label(s) to check against, "
+          "playfield band x=%d..%d on a %dx%d screen"
+          % (len(names), len(labels), gl, gr, sw, sh))
+    if not labels:
+        # This is the expected state, not a broken input: the backdrop has been
+        # painted by the firmware since 1366x768, and its labels are drawn with
+        # the same vector font as the numbers beside them, so nothing is baked
+        # into a plate any more (see HUD_LABELS.clear() in
+        # tools/build_visual_assets.py).  Saying so matters because the check
+        # below otherwise reports a pass over an empty list, which is how this
+        # line read for as long as the table has been empty.
+        print("    (no baked labels: the plates are painted by the firmware and"
+              " its labels are drawn at run time, so there is nothing baked to"
+              " collide with)")
     if bad:
         print("  *** %d layout collision(s):" % len(bad))
         for line in bad:

@@ -7,14 +7,14 @@
  * Mode 1 (SW0): 650-object CPU software rendering vs FPGA BitBlt benchmark,
  *               plus one hardware block copy (OP_COPY) per frame.
  * Mode 2 (SW2): playable bullet-hell stage:
- *   * the player SHOOTS bullets (集中 / 散射 / 扇形 plus a laser mode) instead
+ *   * the player SHOOTS bullets (??? / ??? / ??? plus a laser mode) instead
  *     of holding one permanent laser;
  *   * three themed stages; each boss arrives after a kill quota and dialogue;
  *   * minions drift, weave, hover and fire aimed / spread patterns, carry hit
  *     points and drop power-ups when destroyed;
  *   * the boss moves, summons minions and cycles through RANDOM attack patterns
  *     (fan / ring / aimed / spiral / cross / summon) rather than one fixed fan;
- *   * power-ups: 血包 / 攻速 / 攻击力 / 变换武器 / 分数;
+ *   * power-ups: ????/ ????/ ?????/ ?????? / ???;
  *   * the player carries a hardware-alpha aura (OP_ALPHA) that blends against
  *     the live background, i.e. the competition's alpha datapath runs every
  *     frame of the game.
@@ -26,6 +26,9 @@
 
 #include "gpu2d.h"
 #include "gamepad.h"
+#include "audio.h"
+#include "audio_stream.h"
+#include "asset_rom.h"
 #include "visual_assets.h"
 #include "stage_bg.h"
 
@@ -39,13 +42,78 @@ static const uint32_t palette[8] = {
 };
 
 #define MAGENTA_KEY     0x00FF00FFu
+
+/* ---- 图块角色号：形状的组成部分，与颜色无关 --------------------------------
+ *
+ * 扫描端的图块里一格存的不是调色板索引，而是"这一格是什么角色"：透明、
+ * 白、某类的霓虹主体、光晕第 k 级……角色由形状决定，与色相无关，所以三类
+ * 的八个颜色版本可以压成一份。真正的调色板索引在扫描端拼出来：
+ *
+ *     索引 = 角色号 + 色相 * 32
+ *
+ * 色相从桶条目的 [31:29] 来（bucket_put），就是发射那一刻的 b->color & 7。
+ * 角色号 0 是"这里没有东西"的哨兵，与调色板索引 0 是同一个约定 —— 扫描端
+ * 判断透不透明仍然看这个字节本身是不是 0，不看拼出来的索引。hue > 0 时
+ * 角色 0 会拼出 32/64/... 这些索引，它们永远读不到，填什么颜色都行。
+ *
+ * 页面大小取 32：角色一共 27 个（26 个非透明 + 哨兵），32 是装得下它的最小
+ * 2 的幂；2 的幂让扫描端那边的拼接就是一次左移，不需要加法。实测过程见
+ * scratch/tile颜色分离_侦察与方案.md。
+ */
+enum {
+    BROLE_NONE     = 0,     /* 透明 */
+    BROLE_WHITE    = 1,     /* 三类共用：敌弹白尖 / 玩家弹白芯 / 大玉白心 */
+    BROLE_NEON     = 2,     /* palette[h]，三类共用（大玉的主体也是它） */
+    BROLE_EB_CORE  = 3,     /* 敌弹电脊，色相往白靠 60/255 */
+    BROLE_ORB_CORE = 4,     /* 大玉亮核，色相往白靠 80/255 */
+    BROLE_PB_DIM   = 5,     /* 玩家弹外缘 */
+    BROLE_PB_QUART = 6,     /* 玩家弹尾梢，同时也是大玉的暗环（实测同一条） */
+    BROLE_PB_TINY  = 7,     /* 玩家弹最末的碎光 */
+    BROLE_PB_HOT   = 8,     /* 玩家弹核心尾迹 */
+    BROLE_EB_HALO  = 9,     /* 敌弹光晕第 1 级，往上排到 9..26 */
+    /* 追踪导弹（slot 18）。这两个角色是"一个形状里两种混合"的全部机关：
+     * 弹体的格子落在 27 上，拖尾的格子落在 28 上，扫描端逐像素取调色板，
+     * 两个角色的 alpha 不同（190 / BPAL_ADD），于是同一个弹的前半段走乘法
+     * alpha、后半段走加法。两者都不随色相变，见 brole_color()。 */
+    BROLE_MS_BODY  = 27,    /* 弹体：乘法 alpha，透出背后的雪山 */
+    BROLE_MS_TRAIL = 28     /* 拖尾：加法，亮到过曝 */
+};
+#define BROLE_EB_HALO_N  18u                                       /* 实测 18 级 */
+/* 26 -> 28：27/28 原本就是空的（角色位 0..31，用到 26）。 */
+#define BROLE_MAX        30u
+#define BPAL_PAGE        32u                                       /* 色相页大小 */
+
+/* 敌弹光晕那 18 级的 a。公式是 a = 180 - 7*dist，dist 从 1 到 20 本该有 20 级，
+ * 但 13x13 的整数网格上 t16 - w_core 取不到 96 和 68 这两个值：在真实固件
+ * 数据上数出来就是下面这 18 个（scratch/recon_color_split.py）。 */
+static const uint8_t eb_halo_a[BROLE_EB_HALO_N] = {
+    173u, 166u, 159u, 152u, 145u, 138u, 131u, 124u, 117u,
+    110u, 103u,  89u,  82u,  75u,  61u,  54u,  47u,  40u
+};
+
+/* ---- tile store 里的 slot 号 ---------------------------------------------
+ *
+ * 与 video_bullet_overlay.v 的 SMALL_TILES 那一套对齐，四个地方必须一致：
+ * 那个模块、tests/tb_bullet_overlay.sv 里那份拷贝、这里的调用、以及
+ * tools/gen_bullet_tiles.py 的 SETS 表。漏一处座台的 75425 项检查会全红。
+ *
+ *     slot  0..15   敌弹     26x26 行距 32 -> 每个 832 字节
+ *     slot 16       玩家弹   7x26  行距  8 -> 208 字节
+ *     slot 17       大玉     16x16 行距 16 -> 256 字节
+ *     slot 18       导弹     13x26 行距 16 -> 416 字节
+ *
+ * 色相不在 slot 里 —— 它在桶条目的 [31:29]，因为同一个 slot 要服务八个色相。 */
+#define BTILE_SLOT_PBULLET  16u
+#define BTILE_SLOT_ORB      17u
+#define BTILE_SLOT_MISSILE  18u
 /* The scanout is split at the VDMA HALF_OFFSET (2560 B = 640 px): everything
  * left of it is scanned from the left buffer, everything right of it from the
  * right buffer.  A renderer that only covers part of its own half leaves the
  * rest of that half showing the PREVIOUS frame, which is what the two garbage
  * strips down the sides of the 1366x768 screen were.  These two must always
  * add up to SCREEN_WIDTH. */
-#define SCAN_HALF_PIXELS   640u
+#define SCAN_HALF_PIXELS   512u
+#define SCAN_HALF_BYTES    (SCAN_HALF_PIXELS * 4u)
 #define SCAN_RIGHT_PIXELS  (SCREEN_WIDTH - SCAN_HALF_PIXELS)
 /* ---- 1366x768 native playfield ----------------------------------------
  * The screen is now a 180-pixel HUD gutter either side of a 1005-pixel
@@ -73,6 +141,17 @@ static const uint32_t palette[8] = {
 #define GAME_BOTTOM     SCREEN_HEIGHT
 #define PLAYFIELD_BOTTOM SCREEN_HEIGHT
 
+/* The craft's sprite, in one place.  The walk frames are 48x48 and are drawn
+ * CENTRED on (player_x, player_y), so its box is player +- PLAYER_HALF_*.  The
+ * draw call and the beam's length both have to know the vertical half, and
+ * they used to know it as a literal 48 in one place and as "player_y" in the
+ * other - which is how the beam ended up drawn straight down the middle of
+ * Reimu.  One constant, so the next change to the sprite size cannot move the
+ * artwork out from under the beam again. */
+#define PLAYER_SPRITE_SIDE 48
+#define PLAYER_HALF_H      (PLAYER_SPRITE_SIDE / 2)
+#define PLAYER_HALF_W      (PLAYER_SPRITE_SIDE / 2)
+
 /* ---- bullet-hell tuning ------------------------------------------------
  * Speeds are pixels per frame.  The barrage got DENSER but each projectile
  * got SLOWER.  A 5 px/frame aimed shot crossed the playfield in 1.6 s and
@@ -96,6 +175,39 @@ static const uint32_t palette[8] = {
 #define SPD_LASER       4
 #define SPD_LANCE       3
 
+/* ---- Task 12: the pressure stage's own numbers -------------------------
+ * The stress stage does not scale the campaign's tuning, it replaces it.  Its
+ * whole purpose is a load the three normal stages are never asked to carry,
+ * and every value here is picked for that load:
+ *
+ *   SPD_LOCKON_MISSILE  speed of the two wing missiles in the three-stream
+ *                       shot.  7, not SPD_PBULLET (9): a homing round that
+ *                       outruns the fan it was fired with reads as the only
+ *                       shot that matters.
+ *   SPD_STORM           the storm's shot speed.  3, so a shot that survives
+ *                       the crossing stays on screen for ~250 frames - the
+ *                       barrage is TOPPED UP, never rebuilt.
+ *   STRESS_STORM_TARGET starts at the board-verified 192. Y cycles the
+ *                       supplemental storm through 256/320/384/448/192.
+ *                       The live population includes boss patterns, so it
+ *                       can exceed this target. The HUD records row drops;
+ *                       FPS alone cannot prove every bullet was displayed.
+ *   STRESS_STORM_BUDGET how many shots one frame may add.  Trickling them in
+ *                       is the point - 192 born together would all leave the
+ *                       boss's muzzle as one ring, and this stage wants a
+ *                       screen that is saturated everywhere.
+ *   STRESS_FIRE_CD      frames between salvos of the three-stream shot.  The
+ *                       card asks for ??????? and FIRE_CD_MIN is what ???
+ *                       means in this build, so the stage uses it verbatim
+ *                       rather than inventing a slower number.
+ */
+#define SPD_LOCKON_MISSILE   7
+#define SPD_STORM            3
+#define STRESS_STORM_TARGET  192
+#define STRESS_STORM_MAX     10000
+#define STRESS_STORM_BUDGET  96
+#define STRESS_FIRE_CD       FIRE_CD_MIN
+
 /* Bullet sub-stepping: a fast player shot or a fast bullet would otherwise
  * tunnel through a 24-pixel sprite between two frames. */
 #define BULLET_STEP     3
@@ -117,7 +229,7 @@ static uint32_t rng_state;
 #define PICK_ROWS        (48 / PICK_CELL)
 #define PICK_POSES       6
 #define PICK_MASK_BYTES  (((PICK_COLS * PICK_ROWS) + 31) / 32)
-static uint32_t pick_mask[PICK_POSES][PICK_MASK_BYTES];
+extern uint32_t pick_mask[PICK_POSES][PICK_MASK_BYTES];
 static uint8_t  player_pose;
 
 /* ---- stage backdrop state ---------------------------------------------
@@ -238,6 +350,12 @@ static void cpu_software_fill(uint32_t dst_base, int x, int y, int w, int h,
 #define SCREEN_BITBLT   1
 #define SCREEN_GAME     2
 #define SCREEN_STRESS   3
+#define SCREEN_STRESS_STAGE 4
+
+static int is_stress_stage = 0;
+static uint16_t stress_target;
+static uint8_t stress_prev_y;
+static uint8_t stress_load_hold;
 
 /* v6's boot menu: TWO cards, not a list.  Row 0 is the BitBlt bench (CPU on
  * the left half, FPGA on the right) and row 1 is the bullet-hell run, i.e.
@@ -296,9 +414,12 @@ static void cpu_software_fill(uint32_t dst_base, int x, int y, int w, int h,
  * down; the definitions still live with the rest of the engine wrappers. */
 static void r_blit(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
                    uint32_t sstride, uint32_t dstride);
-static void r_blit_nomark(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
-                          uint32_t sstride, uint32_t dstride);
-static void __attribute__((unused)) r_add(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
+/* The particle pass (particles_render(), far above the engine wrappers) adds
+ * its sparks rather than copying them, and the colour key has to be armed
+ * around the whole batch rather than per particle. */
+static void r_add_begin(void);
+static void r_add_end(void);
+static void r_add(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
                   uint32_t sstride, uint32_t dstride);
 extern uint32_t frame_tick;
 
@@ -324,9 +445,10 @@ extern uint32_t frame_tick;
 #define MENU_EDGE_A    0x02u
 #define MENU_EDGE_X    0x04u
 #define MENU_EDGE_OK   0x08u
+#define MENU_EDGE_B    0x10u
 
 static uint8_t menu_edge_latch;
-static uint8_t menu_btn_prev = 0xFFu;   /* an already-pressed button is not an edge */
+static uint8_t menu_btn_prev = 0u;
 
 static void menu_sample(void)
 {
@@ -334,7 +456,8 @@ static void menu_sample(void)
     uint8_t bits = (uint8_t)(((b >> GPU2D_BTN_BIT_Y) & 1u) |
                              (((b >> GPU2D_BTN_BIT_A) & 1u) << 1) |
                              (((b >> GPU2D_BTN_BIT_X) & 1u) << 2) |
-                             (((b >> GPU2D_BTN_CENTER) & 1u) << 3));
+                             (((b >> GPU2D_BTN_CENTER) & 1u) << 3) |
+                             (((b >> GPU2D_BTN_BIT_B) & 1u) << 4));
 
     menu_edge_latch |= (uint8_t)(bits & (uint8_t)~menu_btn_prev);
     menu_btn_prev = bits;
@@ -343,8 +466,11 @@ static void menu_sample(void)
 /* Drop whatever the pad is doing right now and re-arm from a clean slate.
  * Called when the menu is entered: the button that left the last screen may
  * still be down, and that is not a press on this one. */
+static int menu_last_sel = -1;
+
 static void menu_edge_reset(void)
 {
+    menu_last_sel = -1;
     menu_sample();
     menu_edge_latch = 0;
 }
@@ -361,12 +487,18 @@ static void menu_edge_reset(void)
  */
 static void menu_wait_vsync(void)
 {
-    while (!(GPU2D_REG_VSYNC_STS & 0x01)) menu_sample();
+    uint32_t guard = 2000000u;
+    while (!(GPU2D_REG_VSYNC_STS & 0x01) && --guard) menu_sample();
 }
 
-static void menu_wait_idle(void)
+static int frame_wait_free(uint32_t fb)
 {
-    while (GPU2D_REG_STATUS & GPU2D_STATUS_BUSY_MASK) menu_sample();
+    uint32_t guard = 2000000u;
+    while (GPU2D_REG_LEFT_ACTIVE == fb || GPU2D_REG_RIGHT_ACTIVE == fb) {
+        if (!--guard) return 0;
+        if (gpu2d_idle_hook) gpu2d_idle_hook();
+    }
+    return 1;
 }
 
 
@@ -418,7 +550,7 @@ static void draw_number(uint32_t fb, int x, int y, uint32_t value, int digits,
  * Measured cost: the struct is 8 bytes, eight slots is 64 bytes of .bss, and
  * the render is one draw_number() plus (on a run) one two-glyph draw_text()
  * per live popup - a handful of 6x8 COPYs a frame, well inside the budget in
- * 流程-2.
+ * ???-2.
  *
  * Why it is worth the bytes: before this, a kill's only immediate feedback was
  * the burst.  The player could not tell a 50-point pickup from a 500-point
@@ -435,7 +567,7 @@ typedef struct {
     uint8_t  combo;
 } popup_t;
 
-static popup_t  popups[POPUP_SLOTS];
+extern popup_t popups[POPUP_SLOTS];
 static uint8_t  popup_cursor;
 static uint16_t combo_count;
 static uint16_t combo_timer;
@@ -529,6 +661,7 @@ static void draw_menu(uint32_t base, int sel)
 
     menu_sample();
 
+
     /* ---- title ----------------------------------------------------------
      * Breaths two pixels and drifts a little: the drift uses frame_tick's low
      * bits, so it costs nothing but a shift and the whole title block moves
@@ -612,27 +745,82 @@ static void draw_menu(uint32_t base, int sel)
               "(C) 2026 DSH WHALE-CHAN   ALL RIGHTS RESERVED", 2, 0x008098B0u);
     draw_text(base, 1060, SCREEN_HEIGHT - 28, "VER 7.0", 2, 0x008098B0u);
     draw_text(base, 1230, SCREEN_HEIGHT - 28, "1366x768", 2, 0x00607890u);
+    draw_text(base, 24, SCREEN_HEIGHT - 28, bgm_ready ? "BGM READY" :
+              bgm_size ? "BGM LOADING" : "BGM WAITING", 1, 0x0090C8C8u);
     menu_sample();
 }
+
+/* Defined next to the bucket itself, far below.  Every screen leaves the game
+ * through resync_scanout(), and that is where the curtain has to come down. */
+static void bucket_clear(void);
 
 /* Put the scanout back into a known double-buffer state before a demo starts.
  * The menu is full screen and drives BOTH scanout channels to one buffer, and
  * sampling REG_RIGHT_ACTIVE to pick "the other" buffer races with the flip the
  * display is about to perform.  Publishing one buffer and waiting until the
  * scanout really reports it removes the race. */
-static void resync_scanout(uint32_t *lback, uint32_t *rback)
+static void resync_scanout(uint32_t *lback, uint32_t *rback, int leaving)
 {
     uint32_t guard = 4000000u;
 
+    /* The bullet curtain is composited by the SCANOUT from a table the game loop
+     * writes (B1).  This routine is where every screen leaves the game, and the
+     * game loop stops writing that table the moment it does - but the scanout
+     * has no way to know that, so it goes on compositing whatever the table
+     * holds and the last frame's barrage stands frozen on top of the menu.
+     *
+     * The fix is to EMPTY the tables, not to switch the overlay off.  Switching
+     * it off (bucket_base = 0) works only as long as every way back into a run
+     * remembers to switch it on again, and a path that forgets does not look
+     * like "the curtain is stale" - it looks like "the bullets stopped working",
+     * which is a far worse failure than the one being fixed.  Emptying leaves
+     * the overlay enabled at all times: whatever the game writes gets drawn, and
+     * what the menu leaves behind draws nothing.
+     *
+     * bucket_clear() empties both tables whole: 491,520 bytes, about 5 ms on the
+     * board and about ten simulated frames in the workbench.  This routine runs
+     * on the way IN and on the way OUT, and paying that on the way in pushed the
+     * menu past its own button window - B+X stopped landing in the pressure
+     * stage, and a scenario that samples the table right after entering a run
+     * found it empty.  So the wipe happens on the way OUT only: on the way in
+     * the tables are already empty (this clear emptied them, or the boot
+     * sequence did) and the run's first frame refills them. */
+    if (leaving) {
+        bucket_clear();
+        /* The scanout's beam layer and its three warning hairlines are APB
+         * registers, not framebuffer pixels: the hardware holds whatever the
+         * run's last frame wrote.  A craft that had its beam standing when the
+         * player paused and quit therefore left that beam lit over the boot
+         * menu - nothing in the menu ever writes APB 0xB8/0xBC, so nothing in
+         * the menu could ever take it down.  The laser columns are the same
+         * kind of register: the menu already clears the control word that
+         * enables them, and their centres are cleared here for the same
+         * reason, so no stale x survives either.
+         *
+         * This sits next to the bucket wipe rather than in each exit path
+         * because resync_scanout() is the one place every screen leaves the
+         * game through. */
+        GPU2D_REG_BEAM_X    = 0u;
+        GPU2D_REG_BEAM_CTRL = 0u;
+        for (int k = 0; k < 3; k++) {
+            GPU2D_REG_HAIR(k, 0) = 0u;
+            GPU2D_REG_HAIR(k, 1) = 0u;
+            GPU2D_REG_HAIR(k, 2) = 0u;
+            GPU2D_REG_HAIR(k, 3) = 0u;
+        }
+        GPU2D_REG_LASER_COLX_LO = 0u;
+        GPU2D_REG_LASER_COLX_HI = 0u;
+    }
+
     gpu2d_flush_dcache();
-    GPU2D_REG_RIGHT_NEXT = FB_RIGHT_BACK;
-    GPU2D_REG_LEFT_NEXT  = FB_RIGHT_BACK;
+    GPU2D_REG_FRAME_NEXT = FB_RIGHT_BACK;
     /* The scanout needs a display frame to pick the new buffer up, so this
      * loop normally runs a handful of times.  The guard is not a timeout for
      * the normal case - it is there so that a scanout which never reports the
      * swap back (no pixel clock, a display that went away) cannot trap the
      * firmware in a hard loop with no way out. */
-    while (GPU2D_REG_RIGHT_ACTIVE != FB_RIGHT_BACK && guard--) {
+    while ((GPU2D_REG_LEFT_ACTIVE != FB_RIGHT_BACK ||
+            GPU2D_REG_RIGHT_ACTIVE != FB_RIGHT_BACK) && guard--) {
     }
     *lback = FB_RIGHT_FRONT;
     *rback = FB_RIGHT_FRONT;
@@ -929,6 +1117,14 @@ static void stage_bg_decode(unsigned idx, uint32_t buf)
      * 12,313 bytes stop competing with the code for the CPU's 64 KiB. */
     const uint8_t *p = stage_rle[idx];
     volatile uint32_t *row = (volatile uint32_t *)buf;
+    if (p == 0) {
+        /* The staging copy is filled by stage_bg_boot() from the asset ROM, and
+         * a plate that never got its stream has a NULL here.  Walking it would
+         * read DDR address 0; leaving the destination alone shows the caller's
+         * own previous contents instead, which is a visible bug in one plate
+         * rather than a wild read in every frame. */
+        return;
+    }
     uint32_t x = 0, y = 0;
     const uint32_t w = a->w, h = a->h;
 
@@ -1008,7 +1204,7 @@ typedef struct {
  * opener: 2085.6 KB/frame of copy traffic -> 1760.1 KB/frame (-15.6%). */
 #define DAMAGE_COLS 22u
 #define DAMAGE_ROWS 96u
-static uint32_t damage_tiles[2][DAMAGE_ROWS];
+static uint32_t (* const damage_tiles)[DAMAGE_ROWS] = (uint32_t (*)[DAMAGE_ROWS])MM_DAMAGE_TILES;
 static uint32_t damage_plate[2];
 /* The plate each scanout buffer had its two playfield border columns drawn
  * for.  0 means "not drawn yet".  See the border note in game_render(). */
@@ -1067,6 +1263,37 @@ static void damage_restore(uint32_t fb, uint32_t plate)
 {
     unsigned index = fb == FB_LEFT_FRONT ? 0u : 1u;
     uint32_t *rows = damage_tiles[index];
+
+    /* ---- the repair is tile-by-tile, and that is now a settled question ---
+     * The board pays per SCANLINE - one DRAM row activation each - so a
+     * rectangle's cost to the engine is its height, not its area.  That is
+     * what made an adaptive "lay the whole playfield down once the ledger is
+     * full" path look attractive, and it was built and measured: on the
+     * pressure stage it turned 4478 scanlines into 768.
+     *
+     * It was then REMOVED, because scanlines are only one of the two things a
+     * frame pays for.  At its own 288-tile threshold that path moved 3.08 MB
+     * a frame against the repair's 1.15 MB - 5.2x the traffic to buy 3x fewer
+     * scanlines - and on the board it halved the PLAYABLE stage (75 -> 37 FPS)
+     * the moment the shot was maxed and the barrage filled in, while looking
+     * like a clean win in the workbench, which counts scanlines and cannot see
+     * a bandwidth wall at all.
+     *
+     * A "span merge" variant was tried afterwards - one blit per damaged tile
+     * row instead of one per run of tiles - on the theory that the ledger was
+     * fragmented rather than full.  Measured: it bought 1391 of the ~3700
+     * scanlines such a merge could theoretically save, and paid 27% more
+     * traffic for them, because the marks within a row are scattered rather
+     * than adjacent, so a span is mostly empty.  Any span wide enough to
+     * collect them covers the whole row and becomes the removed path again.
+     * There is no safe middle, and the 768 scanlines of a full plate are the
+     * floor for anything that still writes bullets into the framebuffer.
+     *
+     * So the repair stays exact.  Making the backdrop cheap means stopping the
+     * bullets from damaging it in the first place - see B1 in the frame-budget
+     * document, which is also the only route that lowers row count and DDR
+     * traffic at the same time. */
+
     for (unsigned row = 0; row < DAMAGE_ROWS; row++) {
         while (rows[row]) {
             unsigned first = 0;
@@ -1092,6 +1319,13 @@ static void damage_restore(uint32_t fb, uint32_t plate)
              * whose 64-pixel tile reaches from 1152 to 1215 and therefore
              * sweeps across the gutter. */
             if (x < GAME_LEFT) { w -= (GAME_LEFT - x); x = GAME_LEFT; }
+            /* x can be at or past GAME_RIGHT only if damage_mark_index() ever
+             * records a tile out there, which its own guard (x >= GAME_RIGHT+1)
+             * currently refuses.  Keep the refusal local: without this line
+             * GAME_RIGHT - x underflows to a huge unsigned width and r_blit()
+             * would be handed it.  This used to depend on the other function's
+             * guard, with nothing in either place saying so. */
+            if (x >= GAME_RIGHT) continue;
             if (x + w > GAME_RIGHT) w = GAME_RIGHT - x;
             if (!w) continue;
             uint32_t off = (row << 3) * SCREEN_STRIDE + x * 4u;
@@ -1188,12 +1422,10 @@ static void stage_strip_render(uint32_t fb)
     }
     weather_ctrl_word = (1u << 15) | (stage << 13) | ((unsigned)scroll << 8) | slide | laser_ctrl;
     GPU2D_REG_WEATHER = weather_ctrl_word;
-    /* tlm[40]/tlm[41] used to price the CPU painting that no longer exists;
-     * publish zeros so the telemetry window never reads stale values.  Written
-     * through the base address: the tlm pointer itself is declared further
-     * down the file. */
-    *(volatile uint32_t *)(MM_TELEMETRY_BASE + 40u * 4u) = 0u;
-    *(volatile uint32_t *)(MM_TELEMETRY_BASE + 41u * 4u) = 0u;
+    /* tlm[41] is LIVE again: game_render() writes the bucket_build() slice
+     * into it at frame start, and diag_window() reports it as 's'.  tlm[40]
+     * priced CPU weather-dot painting that no longer exists and has no reader
+     * left, so its old zeroing store is gone too. */
 }
 
 /* ---- merged sprite tiles ------------------------------------------------
@@ -1218,72 +1450,76 @@ static void stage_strip_render(uint32_t fb)
 static void pbullet_tile_build(void)
 {
     /* Phase 2 Task 05: Player bullet visual overhaul.
-     * Round dual-layer energy bullet head (center 3x3 pure white 0x00FFFFFF hot core,
-     * vivid neon aura, soft outer edge) with streamlined ion flare trail featuring
-     * smooth opacity feathering and tapered profile. */
-    for (unsigned c = 0; c < MM_PBULLET_TILE_COUNT; c++) {
-        volatile uint32_t *tile = (volatile uint32_t *)
-            (MM_PBULLET_TILE + (uint32_t)c * MM_PBULLET_TILE_BYTES);
-        uint32_t neon    = palette[c];
-        uint32_t dim     = (neon >> 1) & 0x007F7F7Fu;
-        uint32_t quarter = (dim >> 1) & 0x007F7F7Fu;
-        uint32_t tiny    = (quarter >> 1) & 0x007F7F7Fu;
-        uint32_t white   = 0x00FFFFFFu;
-        /* Core trail color: intense hot core blending neon with white */
-        uint32_t hot_trail = ((neon >> 1) & 0x007F7F7Fu) + 0x007F7F7Fu;
-        const unsigned pitch = MM_PBULLET_TILE_STRIDE / 4u;
+     * Round dual-layer energy bullet head (center 3x3 pure white hot core,
+     * vivid neon aura, soft outer edge) with streamlined ion flare trail
+     * featuring smooth opacity feathering and tapered profile.
+     *
+     * ONE tile, not eight.  The eight colours were the same shape with
+     * different values - verified on the firmware's own DDR - so a cell now
+     * holds a ROLE number and the scanout picks the colour out of the palette
+     * with role + hue*32 (see BROLE_* at the top of the file).  The shape
+     * arithmetic below is character-for-character what it was. */
+    volatile uint8_t *tile = (volatile uint8_t *)MM_PBULLET_TILE;
+    const unsigned pitch = MM_PBULLET_TILE_STRIDE;
 
-        /* Start from fully transparent (MAGENTA_KEY) */
-        for (unsigned i = 0; i < pitch * MM_PBULLET_TILE_H; i++)
-            tile[i] = MAGENTA_KEY;
+    /* BROLE_NONE is the "nothing here" sentinel, and it is index 0 on the
+     * palette side too.  Keying the tile with it rather than leaving whatever
+     * DDR powered up with is the same rule the MAGENTA_KEY fill had.
+     *
+     * ONE BYTE A PIXEL.  This surface used to be ARGB8888 with the role in the
+     * low byte and three bytes nobody read on top of it; bullet_store_tile()
+     * only ever took that low byte.  The three builders now write the role
+     * straight in, which is also what let the enemy tile double its edge
+     * without moving anything: 16 x 32 x 26 bytes is what 16 x 64 x 13 was. */
+    for (unsigned i = 0; i < pitch * MM_PBULLET_TILE_H; i++)
+        tile[i] = BROLE_NONE;
 
-        /* 1) 7x7 Round Dual-Layer Energy Bullet Head (y = 0..6, center at (3, 3)) */
-        for (int y = 0; y < 7; y++) {
-            int dy = y - 3;
-            for (int x = 0; x < 7; x++) {
-                int dx = x - 3;
-                int d2 = dx * dx + dy * dy;
-                if (x >= 2 && x <= 4 && y >= 2 && y <= 4) {
-                    /* Center 3x3 pure white hot core (min_rgb = 255 >= 240, 100% Bloom trigger) */
-                    tile[y * pitch + x] = white;
-                } else if (d2 <= 5) {
-                    /* Vivid saturated neon aura */
-                    tile[y * pitch + x] = neon;
-                } else if (d2 <= 10) {
-                    /* Soft outer edge */
-                    tile[y * pitch + x] = dim;
-                }
+    /* 1) 7x7 Round Dual-Layer Energy Bullet Head (y = 0..6, center at (3, 3)) */
+    for (int y = 0; y < 7; y++) {
+        int dy = y - 3;
+        for (int x = 0; x < 7; x++) {
+            int dx = x - 3;
+            int d2 = dx * dx + dy * dy;
+            if (x >= 2 && x <= 4 && y >= 2 && y <= 4) {
+                /* Center 3x3 pure white hot core (min_rgb = 255, bloom trigger) */
+                tile[y * pitch + x] = BROLE_WHITE;
+            } else if (d2 <= 5) {
+                /* Vivid saturated neon aura */
+                tile[y * pitch + x] = BROLE_NEON;
+            } else if (d2 <= 10) {
+                /* Soft outer edge */
+                tile[y * pitch + x] = BROLE_PB_DIM;
             }
         }
+    }
 
-        /* 2) High-energy Ion Flare Streamlined Trail (y = 7..25) */
-        for (unsigned y = 7; y < MM_PBULLET_TILE_H; y++) {
-            if (y <= 11) {
-                /* Upper plume: wide, intense plasma core */
-                tile[y * pitch + 3] = hot_trail;
-                tile[y * pitch + 2] = neon;
-                tile[y * pitch + 4] = neon;
-                tile[y * pitch + 1] = dim;
-                tile[y * pitch + 5] = dim;
-            } else if (y <= 16) {
-                /* Mid trail: narrowing slightly, smooth neon fading */
-                tile[y * pitch + 3] = neon;
-                tile[y * pitch + 2] = dim;
-                tile[y * pitch + 4] = dim;
-                tile[y * pitch + 1] = quarter;
-                tile[y * pitch + 5] = quarter;
-            } else if (y <= 21) {
-                /* Lower trail: 3-pixel tapered glow */
-                tile[y * pitch + 3] = dim;
-                tile[y * pitch + 2] = quarter;
-                tile[y * pitch + 4] = quarter;
-            } else if (y <= 23) {
-                /* Tail tip */
-                tile[y * pitch + 3] = quarter;
-            } else {
-                /* Final wispy spark */
-                tile[y * pitch + 3] = tiny;
-            }
+    /* 2) High-energy Ion Flare Streamlined Trail (y = 7..25) */
+    for (unsigned y = 7; y < MM_PBULLET_TILE_H; y++) {
+        if (y <= 11) {
+            /* Upper plume: wide, intense plasma core */
+            tile[y * pitch + 3] = BROLE_PB_HOT;
+            tile[y * pitch + 2] = BROLE_NEON;
+            tile[y * pitch + 4] = BROLE_NEON;
+            tile[y * pitch + 1] = BROLE_PB_DIM;
+            tile[y * pitch + 5] = BROLE_PB_DIM;
+        } else if (y <= 16) {
+            /* Mid trail: narrowing slightly, smooth neon fading */
+            tile[y * pitch + 3] = BROLE_NEON;
+            tile[y * pitch + 2] = BROLE_PB_DIM;
+            tile[y * pitch + 4] = BROLE_PB_DIM;
+            tile[y * pitch + 1] = BROLE_PB_QUART;
+            tile[y * pitch + 5] = BROLE_PB_QUART;
+        } else if (y <= 21) {
+            /* Lower trail: 3-pixel tapered glow */
+            tile[y * pitch + 3] = BROLE_PB_DIM;
+            tile[y * pitch + 2] = BROLE_PB_QUART;
+            tile[y * pitch + 4] = BROLE_PB_QUART;
+        } else if (y <= 23) {
+            /* Tail tip */
+            tile[y * pitch + 3] = BROLE_PB_QUART;
+        } else {
+            /* Final wispy spark */
+            tile[y * pitch + 3] = BROLE_PB_TINY;
         }
     }
     gpu2d_flush_dcache();
@@ -1336,6 +1572,12 @@ static void sprites_build(void)
          * every sprite keeps its own packed row pitch.  For the backdrop the old
          * expression evaluated to exactly 4096 - the OLD screen stride - which is
          * why this coupling stayed invisible until the stride changed. */
+        /* The first arm of that ternary is dead code today: no entry in the asset
+         * table has dst == MM_VISUAL_BACKGROUND - the plate is painted by
+         * bg_paint()/stage_bg_decode() on its own path and never comes through this
+         * loop.  It stays because it is the right stride the day a full-screen plate
+         * returns to the table, and because the comment above describes a coupling
+         * this line was written to absorb. */
         asset_decode(i, a->dst,
                      a->dst == MM_VISUAL_BACKGROUND ? SCREEN_STRIDE
                                                     : a->w * a->scale * 4u);
@@ -1356,11 +1598,16 @@ static void sprites_build(void)
             unsigned stride = 512u*s;
             for (unsigned g = 0; g < 96; g++)
                 for (unsigned y = 0; y < 8u*s; y++) {
+                    uint32_t glyph_row = 0;
+                    if (g < 95) {
+                        GPU2D_REG_ASSET_ADDR = FONT_ROM_OFFSET + g * 8u + y / s;
+                        glyph_row = GPU2D_REG_ASSET_DATA;
+                    }
                     volatile uint32_t *row = (volatile uint32_t *)(next +
                         ((g/16u)*8u*s+y)*stride + (g%16u)*8u*s*4u);
                     for (unsigned x = 0; x < 8u*s; x++)
                         row[x] = (g < 95 && x/s < 6 &&
-                            (visual_font[g][y/s] & (32u >> (x/s)))) ? 0x00FFFFFFu : MAGENTA_KEY;
+                            (glyph_row & (32u >> (x/s)))) ? 0x00FFFFFFu : MAGENTA_KEY;
                 }
             next += 24576u*s*s;
         }
@@ -1377,10 +1624,29 @@ static void sprites_build(void)
 /* ===================================================================== */
 
 #define MAX_ENEMIES        MM_ENEMY_COUNT
-#define MAX_ACTIVE_ENEMY   5            /* stage adds 0..2 to this cap */
+#define MAX_ACTIVE_ENEMY   9            /* campaign adds 0..2 to this cap */
 #define MAX_PBULLETS      MM_PBULLET_COUNT
 #define MAX_EBULLETS      MM_EBULLET_COUNT
 #define MAX_ITEMS         MM_ITEM_COUNT
+
+/* How much of the enemy pool the Big Orbs own outright.
+ *
+ * The pool is shared and was strictly first-come-first-served: alloc_bullet()
+ * walks from index 0 and hands out the first free slot.  That is fine until the
+ * pressure stage, where stress_storm_update() keeps 192 shots in the air - and
+ * then PAT_BURST's twenty-four orbs ask for a slot, find none, and the boss's
+ * biggest attack fires into nothing.  Measured on the board's own model: of the
+ * ~120 orbs one PAT_BURST should put in the air, two made it in one window and
+ * none at all in the next, while the same attack in a campaign stage (where the
+ * pool is only half full) put 72..120 orbs on the field.
+ *
+ * So the tail of the pool is theirs.  Everything else allocates from the front,
+ * the orbs allocate from ORB_FIRST up, and an orb may still borrow from the
+ * front when its own tail is busy - so no slot is wasted while no orb wants it.
+ * stress_storm_update() counts every live shot whatever kind it is, so the
+ * storm still fills the pool to its target either way. */
+#define ORB_RESERVE       32
+#define ORB_FIRST        (MAX_EBULLETS - ORB_RESERVE)
 
 #define EF_ACTIVE         0x01u
 #define EF_HELD           0x04u         /* laid out and holding station */
@@ -1391,8 +1657,23 @@ static void sprites_build(void)
 #define EF_BOUNCE_SHIFT     4
 #define EF_BOUNCE_MASK   0x30u
 #define EF_ORB           0x40u          /* Phase 2: high-tier Big Orb / Spell Card projectile (OP_ADD) */
-/* Bits 1 and 7 are free.  They used to carry the two graze flags; the whole
- * graze mechanic is gone - see take_hit() and bullets_update(). */
+/* Bit 7 is free.  Bit 1 is NOT free, and it has three names depending on which
+ * pool the record belongs to - the pools never mix, so one bit is enough:
+ *
+ *   EF_GRAZED  (enemy bullets) marks a shot that has already thrown its graze
+ *              spark, so the spark fires once per bullet instead of every
+ *              frame the shot spends inside the aura (see bullets_update).
+ *   PF_LOCKON  (player bullets) marks the pressure stage's wing missiles,
+ *              which re-aim at the boss every frame.  Nothing on the campaign
+ *              path sets it, so the homing test costs the normal shot one
+ *              compare and changes nothing.
+ *
+ * This comment used to say the bit was free and invite a new use: whatever was
+ * allocated to it would have collided with the missiles, or with EF_GRAZED -
+ * and dropping EF_GRAZED makes the graze spark fire on every frame instead of
+ * once. */
+#define EF_GRAZED        0x02u
+#define PF_LOCKON        0x02u
 
 #define ENEMY_FAIRY       0
 #define ENEMY_SHARD       1
@@ -1470,6 +1751,12 @@ static inline int item_is_debuff(uint8_t type)
     X(SPELL,       8, 360, 164,  54) \
     X(DEBUFF_S,    8, 530, 164,  18) \
     X(DEBUFF_J,    8, 560, 164,  18) \
+    X(SPRITES_TAG, 8, 600,  98,  16) \
+    X(SPRITES_NUM, 8, 620, 105,  24) \
+    X(LOAD_TAG,    8, 652,  56,  16) \
+    X(LOAD_NUM,   68, 648, 105,  24) \
+    X(DROPS_TAG,   8, 684,  56,  16) \
+    X(DROPS_NUM,  68, 680, 105,  24) \
     X(HISCORE,     8, 720, 164,  22) \
     /* ---- right gutter (x 1186..1365) --------------------------------- */ \
     X(WEAPON,    1198,  20, 156,  26) \
@@ -1581,6 +1868,100 @@ typedef struct {
 static enemy_rec_t * const enemies = (enemy_rec_t *)MM_ENEMY_BASE;
 static bullet_t    * const pbullets = (bullet_t *)MM_PBULLET_BASE;
 static bullet_t    * const ebullets = (bullet_t *)MM_EBULLET_BASE;
+
+/* ------------------------------------------------------------------------
+ * HOW FAR A WALK OVER A POOL HAS TO GO  (the pools are 512 slots wide)
+ *
+ * Both pools are 512 records of 8 bytes now, and a record lives in DDR at a
+ * fixed address - these are pointers into a memory map, not arrays the
+ * compiler can size or vectorise.  Walking one costs a load every EIGHT bytes,
+ * so a 32-byte cache line carries four records and a scan of a whole pool
+ * touches 4 KB to read 512 flag bytes.
+ *
+ * That was cheap when the pools were 192 and 128 (2.5 KB between them).  At
+ * 512 each it stopped being cheap, because the frame walks them SEVEN times:
+ * bullets_update() over both, bucket_build() over both, telemetry_write() over
+ * both, and enemy_bullet_render()'s shaft filter over the enemy one.  That is
+ * 3,584 record loads a frame where the old pool sizes cost 1,152 - and it is
+ *
+ *   a fixed 2,432 extra DDR loads per frame, every frame, whether or not
+ *   anything is in the pool.  The cost of a WIDE pool is paid by the scan,
+ *   not by the bullets.
+ *
+ * THE FIX IS A BOUND, NOT A BITMAP.  alloc_bullet_range() hands out the
+ * lowest free slot it can see, so live shots pile up at the BOTTOM of a pool
+ * and the top stays empty.  Remembering "one past the highest slot that can
+ * possibly be live" therefore walks the shots instead of the capacity.
+ *
+ * IT IS EXACT, NOT A HEURISTIC.  A slot can only become EF_ACTIVE through one
+ * of the alloc_* helpers below, and every one of them raises the bound as it
+ * hands the slot out - so "index < bound" is true for every live shot by
+ * construction.  Nothing has to clear the bound when a shot dies (the bound
+ * is allowed to be too big, never too small), and the two functions that empty
+ * a pool outright reset it.  A bound that is too large costs a few loads; one
+ * that is too small would silently drop bullets, which is why the rule is
+ * "raise here, reset on clear, never lower anywhere else".
+ *
+ * THE ORB TAIL IS WHY THE ENEMY WALK IS TWO RUNS.  The Big Orbs own the top
+ * ORB_RESERVE slots (see ORB_FIRST), and PAT_BURST puts twenty-four of them
+ * there in one volley - so a single bound over the whole pool would be dragged
+ * up to ~504 by the first spell card and stay there.  Instead the bound covers
+ * the front run only, and the orb tail is a second, fixed 32-slot run.  That
+ * keeps the walk proportional to the shots in the air on BOTH paths, and it
+ * preserves the draw order the single-index walk had: front run first, orbs
+ * after, so an orb still covers an ordinary shot it overlaps.
+ *
+ * A break inside FOR_EACH_EBULLET ends the CURRENT RUN, not the walk.  None of
+ * the walks below break out - they all cull and continue - and a future one
+ * that needs to stop early wants a flag, not a break.
+ * ---------------------------------------------------------------------- */
+/* The bound must stay BELOW ORB_FIRST: the walk is front run + orb tail, and
+ * a bound that reached into the tail would make both runs visit the same
+ * slot - counted twice by telemetry_write(), drawn twice by bucket_build().
+ * alloc_ebullet() can only hand out slots below ORB_FIRST, so nothing has to
+ * clamp this. */
+static int pb_hi;                    /* one past the highest live pbullet slot */
+static int eb_hi;                    /* ... the front run of the enemy pool    */
+static int eb_free_hint;
+static int pb_free_hint;
+extern uint16_t bt_count[MM_BUCKET_ROWS];
+static uint32_t bt_dropped, bt_drop_peak, bt_drop_window;
+static uint32_t bt_started, bt_buf;
+static uint8_t eb_motion_pending, eb_motion_job;
+#ifndef BUCKET_SOFTWARE_REFERENCE
+#define BUCKET_SOFTWARE_REFERENCE 0
+#endif
+static uint16_t * const eb_lances = (uint16_t *)MM_LANCE_INDEX;
+static int eb_lance_count;
+static uint16_t active_count;
+static int active_ebullets_count;
+
+static void pool_bounds_rebuild(void)
+{
+    int h = pb_hi;
+
+    while (h < MAX_PBULLETS && (pbullets[h].flags & EF_ACTIVE)) h++;
+    while (h > 0 && !(pbullets[h - 1].flags & EF_ACTIVE)) h--;
+    pb_hi = h;
+
+    /* The orb tail is walked at full width in every walk (see
+     * FOR_EACH_EBULLET), so only the front run needs a bound. */
+    h = eb_hi;
+    while (h < ORB_FIRST && (ebullets[h].flags & EF_ACTIVE)) h++;
+    while (h > 0 && !(ebullets[h - 1].flags & EF_ACTIVE)) h--;
+    eb_hi = h;
+}
+
+#define FOR_EACH_EBULLET(var)                                         \
+    for (int _run = 0; _run < 2; _run++)                              \
+        for (int _i = (_run == 0 ? 0 : ORB_FIRST),                    \
+                 _end = (_run == 0 ? eb_hi : MAX_EBULLETS);           \
+             _i < _end; _i++)                                         \
+            if (((var) = &ebullets[_i]), ((var)->flags & EF_ACTIVE))
+
+#define FOR_EACH_PBULLET(var)                                         \
+    for (int _i = 0; _i < pb_hi; _i++)                                \
+        if (((var) = &pbullets[_i]), ((var)->flags & EF_ACTIVE))
 static item_t      * const items    = (item_t *)MM_ITEM_BASE;
 static volatile uint32_t * const tlm = (volatile uint32_t *)MM_TELEMETRY_BASE;
 
@@ -1696,8 +2077,19 @@ static uint8_t  hit_ring_timer;
 /* ---- runtime options (settings / pause menu) ------------------------ */
 static uint8_t  hw_accel = 1;            /* 1 = BitBlt engine, 0 = CPU software render */
 static uint8_t  infinite_respawn = 1;    /* 1 = losing all lives just refills instantly */
+uint8_t game_audio_volume = 3u;          /* 0 mute, 1..4: 12.5/25/50/100 percent */
 static uint8_t  paused;
 static uint8_t  settings_sel;
+/* The pause menu's edge detector.  These used to be function-static inside
+ * settings_input(), which only runs while the menu is open: the first call
+ * after opening the menu therefore compared the pad against whatever the LAST
+ * menu left behind (all zero the first time), so a button the player was
+ * already holding read as a fresh press.  X is the fire button - held almost
+ * always - so holding X and tapping B to pause flipped the highlighted row,
+ * and the highlight starts on INF RESPAWN: infinite respawn silently went off.
+ * settings_edge_reset() is called as the menu opens and re-bases them on the
+ * pad as it is right now. */
+static uint8_t  set_prev_y, set_prev_a, set_prev_x, set_prev_center, set_stick_hold;
 static uint8_t  game_exit_request;
 static uint8_t  pad_bits;                /* last raw pad word, for telemetry */
 
@@ -1706,14 +2098,18 @@ typedef struct { int16_t x,y; uint8_t age,active,pad[2]; } visual_fx_t;
 static visual_fx_t * const visual_fx = (visual_fx_t *)MM_VISUAL_FX;
 static uint8_t fx_cursor;
 
-/* ---- Phase 2 Task 08: Combat Particle FX (OP_ADD) ------------------- */
+/* ---- Phase 2 Task 02 & Task 08: Combat Particle FX (OP_ADD / Bloom) ------------------- */
 #define MAX_PARTICLES 48
 
 typedef enum {
-    PARTICLE_HIT = 0,    /* sparks from bullet hitting enemy/boss */
-    PARTICLE_ITEM = 1,   /* Phase 2: rising golden dust motes from item pickup */
-    PARTICLE_MOTE = 2,   /* rising soft glow motes from clear/boss death */
-    PARTICLE_CRIT = 3    /* high-damage critical spark */
+    PARTICLE_HIT      = 0,   /* golden hit spark (8x8 star, pure white core) */
+    PARTICLE_ITEM     = 1,   /* Phase 2: rising golden dust motes from item pickup */
+    PARTICLE_MOTE     = 2,   /* rising soft glow motes from clear/boss death */
+    PARTICLE_CRIT     = 3,   /* fiery crimson spark (critical hit/boss damage) */
+    PARTICLE_CYAN     = 4,   /* electric cyan spark (graze / laser impact) */
+    PARTICLE_DIM_GOLD = 5,   /* decaying gold ember */
+    PARTICLE_DIM_MOTE = 6,   /* decaying soft mote / cyan ember */
+    PARTICLE_DIM_FIRE = 7    /* decaying crimson ember */
 } particle_type_t;
 
 typedef struct {
@@ -1723,7 +2119,8 @@ typedef struct {
     uint8_t type;
 } game_particle_t;
 
-static game_particle_t game_particles[MAX_PARTICLES];
+extern game_particle_t game_particles[MAX_PARTICLES];
+_Static_assert(sizeof(game_particles) == MM_PARTICLE_STATE_BYTES, "particle DDR size");
 static uint8_t particle_cursor;
 
 static void spawn_particle(int x, int y, int vx, int vy, uint8_t type, uint8_t life)
@@ -1752,17 +2149,50 @@ static void particles_update(void)
 
 static void particles_render(uint32_t fb)
 {
+    /* Sparks, embers and motes are glowing things, so they ADD.  Drawn with a
+     * plain COPY they only ever replaced the backdrop, which is why a golden hit
+     * spark looked like a sticker laid on the snowfield instead of a flash: a
+     * spark that cannot brighten what is behind it is not a spark.
+     *
+     * The colour key is armed around the whole pass, not per particle: it is a
+     * register write and it waits for the engine, so doing it inside the loop
+     * would double the stalls this pass already pays to gpu2d_finish(). */
+    r_add_begin();
+    int rendered = 0;
     for (int i = 0; i < MAX_PARTICLES; i++) {
         game_particle_t *p = &game_particles[i];
         if (!p->life) continue;
+        if (is_stress_stage && rendered >= 16) break;
+        uint8_t type = p->type & 7u;
+        /* Smooth lifecycle attenuation: transition to fading embers in late life */
+        if (p->life <= 6 && type < 5) {
+            if (type == PARTICLE_HIT || type == PARTICLE_ITEM) {
+                type = PARTICLE_DIM_GOLD;
+            } else if (type == PARTICLE_CRIT) {
+                type = PARTICLE_DIM_FIRE;
+            } else {
+                type = PARTICLE_DIM_MOTE;
+            }
+        }
+        int pw = 8, ph = 8;
         int px = p->x - 4;
         int py = p->y - 4;
-        if (px >= GAME_LEFT && px + 8 <= GAME_RIGHT && py >= 0 && py + 8 <= SCREEN_HEIGHT) {
-            uint32_t src = MM_PARTICLE_TILE + (uint32_t)(p->type & 3u) * MM_PARTICLE_TILE_BYTES;
-            r_blit(fb + (uint32_t)(py * SCREEN_STRIDE) + (uint32_t)(px * 4),
-                   src, 8, 8, MM_PARTICLE_TILE_STRIDE, SCREEN_STRIDE);
+        uint32_t src = MM_PARTICLE_TILE + (uint32_t)type * MM_PARTICLE_TILE_BYTES;
+        /* In final 3 frames, smoothly shrink to 4x4 center ember */
+        if (p->life <= 3) {
+            pw = 4;
+            ph = 4;
+            px += 2;
+            py += 2;
+            src += (2u * MM_PARTICLE_TILE_STRIDE) + 8u;
+        }
+        if (px >= GAME_LEFT && px + pw <= GAME_RIGHT && py >= 0 && py + ph <= SCREEN_HEIGHT) {
+            r_add(fb + (uint32_t)(py * SCREEN_STRIDE) + (uint32_t)(px * 4),
+                  src, (uint32_t)pw, (uint32_t)ph,
+                  MM_PARTICLE_TILE_STRIDE, SCREEN_STRIDE);
         }
     }
+    r_add_end();
 }
 
 /* ---- composed-once surfaces -------------------------------------------
@@ -1770,91 +2200,56 @@ static void particles_render(uint32_t fb)
  * on screen, every frame.  The engine charges per command and activates a DRAM
  * row per row touched, so a 9x9 socket and a 3x3 dot are about the most
  * expensive pixels in the build; drawn once into DDR they cost one COPY each.
- * All three run at boot, off the frame budget entirely.
+ * They run at boot, off the frame budget entirely.
+ *
+ * ebullet_tile_build() USED TO BE THE FIRST OF THEM: eight 13x13 concentric
+ * aura sockets at MM_EBULLET_TILE, one per colour.  It was removed here, and
+ * the reason it could be is that nothing had read those bytes for a long time -
+ * name it and the only hits are its own builder, its own call and its entry in
+ * tools/check_ddr_layout.py.  The barrage has been drawn from the scanout's
+ * direction tiles (MM_EBULLET_DIRTILE / ebullet_dirtile_build) since the colour
+ * split, and those carry their own socket geometry.
+ *
+ * It went because this image has 100 bytes free and the missile tile and the
+ * doubled enemy tile need about 250 of them.  The measured cost of the body
+ * was ~300 bytes of .text for eight tiles no picture ever showed.  The address
+ * MM_EBULLET_TILE is still declared and still checked by check_ddr_layout.py;
+ * nothing writes it any more.
  */
-static void ebullet_tile_build(void)
-{
-    /* Phase 2: 13x13 Concentric Glowing Aura Orbs (自机光环同款·双色流光发光能量玉).
-     * Features:
-     * - Concentric geometry (radius 6);
-     * - Blinding pure white core (0x00FFFFFF, min_rgb >= 240) triggering HDMI Scanout Bloom;
-     * - High-energy electric core transition ring;
-     * - Saturated attribute neon body (palette[c]);
-     * - Smooth true 8-bit Alpha feathered halo (Reimu aura style, zero dither noise);
-     * - Outer MAGENTA_KEY transparent boundary. */
-    const unsigned pitch = MM_EBULLET_TILE_STRIDE / 4u;
-
-    for (unsigned c = 0; c < 8u; c++) {
-        volatile uint32_t *tile = (volatile uint32_t *)
-            (MM_EBULLET_TILE + (uint32_t)c * MM_EBULLET_TILE_BYTES);
-        uint32_t neon    = palette[c];
-        /* Pastel bright core ring: tinted towards pure white */
-        uint32_t nr = (neon >> 16) & 0xFFu;
-        uint32_t ng = (neon >> 8) & 0xFFu;
-        uint32_t nb = neon & 0xFFu;
-        uint32_t cr = 255u - ((255u - nr) * 60u / 255u);
-        uint32_t cg = 255u - ((255u - ng) * 60u / 255u);
-        uint32_t cb = 255u - ((255u - nb) * 60u / 255u);
-        uint32_t bright_core = (cr << 16) | (cg << 8) | cb;
-
-        for (int y = 0; y < MM_EBULLET_TILE_W; y++) {
-            int dy = y - 6;
-            for (int x = 0; x < MM_EBULLET_TILE_W; x++) {
-                int dx = x - 6;
-                int d2 = dx * dx + dy * dy;
-                uint32_t px = MAGENTA_KEY;
-                if (d2 <= 2) {
-                    /* Center pure white hot core (100% Bloom trigger) */
-                    px = 0xFFFFFFFFu;
-                } else if (d2 <= 5) {
-                    /* Electric bright pastel core (Reimu aura style) */
-                    px = (255u << 24) | (bright_core & 0x00FFFFFFu);
-                } else if (d2 <= 13) {
-                    /* Saturated attribute neon ring */
-                    px = (240u << 24) | (neon & 0x00FFFFFFu);
-                } else if (d2 <= 22) {
-                    /* Soft glowing aura layer */
-                    px = (140u << 24) | (neon & 0x00FFFFFFu);
-                } else if (d2 <= 34) {
-                    /* Semi-transparent outer feathered halo */
-                    px = (60u << 24) | (neon & 0x00FFFFFFu);
-                }
-                tile[y * pitch + x] = px;
-            }
-        }
-    }
-    gpu2d_flush_dcache();
-}
 
 static void orb_tile_build(void)
 {
-    /* 8 colors of 16x16 Big Orbs (大玉) for Phase 2 Task 01 & Task 07 (Scheme B Bloom + ColorKey).
-     * MAGENTA_KEY background enables single-stream blit with zero DDR read stalls,
-     * while the scanout Gaussian Bloom filter creates radiant glowing energy orbs. */
-    for (unsigned c = 0; c < MM_ORB_TILE_COUNT; c++) {
-        volatile uint32_t *tile = (volatile uint32_t *)
-            (MM_ORB_TILE + (uint32_t)c * MM_ORB_TILE_BYTES);
-        const unsigned pitch = MM_ORB_TILE_STRIDE / 4u;
-        uint32_t color = palette[c];
-        uint32_t halo  = (color >> 1) & 0x007F7F7Fu;
+    /* 16x16 Big Orbs for Phase 2 Task 01 & Task 07 (Scheme B Bloom + ColorKey).
+     * MAGENTA_KEY background enables single-stream blit with zero DDR read
+     * stalls, while the scanout Gaussian Bloom filter creates radiant glowing
+     * energy orbs.
+     *
+     * ONE tile, not eight: same shape, different values.  The dark rim is the
+     * player shot's quarter role - measured, the two formulas agree bit for bit
+     * across all eight hues - so the orbs and the fan shot share that entry. */
+    volatile uint8_t *tile = (volatile uint8_t *)MM_ORB_TILE;
+    const unsigned pitch = MM_ORB_TILE_STRIDE;   /* one byte a pixel */
 
-        for (int y = 0; y < MM_ORB_TILE_H; y++) {
-            int dy = y * 2 - 15;
-            for (int x = 0; x < MM_ORB_TILE_W; x++) {
-                int dx = x * 2 - 15;
-                int d2 = dx * dx + dy * dy;
-                uint32_t px = MAGENTA_KEY;
-                if (d2 <= 20) {
-                    px = 0x00FFFFFFu;  /* Blinding white hot core */
-                } else if (d2 <= 80) {
-                    px = 0x00FFFFFFu;  /* White-saturated inner body */
-                } else if (d2 <= 150) {
-                    px = color;        /* Vivid saturated color */
-                } else if (d2 <= 210) {
-                    px = halo;         /* Soft outer glow */
-                }
-                tile[y * pitch + x] = px;
+    for (int y = 0; y < MM_ORB_TILE_H; y++) {
+        int dy = y * 2 - 15;
+        for (int x = 0; x < MM_ORB_TILE_W; x++) {
+            int dx = x * 2 - 15;
+            int d2 = dx * dx + dy * dy;
+            uint32_t role = BROLE_NONE;
+            if (d2 <= 12) {
+                /* Micro-pinpoint pure white core (hot spark) */
+                role = BROLE_WHITE;
+            } else if (d2 <= 40) {
+                /* Electric core highlight: the hue pushed 80/255 towards white */
+                role = BROLE_ORB_CORE;
+            } else if (d2 <= 145) {
+                /* Deep saturated gemstone body (vivid colour, authentic hue) */
+                role = BROLE_NEON;
+            } else if (d2 <= 195) {
+                /* Outer refractive shade */
+                role = BROLE_PB_QUART;
             }
+            tile[y * pitch + x] = role;
         }
     }
     gpu2d_flush_dcache();
@@ -1874,31 +2269,31 @@ static void particle_tile_build(void)
 
     /* Type 0: PARTICLE_HIT (golden hit spark, 8x8 diamond star) */
     volatile uint32_t *t0 = base;
-    t0[1 * pitch + 3] = t0[1 * pitch + 4] = 0x00FF8000u;
-    t0[2 * pitch + 3] = t0[2 * pitch + 4] = 0x00FFCC00u;
-    t0[3 * pitch + 1] = t0[3 * pitch + 6] = 0x00FF8000u;
-    t0[3 * pitch + 2] = t0[3 * pitch + 5] = 0x00FFD700u;
-    t0[3 * pitch + 3] = t0[3 * pitch + 4] = 0x00FFFFFFu;
-    t0[4 * pitch + 1] = t0[4 * pitch + 6] = 0x00FF8000u;
-    t0[4 * pitch + 2] = t0[4 * pitch + 5] = 0x00FFD700u;
-    t0[4 * pitch + 3] = t0[4 * pitch + 4] = 0x00FFFFFFu;
-    t0[5 * pitch + 3] = t0[5 * pitch + 4] = 0x00FFCC00u;
-    t0[6 * pitch + 3] = t0[6 * pitch + 4] = 0x00FF8000u;
+    t0[1 * pitch + 3] = t0[1 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF8000u;
+    t0[2 * pitch + 3] = t0[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFCC00u;
+    t0[3 * pitch + 1] = t0[3 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FF8000u;
+    t0[3 * pitch + 2] = t0[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
+    t0[3 * pitch + 3] = t0[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+    t0[4 * pitch + 1] = t0[4 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FF8000u;
+    t0[4 * pitch + 2] = t0[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
+    t0[4 * pitch + 3] = t0[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+    t0[5 * pitch + 3] = t0[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFCC00u;
+    t0[6 * pitch + 3] = t0[6 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF8000u;
 
     /* Type 1: PARTICLE_ITEM (Phase 2: glowing golden dust mote, 8x8) */
     volatile uint32_t *t1 = base + pitch * 8u;
-    t1[1 * pitch + 3] = t1[1 * pitch + 4] = 0x00FFA500u;
-    t1[2 * pitch + 2] = t1[2 * pitch + 5] = 0x00FFD700u;
-    t1[2 * pitch + 3] = t1[2 * pitch + 4] = 0x00FFFFFFu;
-    t1[3 * pitch + 1] = t1[3 * pitch + 6] = 0x00FFA500u;
-    t1[3 * pitch + 2] = t1[3 * pitch + 5] = 0x00FFD700u;
-    t1[3 * pitch + 3] = t1[3 * pitch + 4] = 0x00FFFFFFu;
-    t1[4 * pitch + 1] = t1[4 * pitch + 6] = 0x00FFA500u;
-    t1[4 * pitch + 2] = t1[4 * pitch + 5] = 0x00FFD700u;
-    t1[4 * pitch + 3] = t1[4 * pitch + 4] = 0x00FFFFFFu;
-    t1[5 * pitch + 2] = t1[5 * pitch + 5] = 0x00FFD700u;
-    t1[5 * pitch + 3] = t1[5 * pitch + 4] = 0x00FFFFFFu;
-    t1[6 * pitch + 3] = t1[6 * pitch + 4] = 0x00FFA500u;
+    t1[1 * pitch + 3] = t1[1 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFA500u;
+    t1[2 * pitch + 2] = t1[2 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
+    t1[2 * pitch + 3] = t1[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+    t1[3 * pitch + 1] = t1[3 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FFA500u;
+    t1[3 * pitch + 2] = t1[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
+    t1[3 * pitch + 3] = t1[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+    t1[4 * pitch + 1] = t1[4 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FFA500u;
+    t1[4 * pitch + 2] = t1[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
+    t1[4 * pitch + 3] = t1[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+    t1[5 * pitch + 2] = t1[5 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
+    t1[5 * pitch + 3] = t1[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+    t1[6 * pitch + 3] = t1[6 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFA500u;
 
     /* Type 2: PARTICLE_MOTE (magical pink/white circular rising mote) */
     volatile uint32_t *t2 = base + pitch * 16u;
@@ -1908,77 +2303,137 @@ static void particle_tile_build(void)
             int dx = x * 2 - 7;
             int d2 = dx * dx + dy * dy;
             if (d2 <= 8) {
-                t2[y * pitch + x] = 0x00FFFFFFu;
+                t2[y * pitch + x] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
             } else if (d2 <= 20) {
-                t2[y * pitch + x] = 0x00FFA0E0u;
+                t2[y * pitch + x] = MM_EMISSIVE_TAG | 0x00FFA0E0u;
             } else if (d2 <= 32) {
-                t2[y * pitch + x] = 0x00602050u;
+                t2[y * pitch + x] = MM_EMISSIVE_TAG | 0x00602050u;
             }
         }
     }
 
     /* Type 3: PARTICLE_CRIT (crimson star, 8x8) */
     volatile uint32_t *t3 = base + pitch * 24u;
-    t3[1 * pitch + 3] = t3[1 * pitch + 4] = 0x00FF3050u;
-    t3[2 * pitch + 3] = t3[2 * pitch + 4] = 0x00FF6080u;
-    t3[3 * pitch + 1] = t3[3 * pitch + 6] = 0x00FF3050u;
-    t3[3 * pitch + 2] = t3[3 * pitch + 5] = 0x00FF80A0u;
-    t3[3 * pitch + 3] = t3[3 * pitch + 4] = 0x00FFFFFFu;
-    t3[4 * pitch + 1] = t3[4 * pitch + 6] = 0x00FF3050u;
-    t3[4 * pitch + 2] = t3[4 * pitch + 5] = 0x00FF80A0u;
-    t3[4 * pitch + 3] = t3[4 * pitch + 4] = 0x00FFFFFFu;
-    t3[5 * pitch + 3] = t3[5 * pitch + 4] = 0x00FF6080u;
-    t3[6 * pitch + 3] = t3[6 * pitch + 4] = 0x00FF3050u;
+    t3[1 * pitch + 3] = t3[1 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF3050u;
+    t3[2 * pitch + 3] = t3[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF6080u;
+    t3[3 * pitch + 1] = t3[3 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FF3050u;
+    t3[3 * pitch + 2] = t3[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FF80A0u;
+    t3[3 * pitch + 3] = t3[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+    t3[4 * pitch + 1] = t3[4 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FF3050u;
+    t3[4 * pitch + 2] = t3[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FF80A0u;
+    t3[4 * pitch + 3] = t3[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+    t3[5 * pitch + 3] = t3[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF6080u;
+    t3[6 * pitch + 3] = t3[6 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF3050u;
+
+    /* Type 4: PARTICLE_CYAN (electric cyan / graze spark, 8x8) */
+    volatile uint32_t *t4 = base + pitch * 32u;
+    t4[1 * pitch + 3] = t4[1 * pitch + 4] = MM_EMISSIVE_TAG | 0x000070D0u;
+    t4[2 * pitch + 3] = t4[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x0000C0FFu;
+    t4[3 * pitch + 1] = t4[3 * pitch + 6] = MM_EMISSIVE_TAG | 0x000070D0u;
+    t4[3 * pitch + 2] = t4[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x0000E0FFu;
+    t4[3 * pitch + 3] = t4[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+    t4[4 * pitch + 1] = t4[4 * pitch + 6] = MM_EMISSIVE_TAG | 0x000070D0u;
+    t4[4 * pitch + 2] = t4[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x0000E0FFu;
+    t4[4 * pitch + 3] = t4[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+    t4[5 * pitch + 3] = t4[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x0000C0FFu;
+    t4[6 * pitch + 3] = t4[6 * pitch + 4] = MM_EMISSIVE_TAG | 0x000070D0u;
+
+    /* Type 5: PARTICLE_DIM_GOLD (decaying golden ember, 8x8) */
+    volatile uint32_t *t5 = base + pitch * 40u;
+    t5[2 * pitch + 3] = t5[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00704008u;
+    t5[3 * pitch + 2] = t5[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00704008u;
+    t5[3 * pitch + 3] = t5[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00D09010u;
+    t5[4 * pitch + 2] = t5[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00704008u;
+    t5[4 * pitch + 3] = t5[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00D09010u;
+    t5[5 * pitch + 3] = t5[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00704008u;
+
+    /* Type 6: PARTICLE_DIM_MOTE (decaying cyan/soft mote ember, 8x8) */
+    volatile uint32_t *t6 = base + pitch * 48u;
+    t6[2 * pitch + 3] = t6[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00203050u;
+    t6[3 * pitch + 2] = t6[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00203050u;
+    t6[3 * pitch + 3] = t6[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x004080A0u;
+    t6[4 * pitch + 2] = t6[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00203050u;
+    t6[4 * pitch + 3] = t6[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x004080A0u;
+    t6[5 * pitch + 3] = t6[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00203050u;
+
+    /* Type 7: PARTICLE_DIM_FIRE (decaying crimson ember, 8x8) */
+    volatile uint32_t *t7 = base + pitch * 56u;
+    t7[2 * pitch + 3] = t7[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00401018u;
+    t7[3 * pitch + 2] = t7[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00401018u;
+    t7[3 * pitch + 3] = t7[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00902030u;
+    t7[4 * pitch + 2] = t7[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00401018u;
+    t7[4 * pitch + 3] = t7[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00902030u;
+    t7[5 * pitch + 3] = t7[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00401018u;
 
     gpu2d_flush_dcache();
 }
 
-static void laser_glow_build(void)
+static void __attribute__((unused)) laser_glow_build(void)
 {
-    /* Phase 2: High-Energy Player Laser Beam (16x768, stride 64).
-     * Baked with a 4-pixel blazing pure white hot core (0x00FFFFFF) flanked by
-     * electric neon cyan walls and smooth radiant plasma edges (zero dither noise).
-     * Triggers HDMI scanout Gaussian Bloom, diffusing an ethereal radiant cyan-white halo. */
+    /* Phase 2 / A3: the player laser beam sheet (16x768, stride 64).
+     *
+     * The engine no longer blits this surface.  A3 moved the craft's beam into
+     * the scanout, where video_beam.v draws it out of a sixteen-entry column
+     * table, and the sheet's remaining job is to be the thing that table is
+     * CHECKED against: tools/dump_beam_ref.py reads these bytes back out of
+     * emulated DDR and tests/tb_video_beam.sv compares the RTL's output with
+     * them pixel by pixel, all 768 rows and 16 columns, at three beam centres.
+     * The two are one table written twice, and changing either alone fails the
+     * bench - which is the point of keeping them apart.
+     *
+     * THE PROFILE.  A beam is light, so an opaque bar of colour is the wrong
+     * shape for it - but only its core is a light SOURCE, and the old sheet
+     * gave six of its twelve drawn columns white or near white (5, 6, 7, 8, 9,
+     * 10) while the scanout ADDED every one of them.  On any non-zero
+     * background all six saturated, so the core's over-exposure spread out
+     * until the beam read as a solid white bar.  Dimming the colours cannot fix
+     * that; it only turns a white bar grey.  The blend has to differ by column,
+     * and now it does - video_beam.v carries the same twelve columns with an
+     * add flag and an alpha per column:
+     *
+     *     columns 0, 1, 14, 15   MAGENTA_KEY - the engine's colour key skipped
+     *                            them and the scanout skips them too
+     *     columns 2..4, 11..13   the rim, a cool blue the scanout BLENDS at
+     *                            alpha 130, so the snow reads through it
+     *     columns 5, 6, 9, 10    the halo, brighter cyan, blended at alpha 190
+     *     columns 7, 8           the core: the only columns that ADD, and the
+     *                            only ones allowed to saturate
+     *
+     * The alpha is deliberately not here.  It is not a colour, this is a 24-bit
+     * surface, and the blend decision belongs next to the blend - video_beam.v
+     * keeps it in the same table row as the colour it applies to. */
     volatile uint32_t *base = (volatile uint32_t *)MM_LASER_GLOW;
     const unsigned pitch = 16u; /* MM_LASER_GLOW stride is 64 bytes = 16 words */
 
     for (unsigned y = 0; y < 768u; y++) {
         volatile uint32_t *row = &base[y * pitch];
-        /* Outer margin: completely transparent */
+
+        /* Outer margin: the four columns the colour key skips.  Written as the
+         * bare key, with no emissive tag - a tagged key is not the key the
+         * comparison in tb_video_beam.sv (and the old blit) looks for. */
         row[0]  = MAGENTA_KEY;
         row[1]  = MAGENTA_KEY;
         row[14] = MAGENTA_KEY;
         row[15] = MAGENTA_KEY;
 
-        /* Outer halo edge (deep electric cyan glow, smooth, no dither) */
-        row[2]  = 0x00003060u;
-        row[13] = 0x00003060u;
+        /* Rim: deep to mid cool blue, the most transparent step. */
+        row[2]  = MM_EMISSIVE_TAG | 0x002E6C8Cu;
+        row[13] = MM_EMISSIVE_TAG | 0x002E6C8Cu;
+        row[3]  = MM_EMISSIVE_TAG | 0x004696C0u;
+        row[12] = MM_EMISSIVE_TAG | 0x004696C0u;
+        row[4]  = MM_EMISSIVE_TAG | 0x0066C0E8u;
+        row[11] = MM_EMISSIVE_TAG | 0x0066C0E8u;
 
-        /* Saturated electric cyan walls */
-        row[3]  = 0x000088FFu;
-        row[4]  = 0x0020D0FFu;
-        row[11] = 0x0020D0FFu;
-        row[12] = 0x000088FFu;
+        /* Halo: saturated cyan carrying its own colour through the blend. */
+        row[5]  = MM_EMISSIVE_TAG | 0x008AD8FFu;
+        row[10] = MM_EMISSIVE_TAG | 0x008AD8FFu;
+        row[6]  = MM_EMISSIVE_TAG | 0x00C0EEFFu;
+        row[9]  = MM_EMISSIVE_TAG | 0x00C0EEFFu;
 
-        /* High-speed ion plasma ripple along the beam */
-        unsigned rip = (y & 15u);
-        if (rip <= 2u) {
-            /* High-energy node: expanded white core */
-            row[5]  = 0x00E0FFFFu;
-            row[6]  = 0x00FFFFFFu;
-            row[7]  = 0x00FFFFFFu;
-            row[8]  = 0x00FFFFFFu;
-            row[9]  = 0x00FFFFFFu;
-            row[10] = 0x00E0FFFFu;
-        } else {
-            /* Intense white core with cyan-white transition */
-            row[5]  = 0x0080F0FFu;
-            row[6]  = 0x00FFFFFFu;
-            row[7]  = 0x00FFFFFFu;
-            row[8]  = 0x00FFFFFFu;
-            row[9]  = 0x00FFFFFFu;
-            row[10] = 0x0080F0FFu;
-        }
+        /* Core: two columns of pure white, the only pair that adds, so the only
+         * pair allowed to drive the scanout bloom into over-exposure. */
+        row[7]  = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+        row[8]  = MM_EMISSIVE_TAG | 0x00FFFFFFu;
     }
     gpu2d_flush_dcache();
 }
@@ -2012,52 +2467,52 @@ static void laser_bar_build(void)
             row[15] = MAGENTA_KEY;
 
             /* Outer corona: smooth radiant halo (no raster dither noise) */
-            row[2]  = aura_edge;
-            row[13] = aura_edge;
+            row[2]  = MM_EMISSIVE_TAG | aura_edge;
+            row[13] = MM_EMISSIVE_TAG | aura_edge;
 
             if (f < 2u) {
                 /* Frames 0 & 1: Full-Power Blazing Plasma with traveling energy nodes */
                 /* Frame 0 phase offset 0, Frame 1 phase offset 16 -> creates flowing pulse */
                 unsigned wave = (y + (f * 16u)) & 31u;
 
-                row[3]  = 0x00FF2050u; /* Saturated neon crimson */
-                row[12] = 0x00FF2050u;
+                row[3]  = MM_EMISSIVE_TAG | 0x00FF2050u; /* Saturated neon crimson */
+                row[12] = MM_EMISSIVE_TAG | 0x00FF2050u;
 
                 if (wave < 8u) {
                     /* High-energy plasma surge: 6-pixel blinding white core */
-                    row[4]  = 0x00FFA0C8u;
-                    row[5]  = 0x00FFE0ECu;
-                    row[6]  = 0x00FFFFFFu;
-                    row[7]  = 0x00FFFFFFu;
-                    row[8]  = 0x00FFFFFFu;
-                    row[9]  = 0x00FFFFFFu;
-                    row[10] = 0x00FFE0ECu;
-                    row[11] = 0x00FFA0C8u;
+                    row[4]  = MM_EMISSIVE_TAG | 0x00FFA0C8u;
+                    row[5]  = MM_EMISSIVE_TAG | 0x00FFE0ECu;
+                    row[6]  = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+                    row[7]  = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+                    row[8]  = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+                    row[9]  = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+                    row[10] = MM_EMISSIVE_TAG | 0x00FFE0ECu;
+                    row[11] = MM_EMISSIVE_TAG | 0x00FFA0C8u;
                 } else {
                     /* Intense steady plasma: 4-pixel white core with radiant peach flanks */
-                    row[4]  = 0x00FF6080u;
-                    row[5]  = 0x00FFA0C8u;
-                    row[6]  = 0x00FFFFFFu;
-                    row[7]  = 0x00FFFFFFu;
-                    row[8]  = 0x00FFFFFFu;
-                    row[9]  = 0x00FFFFFFu;
-                    row[10] = 0x00FFA0C8u;
-                    row[11] = 0x00FF6080u;
+                    row[4]  = MM_EMISSIVE_TAG | 0x00FF6080u;
+                    row[5]  = MM_EMISSIVE_TAG | 0x00FFA0C8u;
+                    row[6]  = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+                    row[7]  = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+                    row[8]  = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+                    row[9]  = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+                    row[10] = MM_EMISSIVE_TAG | 0x00FFA0C8u;
+                    row[11] = MM_EMISSIVE_TAG | 0x00FF6080u;
                 }
             } else {
                 /* Frame 2: Cooling / Dissipating warning phase (when countdown <= 30) */
                 row[2]  = MAGENTA_KEY;
                 row[13] = MAGENTA_KEY;
-                row[3]  = 0x00600818u; /* Dimming crimson */
-                row[4]  = 0x00901428u;
-                row[5]  = 0x00D02040u;
-                row[6]  = 0x00FF6080u;
-                row[7]  = 0x00FFFFFFu; /* Narrow 2-pixel core */
-                row[8]  = 0x00FFFFFFu;
-                row[9]  = 0x00FF6080u;
-                row[10] = 0x00D02040u;
-                row[11] = 0x00901428u;
-                row[12] = 0x00600818u;
+                row[3]  = MM_EMISSIVE_TAG | 0x00600818u; /* Dimming crimson */
+                row[4]  = MM_EMISSIVE_TAG | 0x00901428u;
+                row[5]  = MM_EMISSIVE_TAG | 0x00D02040u;
+                row[6]  = MM_EMISSIVE_TAG | 0x00FF6080u;
+                row[7]  = MM_EMISSIVE_TAG | 0x00FFFFFFu; /* Narrow 2-pixel core */
+                row[8]  = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+                row[9]  = MM_EMISSIVE_TAG | 0x00FF6080u;
+                row[10] = MM_EMISSIVE_TAG | 0x00D02040u;
+                row[11] = MM_EMISSIVE_TAG | 0x00901428u;
+                row[12] = MM_EMISSIVE_TAG | 0x00600818u;
             }
         }
     }
@@ -2119,7 +2574,7 @@ static void lance_build(void)
             if (px < 0 || py < 0 ||
                 px > MM_LANCE_W - 3 || py > MM_LANCE_W - 3) continue;
             r_fill(dst + (uint32_t)(py * MM_LANCE_STRIDE + px * 4), 3, 3,
-                   (t > 2 || t < -2) ? 0x00FF6080u : 0x00FFE0F0u,
+                   MM_EMISSIVE_TAG | ((t > 2 || t < -2) ? 0x00FF6080u : 0x00FFE0F0u),
                    MM_LANCE_STRIDE);
         }
     }
@@ -2128,7 +2583,7 @@ static void lance_build(void)
 /* One 9x9 tile per (colour, heading): the socket tile with the direction
  * speck baked in.  enemy_bullet_render() used to FILL that 2x2 speck and then
  * COPY the tile - two commands, two DDR round trips, for 36 bytes of pixels,
- * up to 192 times a frame.
+ * once per enemy shot, so up to MAX_EBULLETS times a frame.
  *
  * The speck's offset comes from the shot's velocity, so a faithful bake would
  * need one tile per distinct (vx, vy).  Quantising to the 16 headings costs
@@ -2139,100 +2594,175 @@ static void lance_build(void)
  * playfield, and nothing repaints the gutter afterwards. */
 static void ebullet_dirtile_build(void)
 {
-    /* Phase 2 Task 01: 16-Direction High-Energy Conical Rice Bullets (经典东方流光锥形米弹).
+    /* Phase 2 Task 01: 16-Direction High-Energy Conical Rice Bullets.
      * Features:
-     * - 16 pre-quantised heading tiles per color, 13x13 footprint (fits within tile without gutter bleed);
-     * - Needle-sharp pure white hot tip (0x00FFFFFF, min_rgb >= 240) triggering HDMI Scanout Bloom;
-     * - High-energy electric core transition spine along direction vector;
-     * - Saturated attribute neon wings (palette[c]);
-     * - Smooth genuine 8-bit Alpha feathered halo (Reimu aura style, zero dither raster noise);
-     * - Outer MAGENTA_KEY transparent boundary. */
-    const unsigned dpitch = MM_EBULLET_DIRTILE_STRIDE / 4u;
+     * - 16 pre-quantised heading tiles, 26x26 footprint (twice the 13x13 it
+     *   was, edge for edge - see MM_EBULLET_DIRTILE in memory_map.h);
+     * - Needle-sharp pure white hot tip (bloom trigger);
+     * - High-energy electric core transition spine along the direction vector;
+     * - Saturated attribute neon wings;
+     * - Smooth 8-bit feathered halo, zero dither raster noise;
+     * - Outer "nothing here" boundary.
+     *
+     * SIXTEEN tiles, not 8 x 16.  The eight colours were pure recolourings of
+     * the same shape - measured on the firmware's own DDR, all 112 (shape, hue)
+     * pairs have identical opaque-cell sets - so a cell holds a ROLE number
+     * and the scanout resolves the colour with role + hue*32.
+     *
+     * Directions stay at sixteen because d and d+8 are NOT exact flips of each
+     * other on an integer grid: measured at 13x13, only 1 of the 8 pairs holds
+     * and only 4 of the 16 masks are symmetric about either axis.  Off by a
+     * pixel or two is still a different picture.
+     *
+     * TWICE THE EDGE, AND THE SHAPE IS THE OLD ONE WITH ITS THRESHOLDS
+     * DOUBLED - the COORDINATES stay on a one-pixel grid:
+     *
+     *     13x13                       26x26
+     *     dx = x - 6                  dx = x - 13
+     *     l  = dx*vx + dy*vy          l  = dx*vx + dy*vy   (same formula)
+     *     t  = |-dx*vy + dy*vx|       t  = same
+     *     l in [-60, 72]              l in [-120, 144]
+     *     w_core 34*(72-l)/72         68*(144-l)/144  (and 34*(60+l)/60 ->
+     *                                                     68*(120+l)/120)
+     *     w_halo = w_core + 20        w_halo = w_core + 40
+     *     t <= 4 / 8                  t <= 8 / 16
+     *     l >= 28                     l >= 56
+     *
+     * THE COORDINATES MUST NOT BE SCALED WITH THE THRESHOLDS.  Multiplying
+     * both by two is what "twice as big" looks like it should mean, and it is
+     * exactly the change that does NOTHING: l is linear in dx, so scaling dx
+     * scales l by the same factor, and doubling the window on l as well leaves
+     * every cell's verdict unchanged.  Measured on the first attempt, that put
+     * the shape at 9 x 6 cells where the 13x13 one was 8 x 7 - a 26x26 footprint
+     * around a bullet the same size as before.  What doubles the shape is the
+     * window alone: on a one-pixel grid, [-120, 144] admits 17 cells along the
+     * flight axis where [-60, 72] admitted 8.
+     *
+     * The halo is the one place the doubling is not a pure relabelling.  The
+     * old tier was a = 180 - 7*(t - w_core), and t - w_core could only reach 18
+     * of the 20 values the formula allows on a 13x13 grid (96 and 68 are
+     * unreachable - see eb_halo_a).  A 26x26 grid reaches further, so a is no
+     * longer compared for equality: the first entry of eb_halo_a that is no
+     * brighter than a wins.  A 20-tier halo would have needed two more roles x
+     * 8 hue pages and the palette has none to spare, and 18 tiers over a bullet
+     * twice as wide is a smoother ramp than it was, not a coarser one. */
+    const unsigned dpitch = MM_EBULLET_DIRTILE_STRIDE;   /* one byte a pixel */
 
-    for (unsigned c = 0; c < 8u; c++) {
-        uint32_t neon = palette[c];
-        /* Electric bright pastel transition: tinted towards pure white */
-        uint32_t nr = (neon >> 16) & 0xFFu;
-        uint32_t ng = (neon >> 8) & 0xFFu;
-        uint32_t nb = neon & 0xFFu;
-        uint32_t cr = 255u - ((255u - nr) * 60u / 255u);
-        uint32_t cg = 255u - ((255u - ng) * 60u / 255u);
-        uint32_t cb = 255u - ((255u - nb) * 60u / 255u);
-        uint32_t bright_core = (cr << 16) | (cg << 8) | cb;
+    for (unsigned d = 0; d < MM_EBULLET_DIRTILE_DIRS; d++) {
+        volatile uint8_t *dst = (volatile uint8_t *)
+            (MM_EBULLET_DIRTILE + (uint32_t)d * MM_EBULLET_DIRTILE_BYTES);
+        int vx = dir16_x[d];
+        int vy = dir16_y[d];
 
-        for (unsigned d = 0; d < MM_EBULLET_DIRTILE_DIRS; d++) {
-            volatile uint32_t *dst = (volatile uint32_t *)
-                (MM_EBULLET_DIRTILE +
-                 ((uint32_t)c * MM_EBULLET_DIRTILE_DIRS + d) *
-                     MM_EBULLET_DIRTILE_BYTES);
-            int vx = dir16_x[d];
-            int vy = dir16_y[d];
+        for (int y = 0; y < MM_EBULLET_DIRTILE_H; y++) {
+            /* ONE-PIXEL GRID.  Scaling these with the thresholds is the change
+             * that looks right and does nothing - see the note above the
+             * function. */
+            int dy = y - 13;
+            for (int x = 0; x < MM_EBULLET_DIRTILE_W; x++) {
+                int dx = x - 13;
+                int l = dx * vx + dy * vy;
+                int t = -dx * vy + dy * vx;
+                if (t < 0) t = -t;
 
-            for (int y = 0; y < MM_EBULLET_DIRTILE_W; y++) {
-                int dy = y - 6;
-                for (int x = 0; x < MM_EBULLET_DIRTILE_W; x++) {
-                    int dx = x - 6;
-                    int l16 = dx * vx + dy * vy;
-                    int t16 = -dx * vy + dy * vx;
-                    if (t16 < 0) t16 = -t16;
+                uint8_t role = BROLE_NONE;
+                if (l <= 144 && l >= -120) {
+                    int w_core = (l >= 0) ? ((68 * (144 - l)) / 144)
+                                          : ((68 * (120 + l)) / 120);
+                    int w_halo = w_core + 40;
 
-                    uint32_t px = MAGENTA_KEY;
-                    if (l16 <= 72 && l16 >= -60) {
-                        int w_core = (l16 >= 0) ? ((34 * (72 - l16)) / 72)
-                                                : ((34 * (60 + l16)) / 60);
-                        int w_halo = w_core + 20;
-
-                        if (t16 <= 10 && l16 >= 12) {
-                            /* Needle-sharp pure white hot tip (Bloom trigger) */
-                            px = 0xFFFFFFFFu;
-                        } else if (t16 <= 14 && l16 >= -24) {
-                            /* Blazing electric spine along trajectory */
-                            px = (255u << 24) | (bright_core & 0x00FFFFFFu);
-                        } else if (t16 <= w_core) {
-                            /* Saturated neon body/wings */
-                            px = (240u << 24) | (neon & 0x00FFFFFFu);
-                        } else if (t16 <= w_halo) {
-                            /* Smooth feathered halo.  The alpha byte is kept -
-                             * a tier that blends later can read it - but the
-                             * colour is pre-multiplied towards black as well,
-                             * because the shot loop draws these with a
-                             * colour-key COPY, which has no alpha channel to
-                             * read: an alpha-only feather comes out as a solid
-                             * neon band, a scaled one comes out as the dark
-                             * fringe the flare is meant to be. */
-                            int dist = t16 - w_core;
-                            uint32_t a = 180u - ((uint32_t)dist * 140u) / 20u;
-                            uint32_t pr = (((neon >> 16) & 0xFFu) * a) / 255u;
-                            uint32_t pg = (((neon >> 8) & 0xFFu) * a) / 255u;
-                            uint32_t pb = ((neon & 0xFFu) * a) / 255u;
-                            px = (a << 24) | (pr << 16) | (pg << 8) | pb;
-                        }
+                    if (t <= 8 && l >= 56) {
+                        /* Needle-sharp pure white hot tip (micro pinpoint spark) */
+                        role = BROLE_WHITE;
+                    } else if (t <= 16 && l >= 0) {
+                        /* Blazing electric spine along the trajectory */
+                        role = BROLE_EB_CORE;
+                    } else if (t <= w_core) {
+                        /* Saturated neon body/wings */
+                        role = BROLE_NEON;
+                    } else if (t <= w_halo) {
+                        /* Smooth feathered halo.  The tier is the first entry of
+                         * eb_halo_a that is no brighter than a: the table runs
+                         * brightest-first, and the old "equal" comparison no
+                         * longer holds - the formula's 20 steps reach values the
+                         * 13x13 grid never produced (96 and 68), and a 26-wide
+                         * bullet lands between two of them as well. */
+                        uint32_t a = 180u - ((uint32_t)(t - w_core) * 140u) / 20u;
+                        unsigned k = 0u;
+                        while (k + 1u < BROLE_EB_HALO_N && eb_halo_a[k] > a) k++;
+                        role = (uint8_t)(BROLE_EB_HALO + k);
                     }
-                    dst[y * dpitch + x] = px;
                 }
+                dst[y * dpitch + x] = role;
             }
         }
     }
     gpu2d_flush_dcache();
 }
 
-static int aim_index(int dx, int dy)
+/* ---- 追踪导弹：一个形状，两种混合 ----------------------------------------
+ *
+ * PF_LOCKON 的那两颗弹原来用玩家弹的图块（slot 16），所以它们的像素、角色
+ * 和调色板条目都和扇形弹共用 —— 而扫描端是**按调色板条目**决定混合方式
+ * 的，条目共用就等于混合方式共用，这也是"导弹没法单独设成半透明加加法"
+ * 的全部原因。
+ *
+ * 现在它有自己的图块（slot 18）和两个角色：
+ *
+ *     y 0..9    弹体   BROLE_MS_BODY   -> 调色板 alpha 190，乘法 alpha
+ *     y 10..25  拖尾   BROLE_MS_TRAIL  -> 调色板 alpha 254 = BPAL_ADD，加法
+ *
+ * 同一个弹里两种混合，靠的就是扫描端逐像素取调色板条目、逐像素读它的
+ * alpha 字节，再把 254 解释成"加法"（video_bullet_overlay.v 的 ADD_CODE）。
+ *
+ * 只有一个朝向（永远朝上）。16 个朝向要 16 x 416 = 6656 字节，而敌弹那边
+ * 刚刚把 store 顶到 16384；何况导弹是个圆头弹体加一条尾焰，整体接近轴对称，
+ * 朝向差异本来就比敌弹那根"针尖"弱得多，不值得为它再翻一倍 store。
+ *
+ * 13 宽（扇形弹 7，大玉 16），26 高 —— 与玩家弹一样高，所以
+ * spawn_pbullet_lockon() 里 GAME_BOTTOM - 26 那条夹取不用动。 */
+static void missile_tile_build(void)
+{
+    volatile uint8_t *tile = (volatile uint8_t *)MM_MISSILE_TILE;
+    const unsigned pitch = MM_MISSILE_TILE_STRIDE;
+
+    for (unsigned i = 0; i < pitch * MM_MISSILE_TILE_H; i++)
+        tile[i] = BROLE_NONE;
+
+    /* 一行一趟，半宽从中心列往两边铺：0..9 是弹体（尖头 1,2,3 -> 弹身 4 ->
+     * 最宽的一对翼 5 -> 收尾 3），10..25 是拖尾（5 起，每 3 行收 1 格）。 */
+    for (int y = 0; y < MM_MISSILE_TILE_H; y++) {
+        int half = (y < 10) ? ((y < 3) ? (y + 1) : ((y < 6) ? 4 : ((y < 8) ? 5 : 3)))
+                            : ((25 - y) / 3);
+        uint8_t role = (y < 10) ? BROLE_MS_BODY : BROLE_MS_TRAIL;
+        for (int x = 6 - half; x <= 6 + half; x++)
+            tile[y * pitch + x] = role;
+    }
+    gpu2d_flush_dcache();
+}
+
+static inline __attribute__((always_inline)) int aim_index_inline(int dx, int dy)
 {
     int ax = (dx < 0) ? -dx : dx;
     int ay = (dy < 0) ? -dy : dy;
     int q;
 
-    if (ax == 0 && ay == 0) return 4;
+    /* Horizontal walls dominate the pressure stage; avoid the ratio tests. */
+    if (dy == 0) return dx == 0 ? 4 : (dx < 0 ? 8 : 0);
     if ((ay << 2) + ay <= ax)             q = 0;   /* |dy|/|dx| <= 0.2 */
     else if ((ay << 1) + ay <= (ax << 1)) q = 1;
     else if ((ay << 1) <= (ax << 1) + ax) q = 2;
     else if (ay <= (ax << 2) + ax)        q = 3;
     else                                  q = 4;
 
-    if (dx >= 0 && dy >= 0) return q;
-    if (dx <  0 && dy >= 0) return 8 - q;
-    if (dx <  0 && dy <  0) return 8 + q;
-    return (16 - q) & 15;
+    if (dx < 0) q = 8 - q;
+    if (dy < 0) q = -q;
+    return q & 15;
+}
+
+static int aim_index(int dx, int dy)
+{
+    return aim_index_inline(dx, dy);
 }
 
 /* ---------------------------------------------------------------- pools */
@@ -2250,19 +2780,96 @@ static void pool_clear(void)
     for (int i = 0; i < MAX_ENEMIES; i++)  enemies[i].flags  = 0;
     for (int i = 0; i < MAX_PBULLETS; i++) pbullets[i].flags = 0;
     for (int i = 0; i < MAX_EBULLETS; i++) ebullets[i].flags = 0;
+    /* Emptied, so the walks can start from nothing again.  See the bound
+     * comment above: only these two lines are allowed to LOWER it. */
+    pb_hi = 0;
+    pb_free_hint = 0;
+    eb_hi = 0;
+    eb_free_hint = 0;
+    eb_lance_count = 0;
+    active_ebullets_count = 0;
+    active_count = 0;
     for (int i = 0; i < MAX_ITEMS; i++)    items[i].flags    = 0;
 }
 
-static bullet_t *alloc_bullet(bullet_t *pool, int n)
+static bullet_t *alloc_bullet_range(bullet_t *pool, int lo, int hi)
 {
-    for (int i = 0; i < n; i++)
-        if (!(pool[i].flags & EF_ACTIVE)) return &pool[i];
+    for (bullet_t *b = pool + lo, *end = pool + hi; b < end; b++)
+        if (!(b->flags & EF_ACTIVE)) return b;
     return (bullet_t *)0;
+}
+
+/* The player's pool, in one run, so one bound covers it.  Raises pb_hi as it
+ * hands a slot out - see the bound comment above for why that is the whole
+ * correctness argument. */
+static bullet_t *alloc_pbullet(void)
+{
+    bullet_t *b = (bullet_t *)0;
+    if (pb_free_hint < MAX_PBULLETS && !(pbullets[pb_free_hint].flags & EF_ACTIVE)) {
+        b = &pbullets[pb_free_hint++];
+    } else {
+        b = alloc_bullet_range(pbullets, pb_free_hint, MAX_PBULLETS);
+        if (!b && pb_free_hint > 0)
+            b = alloc_bullet_range(pbullets, 0, pb_free_hint);
+        if (b) pb_free_hint = (int)(b - pbullets) + 1;
+    }
+
+    if (b && (int)(b - pbullets) + 1 > pb_hi)
+        pb_hi = (int)(b - pbullets) + 1;
+    return b;
+}
+
+/* Every enemy shot that is not an orb: the front of the pool only. */
+static bullet_t *alloc_ebullet(void)
+{
+    bullet_t *b = (bullet_t *)0;
+    if (eb_free_hint < ORB_FIRST && !(ebullets[eb_free_hint].flags & EF_ACTIVE)) {
+        b = &ebullets[eb_free_hint++];
+    } else {
+        b = alloc_bullet_range(ebullets, eb_free_hint, ORB_FIRST);
+        if (!b && eb_free_hint > 0)
+            b = alloc_bullet_range(ebullets, 0, eb_free_hint);
+        if (b) eb_free_hint = (int)(b - ebullets) + 1;
+    }
+
+    if (b) {
+        int i = (int)(b - ebullets);
+        if (i + 1 > eb_hi) eb_hi = i + 1;
+        active_count++;
+        active_ebullets_count = active_count;
+    }
+    return b;
+}
+
+/* The Big Orbs: their own tail first, the front only when that is full.
+ * See ORB_RESERVE for what this is for. */
+static bullet_t *alloc_orb(void)
+{
+    /* The orb tail is a FIXED 32 slots and is walked in full every time (see
+     * FOR_EACH_EBULLET), so a slot taken here needs no bound update.  A slot
+     * BORROWED from the front run does. */
+    bullet_t *b = alloc_bullet_range(ebullets, ORB_FIRST, MAX_EBULLETS);
+
+    if (!b) {
+        b = alloc_bullet_range(ebullets, eb_free_hint, ORB_FIRST);
+        if (!b && eb_free_hint > 0)
+            b = alloc_bullet_range(ebullets, 0, eb_free_hint);
+        if (b) {
+            int i = (int)(b - ebullets);
+            eb_free_hint = i + 1;
+            if (i + 1 > eb_hi) eb_hi = i + 1;
+        }
+    }
+    if (b) {
+        active_count++;
+        active_ebullets_count = active_count;
+    }
+    return b;
 }
 
 static void spawn_pbullet(int x, int y, int vx, int vy, uint8_t color)
 {
-    bullet_t *b = alloc_bullet(pbullets, MAX_PBULLETS);
+    bullet_t *b = alloc_pbullet();
     if (!b) return;
     /* Clamp at spawn so every later render lands inside the PLAYFIELD, not
      * merely inside the framebuffer: a 7-pixel tile parked on the right edge
@@ -2284,20 +2891,44 @@ static void spawn_pbullet(int x, int y, int vx, int vy, uint8_t color)
     b->color = color;  b->flags = EF_ACTIVE;
 }
 
+/* Task 12: the two wing missiles of the pressure stage's three-stream shot.
+ * They are born flying straight up so a shot with no target in front of it is
+ * never a shot with no direction, and bullets_update() re-aims them at the
+ * boss on every frame they live. */
+static void spawn_pbullet_lockon(int x, int y)
+{
+    bullet_t *b = alloc_pbullet();
+    if (!b) return;
+    /* The tile is 13 wide now, not 7, and b->x is its top-left corner. */
+    if (x < GAME_LEFT + 2)  x = GAME_LEFT + 2;
+    if (x > GAME_RIGHT - MM_MISSILE_TILE_W) x = GAME_RIGHT - MM_MISSILE_TILE_W;
+    if (y < PLAYFIELD_TOP + 1) y = PLAYFIELD_TOP + 1;
+    if (y > GAME_BOTTOM - 26)  y = GAME_BOTTOM - 26;
+    b->x = (int16_t)x; b->y = (int16_t)y;
+    b->vx = 0;         b->vy = -SPD_LOCKON_MISSILE;
+    /* Colour 5 is the cyan tile the laser's own outer bolts already use, so
+     * the homing rounds read as part of the same weapon instead of a third
+     * one dropped on top of it. */
+    b->color = 5;
+    b->flags = (uint8_t)(EF_ACTIVE | PF_LOCKON);
+}
+
 static void spawn_ebullet(int x, int y, int vx, int vy, uint8_t color)
 {
-    bullet_t *b = alloc_bullet(ebullets, MAX_EBULLETS);
+    bullet_t *b = alloc_ebullet();
     if (!b) return;
     /* Enemy shots live strictly inside the playfield: they are drawn inside a
      * dark socket that reaches one pixel past the tile, and the socket must
      * not land on either HUD panel. */
+    /* x and y are the shot's CENTRE, so the right and bottom clamps are the
+     * tile's half width plus the same 3-pixel margin the 13x13 bullet had
+     * (6 + 3 and 6 + 7).  The tile is 26x26 now: 13 + 3 = 16, 13 + 7 = 20. */
     if (x < GAME_LEFT + 1)  x = GAME_LEFT + 1;
-    if (x > GAME_RIGHT - 9) x = GAME_RIGHT - 9;
-    /* One row below PLAYFIELD_TOP: the socket is drawn from y-1.  The lower
-     * bound is the socket itself, which reaches four rows below the tile -
-     * 590 was that same value against a 600-tall playfield. */
+    if (x > GAME_RIGHT - 16) x = GAME_RIGHT - 16;
+    /* One row below PLAYFIELD_TOP: the shot is drawn from y - 1.  The lower
+     * bound keeps the whole 26-pixel tile inside the playfield. */
     if (y < PLAYFIELD_TOP + 1)  y = PLAYFIELD_TOP + 1;
-    if (y > GAME_BOTTOM - 13)   y = GAME_BOTTOM - 13;
+    if (y > GAME_BOTTOM - 2)    y = GAME_BOTTOM - 2;
     b->x = (int16_t)x; b->y = (int16_t)y;
     b->vx = (int8_t)vx; b->vy = (int8_t)vy;
     b->color = color;  b->flags = EF_ACTIVE;
@@ -2305,7 +2936,7 @@ static void spawn_ebullet(int x, int y, int vx, int vy, uint8_t color)
 
 static void spawn_ebullet_orb(int x, int y, int vx, int vy, uint8_t color)
 {
-    bullet_t *b = alloc_bullet(ebullets, MAX_EBULLETS);
+    bullet_t *b = alloc_orb();
     if (!b) return;
     if (x < GAME_LEFT + 8)  x = GAME_LEFT + 8;
     if (x > GAME_RIGHT - 8) x = GAME_RIGHT - 8;
@@ -2324,7 +2955,7 @@ static void spawn_ebullet_orb(int x, int y, int vx, int vy, uint8_t color)
  * means "everything still on station turns". */
 static void spawn_held_ebullet(int x, int y, uint8_t color)
 {
-    bullet_t *b = alloc_bullet(ebullets, MAX_EBULLETS);
+    bullet_t *b = alloc_ebullet();
     if (!b) return;
     if (x < GAME_LEFT + 1)  x = GAME_LEFT + 1;
     if (x > GAME_RIGHT - 9) x = GAME_RIGHT - 9;
@@ -2342,8 +2973,10 @@ static void spawn_held_ebullet(int x, int y, uint8_t color)
  * be stored in a record that is exactly eight bytes wide. */
 static void spawn_lance(int x, int y, int vx, int vy)
 {
-    bullet_t *b = alloc_bullet(ebullets, MAX_EBULLETS);
+    bullet_t *b = alloc_ebullet();
     if (!b) return;
+    int idx = (int)(b - ebullets);
+    eb_lances[eb_lance_count++] = (uint16_t)idx;
     /* Born on the boss's muzzle, which can be close enough to a wall that
      * half the shaft would be drawn over the HUD gutter before the first
      * bounce could turn it back. */
@@ -2459,6 +3092,8 @@ static void player_fire(void)
     int cy = player_y - 18;
     int lv = (int)weapon_level;                    /* 1..WEAPON_MAX_LEVEL */
 
+    audio_event((weapon == W_LASER) ? AUDIO_EVENT_LASER : AUDIO_EVENT_SHOT);
+
     /* The shot pattern scales with the weapon LEVEL: the same weapon type at
      * level 4 fires more bullets than at level 1.  That is what makes a
      * fourth SHOT pickup worth taking after the old code wrapped a maxed-out
@@ -2478,12 +3113,22 @@ static void player_fire(void)
         }
         break;
 
-    case W_FAN:
-        /* 3 -> 5 -> 7 -> 9 shots, always centred and symmetric */
-        for (int k = -(lv / 2 + 1); k <= (lv / 2 + 1); k++)
-            spawn_pbullet(cx + k * 5, cy + ((k & 1) ? 6 : 4), k * 3,
+    case W_FAN: {
+        /* 3 -> 5 -> 7 -> 9 shots, always centred and symmetric.
+         *
+         * Written as a table because the arithmetic this replaced did not do
+         * what its comment said: -(lv / 2 + 1) .. +(lv / 2 + 1) with integer
+         * division gives 3, 5, 5, 7 - level 3 fired exactly what level 2 did,
+         * so the third SHOT pickup changed nothing on screen and only the
+         * fourth did.  The spread also runs to +-24 px at level 4; the craft's
+         * silhouette is 48 px wide. */
+        static const int fan_span[4] = { 1, 2, 3, 4 };   /* lv 1..4 */
+        int span = fan_span[(lv < 1) ? 0 : ((lv > 4) ? 3 : (lv - 1))];
+        for (int k = -span; k <= span; k++)
+            spawn_pbullet(cx + k * 6, cy + ((k & 1) ? 6 : 4), k * 3,
                           -SPD_PBULLET_S, (uint8_t)(3 + ((k + 4) & 1)));
         break;
+    }
 
     case W_LASER:
         /* The beam is continuous; from level 2 it also throws outer bolts so
@@ -2513,6 +3158,50 @@ static void player_fire(void)
     }
 }
 
+/* Task 12: the pressure stage's three-stream shot.
+ *
+ * The campaign's shot is ONE weapon at a time, and that stays true: this
+ * function is reached only under `is_stress_stage`, so nothing here can reach
+ * a normal run and no normal run can reach it.
+ *
+ * The three streams are chosen to exercise three different render paths at
+ * once, which is the point of the stage:
+ *
+ *   1. the centre beam  - W_LASER, drawn by laser_tick() plus the scanout's
+ *                         own glow strip.  It costs no pool slot at all, so
+ *                         the densest stream in the picture is also the
+ *                         cheapest one.
+ *   2. the fan          - W_FAN at its top level: seven bullets a salvo on
+ *                         seven different headings, i.e. seven directional
+ *                         tiles out of the pre-composed 8x16 atlas per salvo.
+ *   3. the wing missiles- two rounds that re-aim at the boss every frame, so
+ *                         the stage also carries the one case where a shot's
+ *                         heading changes after it is drawn. */
+static void stress_player_fire(void)
+{
+    int cx = player_x;
+    int cy = player_y - 18;
+
+    /* This stress-stage path bypasses player_fire(), so it needs its own
+     * one-shot.  Without it the fan looked active but was silent. */
+    audio_event(AUDIO_EVENT_SHOT);
+
+    /* W_FAN at WEAPON_MAX_LEVEL: nine shots, centred and symmetric.  Spelling
+     * the loop out rather than calling player_fire() keeps the fan's tuning in
+     * exactly one place - and that place is now player_fire()'s fan_span
+     * table, which this matches: lv 4 -> span 4 -> k = -4..4.  It used to be a
+     * hard-coded -3..3, i.e. SEVEN, which is what level 3 fires. */
+    for (int k = -4; k <= 4; k++)
+        spawn_pbullet(cx + k * 6, cy + ((k & 1) ? 6 : 4), k * 3,
+                      -SPD_PBULLET_S, (uint8_t)(3 + ((k + 4) & 1)));
+
+    /* The two wings.  14 pixels out is outside the craft's own 48-pixel
+     * silhouette's centre but still inside the aura, so the pair reads as
+     * mounted on the wings rather than fired from the middle. */
+    spawn_pbullet_lockon(cx - 14, cy + 8);
+    spawn_pbullet_lockon(cx + 14, cy + 8);
+}
+
 /* ---- the player's spell card ------------------------------------------
  * Centre-click.  It wipes every enemy shot off the screen - converting them
  * into score, so the button is worth pressing at the worst possible moment -
@@ -2528,16 +3217,35 @@ static void player_bomb(void)
     bomb_charge = 0;
     bomb_flash  = BOMB_FLASH_FRAMES;
 
-    for (int i = 0; i < MAX_EBULLETS; i++) {
-        if (!(ebullets[i].flags & EF_ACTIVE)) continue;
-        ebullets[i].flags = 0;
-        score_award(20u, ebullets[i].x, ebullets[i].y);
-        spawn_particle(ebullets[i].x, ebullets[i].y,
-                       (int)(xorshift32() % 3u) - 1,
-                       -2 - (int)(xorshift32() % 2u),
-                       PARTICLE_MOTE, 24);
+    /* Task 12: in the pressure stage the spell card is a WEAPON, not a reset.
+     *
+     * Everything below is the genre's standard "get out of a wall" button, and
+     * that is exactly what the pressure stage must not have: a screen-clearing
+     * button empties the one thing the stage exists to keep full, and the
+     * 1.5 s white flash both hides the barrage and puts the largest burst the
+     * colour matrix ever has to run on the frame where the engine is already
+     * at its busiest.  The stage keeps the card's damage (below) and its
+     * shockwave ring, so the button still does something visible and useful -
+     * it just no longer deletes the field. */
+    if (!is_stress_stage) {
+        bullet_t *eb;
+
+        FOR_EACH_EBULLET(eb) {
+            eb->flags = 0;
+            score_award(20u, eb->x, eb->y);
+            spawn_particle(eb->x, eb->y,
+                           (int)(xorshift32() % 3u) - 1,
+                           -2 - (int)(xorshift32() % 2u),
+                           PARTICLE_MOTE, 24);
+        }
+        /* The field is empty again, so the walk may start from nothing. */
+        eb_hi = 0;
+        eb_lance_count = 0;
+        eb_free_hint = 0;
+        active_ebullets_count = 0;
+        active_count = 0;
+        color_matrix_flash_timer = CM_FLASH_FRAMES;
     }
-    color_matrix_flash_timer = CM_FLASH_FRAMES;
 
     for (int i = 0; i < MAX_ENEMIES; i++) {
         enemy_rec_t *e = &enemies[i];
@@ -2598,6 +3306,112 @@ static void laser_tick(uint8_t held)
     }
 }
 
+/* ---- Task 12: the continuous barrage -----------------------------------
+ *
+ * The stage holds STRESS_STORM_TARGET shots in the air, and it does that by
+ * ASKING THE POOL how full it is and topping it up - not by firing on a
+ * schedule.  A schedule would have to be tuned against the cull rate (a shot
+ * leaves at the playfield edge, or on the frame it reaches the craft), and any
+ * such tuning is wrong the moment the player moves or stops shooting.  Counting
+ * costs one pass over MAX_EBULLETS flag bytes and needs no constant at all.
+ *
+ * Three sources, mixed ring/cone/wall = 1/3, 1/6, 1/2:
+ *
+ *   ring - one arm per step around the boss, i.e. a slow multi-petal rose as
+ *          the boss drifts across its move targets
+ *   cone - four aim offsets on the craft, so standing still is punished
+ *   wall - a crossing shot from alternating edges, so the walls are not the
+ *          safe place the other two can leave them
+ *
+ * The budget cap is what keeps those three APART on screen.  Filling the pool
+ *
+ * SPAWN GEOMETRY (balanced mix): Ring/Cone/Wall balanced to equal on-screen
+ * presence. In every 24 steps: 10 Ring (hue 5), 8 Cone (hue 3), 6 Wall (hue 4:
+ * 3 left, 3 right). Per 48-shot cycle: 20 Ring, 16 Cone, 12 Wall (6 left, 6 right).
+ * Interleaved pattern prevents clustering and disperses vertical row density across
+ * 94 groups with coprime strides (29, 37, 31). */
+static uint16_t stress_storm_step;
+
+/* 24-entry pattern table: high 2 bits = kind (0:Ring, 1:Cone, 2:Wall L, 3:Wall R),
+ * low 6 bits = sub-index within that kind.
+ * 50% Wall (6 Left, 6 Right), 25% Ring, 25% Cone. Interleaved every other step. */
+static const uint8_t storm_sched[24] = {
+    0, 128, 64, 198,
+    1, 129, 65, 199,
+    2, 130, 66, 200,
+    3, 131, 67, 201,
+    4, 132, 68, 202,
+    5, 133, 69, 203
+};
+
+static const uint8_t storm_wall_g[128] = {
+     0, 45, 72,  7, 50, 76, 17, 54, 79, 23, 58, 84, 29, 62, 89, 36,
+    67, 95, 43, 71,  2, 48, 74, 14, 52, 78, 21, 56, 81, 26, 61, 87,
+    33, 65, 93, 40, 69,  0, 46, 73,  9, 50, 76, 18, 55, 79, 23, 59,
+    84, 30, 64, 91, 37, 68, 95, 43, 71,  4, 49, 75, 15, 53, 78, 21,
+    58, 82, 27, 62, 88, 34, 66, 93, 41, 70,  0, 47, 73, 11, 51, 77,
+    19, 56, 80, 24, 60, 86, 31, 64, 91, 38, 68, 95, 45, 72,  6, 49,
+    75, 17, 54, 79, 22, 58, 83, 28, 62, 89, 35, 66, 95, 42, 70,  2,
+    47, 74, 13, 52, 77, 20, 56, 81, 25, 60, 86, 32, 64, 91, 39, 69,
+};
+
+static void stress_storm_update(void)
+{
+    int active = active_ebullets_count;
+
+    /* Real live reserve covers the DMA culls at the end of this frame. */
+    int room = (int)stress_target + (stress_target >= 4000u ? 64 : 0) - active;
+    if (room <= 0) return;
+    if (room > STRESS_STORM_BUDGET) room = STRESS_STORM_BUDGET;
+
+    int cx = boss_x + 32;
+    int cy = boss_y + 28;
+    int base_aim = aim_index(player_x - cx, player_y - cy);
+
+    unsigned cur_step = (unsigned)stress_storm_step;
+    unsigned q = cur_step / 24u;
+    unsigned rem = cur_step % 24u;
+
+    for (int i = 0; i < room; i++) {
+        unsigned step = cur_step + (unsigned)i;
+        uint8_t entry = storm_sched[rem];
+        unsigned kind = entry >> 6;
+        unsigned sub = entry & 0x3Fu;
+
+        if (kind == 0u) {
+            /* Ring: emitted radially from the boss */
+            int a = (int)((step * 2u) & 15u);
+            spawn_ebullet(cx, cy,
+                          (dir16_x[a] * SPD_STORM) >> 4,
+                          (dir16_y[a] * SPD_STORM) >> 4, 5);
+        } else if (kind == 1u) {
+            /* Cone: targeted spray towards player */
+            int off = ((int)(step & 12u) >> 2) - 1;   /* -1..+2 */
+            int a = (base_aim + off + ((sub & 1u) ? 8 : 0)) & 15;
+            spawn_ebullet(cx, cy,
+                          (dir16_x[a] * SPD_STORM) >> 4,
+                          (dir16_y[a] * SPD_STORM) >> 4, 3);
+        } else {
+            /* Wall: crossing shots from side walls covering full 768-height screen */
+            unsigned idx = q * 12u + sub;
+            uint8_t g = storm_wall_g[idx & 127u];
+            int y = (int)((g << 3) + 6u);
+            if (y > GAME_BOTTOM - 26) y = GAME_BOTTOM - 26;
+            if (kind == 2u)
+                spawn_ebullet(GAME_LEFT + 2, y, SPD_STORM, 0, 4);
+            else
+                spawn_ebullet(GAME_RIGHT - 11, y, -SPD_STORM, 0, 4);
+        }
+
+        rem++;
+        if (rem == 24u) {
+            rem = 0;
+            q++;
+        }
+    }
+    stress_storm_step = (uint16_t)(stress_storm_step + (unsigned)room);
+}
+
 /* Phase 2 Task 02: a hit is a screen-clearing event now, not a cosmetic blink.
  *
  * The old version only deducted a life and lit the colour-matrix flash, which
@@ -2631,7 +3445,16 @@ static void take_hit(void)
     invuln = INVULN_FRAMES;
     hit_blink = HIT_BLINK_FRAMES;
     hits_taken++;
-    color_matrix_flash_timer = CM_FLASH_FRAMES;
+    /* Task 12: the pressure stage takes the hit and drops the two full-screen
+     * reactions to it.  A craft that eats a bullet out of a 192-shot curtain
+     * is hit again the frame its invulnerability lapses; with the sweep and
+     * the flash both on, the stage degenerates into an unreadable strobe on a
+     * field that is alternately emptied and refilled.  What the player still
+     * gets is the whole per-hit readout that matters: the life, the
+     * invulnerability, the fast blink, the shockwave ring on the point of
+     * impact, and the telemetry counter. */
+    if (!is_stress_stage)
+        color_matrix_flash_timer = CM_FLASH_FRAMES;
 
     /* Anchor the shockwave HERE, before the respawn below moves the craft -
      * see the note on hit_ring_x / hit_ring_y. */
@@ -2642,23 +3465,47 @@ static void take_hit(void)
     /* Clear the field.  The pool is DDR so the flags byte is the only write,
      * and one mote per shot is what sells "the curtain was blown apart" -
      * particle_cursor wraps over the 48-slot ring, so a 192-shot screen simply
-     * keeps the newest 48 of them. */
-    for (int i = 0; i < MAX_EBULLETS; i++) {
-        if (!(ebullets[i].flags & EF_ACTIVE)) continue;
-        int bx = ebullets[i].x;
-        int by = ebullets[i].y;
-        ebullets[i].flags = 0;
-        spawn_particle(bx, by,
-                       (int)(xorshift32() % 3u) - 1,
-                       -2 - (int)(xorshift32() % 2u),
-                       PARTICLE_MOTE, 24);
+     * keeps the newest 48 of them.
+     *
+     * Task 12: not in the pressure stage.  "????????????" is the whole
+     * premise of the stage - the barrage has to survive the player being hit,
+     * or the continuous-load measurement restarts every time it lands. */
+    if (!is_stress_stage) {
+        bullet_t *eb;
+
+        FOR_EACH_EBULLET(eb) {
+            int bx = eb->x;
+            int by = eb->y;
+            eb->flags = 0;
+            spawn_particle(bx, by,
+                           (int)(xorshift32() % 3u) - 1,
+                           -2 - (int)(xorshift32() % 2u),
+                           PARTICLE_MOTE, 24);
+        }
+        eb_hi = 0;
+        eb_lance_count = 0;
+        eb_free_hint = 0;
+        active_ebullets_count = 0;
+        active_count = 0;
     }
 
     /* Back to the classic spawn point: centred, on the bottom third of the
      * field.  Same expression game_init() uses, so a fresh run and a respawn
-     * cannot drift apart. */
-    player_x = (int16_t)((GAME_LEFT + GAME_RIGHT) / 2);
-    player_y = GAME_TOP + (GAME_BOTTOM - GAME_TOP) * 2 / 3;
+     * cannot drift apart.
+     *
+     * NOT in the pressure stage.  The respawn is a rescue: on a normal stage
+     * the hit has just cleared the screen, so the craft is put down somewhere
+     * with room to re-enter from.  There the curtain never clears, so the same
+     * teleport does not rescue anything - it drags the craft out of a position
+     * the player had earned by dodging and drops it back into the thick of the
+     * barrage, and then the invulnerability it was granted runs out on a spot
+     * the player never chose.  The stage keeps everything a hit is supposed to
+     * cost (the life, the invulnerability, the blink, the ring on the point of
+     * impact) and lets the craft stay where it was hit. */
+    if (!is_stress_stage) {
+        player_x = (int16_t)((GAME_LEFT + GAME_RIGHT) / 2);
+        player_y = GAME_TOP + (GAME_BOTTOM - GAME_TOP) * 2 / 3;
+    }
 
     if (lives) lives--;
     if (lives == 0) {
@@ -2738,6 +3585,26 @@ static const uint8_t pat_book1[12] = {
     PAT_SWAY, PAT_BEAM, PAT_TORNADO, PAT_LANCE
 };
 
+/* Stage 2's book.  It was RAIN and the spiral family - three patterns in all -
+ * so PAT_CUT and PAT_BEAM were not in the table and its boss could never show
+ * a laser: a player who reached stage 2 fought a laser-less boss.  The two
+ * laser skills join the table here, and the rest of it stays the spiral stage
+ * it always was. */
+static const uint8_t pat_book2[12] = {
+    PAT_RAIN, PAT_SPIRAL, PAT_CROSS, PAT_AIMED,
+    PAT_RAIN, PAT_SPIRAL, PAT_CROSS, PAT_TWIN,
+    PAT_BURST, PAT_SWAY, PAT_CUT, PAT_BEAM
+};
+
+/* Deterministic coverage of every non-summon attack in a sustained load run.
+ * Keep collision, lock-on, lance, impact FX and laser workloads enabled. */
+static const uint8_t pat_book_stress[] = {
+    PAT_FAN, PAT_RING, PAT_SPIRAL, PAT_CROSS,
+    PAT_RAIN, PAT_WALL, PAT_TWIN, PAT_BURST,
+    PAT_LANCE, PAT_TORNADO, PAT_CUT, PAT_BEAM,
+    PAT_AIMED, PAT_LOCKON, PAT_SWAY, PAT_VOLLEY, PAT_CURTAIN
+};
+
 #define PAT_RECENT 5
 static uint8_t pat_recent[PAT_RECENT];
 static uint8_t pat_recent_n;
@@ -2763,7 +3630,10 @@ static void boss_next_pattern(void)
     /* The summon pattern is guaranteed to come round at least every fourth
      * change: the boss always reinforces, and the behaviour stays testable
      * instead of depending on a lucky random draw. */
-    if (boss_since_summon >= 3) {
+    if (is_stress_stage) {
+        boss_pattern = pat_book_stress[(pattern_changes + 1u) % sizeof(pat_book_stress)];
+        boss_prev_pat = boss_pattern;
+    } else if (boss_since_summon >= 3) {
         boss_pattern     = PAT_SUMMON;
         boss_prev_pat    = PAT_SUMMON;
         boss_since_summon = 0;
@@ -2776,10 +3646,13 @@ static void boss_next_pattern(void)
             /* Each stage opens more of the book than the last.  Stage 1 used
              * to cycle fan / ring / aimed and nothing else, which is why the
              * first boss felt thin next to the later ones. */
+            /* Every book carries both laser skills: stage 1's table always
+             * did, stage 2's did not, and the pressure stage has one of its
+             * own with the lasers at twice the density. */
             if (wave == 0) {
                 p = pat_book1[r % 12u];
             }
-            else if (wave == 1) p = (uint8_t)((r % 3u == 2u) ? PAT_RAIN : PAT_SPIRAL + r % 3u);
+            else if (wave == 1) p = pat_book2[r % 12u];
             else p = (uint8_t)(r % PAT_COUNT);
             if (p == PAT_SUMMON || p == boss_prev_pat) continue;
             pick = p;
@@ -2954,15 +3827,36 @@ static void boss_fire(void)
         break;
 
     case PAT_LOCKON:
-        /* 6.2: the layout is stepped out over the next second. */
-        lockon_timer = LOCKON_LAYOUT;
-        lockon_arm   = 1;
+        /* 6.2: the layout is stepped out over the next second.
+         *
+         * ONLY THE FIRST CALL STARTS A LAYOUT, and that guard is the whole
+         * point: boss_fire() runs every (28 - wave*4) logic steps while the
+         * pattern is live, and this branch used to write lockon_timer back to
+         * LOCKON_LAYOUT unconditionally.  The timer was therefore never
+         * allowed to reach zero, the volley never left the laying-out phase
+         * inside its own window, and the shots only came off station once the
+         * pattern had already changed away - a batch of bullets starting to
+         * move after the boss had visibly switched attacks.  PAT_CUT has the
+         * same guard for the same reason (see its cut_phase comment). */
+        if (!lockon_arm) {
+            lockon_timer = LOCKON_LAYOUT;
+            lockon_arm   = 1;
+        }
         break;
 
     case PAT_BURST:
-        /* 6.3: two rings half an aim step apart, using high-tier additive Big Orbs. */
+        /* 6.3: a ring of sixteen high-tier Big Orbs, plus a faster cyan one out
+         * of every other direction behind them.
+         *
+         * ONE ORB PER DIRECTION.  The direction used to be `(k * 2) & 15`, which
+         * walks 0, 2, 4 ... 14 and then 0, 2, 4 ... 14 again: sixteen orbs over
+         * eight directions, and the two that share a direction also share a
+         * speed, so they are drawn exactly on top of each other for their whole
+         * flight.  Half of what the attack threw was invisible and the "all
+         * round" ring was really a cross.  `k` gives all sixteen directions, so
+         * the same twenty-four orbs read as twenty-four. */
         for (int k = 0; k < BURST_RING; k++) {
-            int a = (k * 2) & 15;
+            int a = k & 15;
             spawn_ebullet_orb(cx, cy, (dir16_x[a] * SPD_RING) >> 4,
                               (dir16_y[a] * SPD_RING) >> 4, 2);
             if (k & 1)
@@ -3041,9 +3935,15 @@ static void boss_clear_lasers(void)
     cut_phase = 0;
 }
 
-static void boss_opener(void)
+/* wipe clears whatever beams are standing before the volley.  The campaign
+ * card wants that - it opens on a clean field.  The pressure stage called
+ * this with 0 so that its own opener would not delete a standing cut; it
+ * no longer fires the opener at all, and the argument stays so the door is
+ * still there should it ever need to again. */
+static void boss_opener(int wipe)
 {
-    boss_clear_lasers();
+    if (wipe) boss_clear_lasers();
+    audio_event(AUDIO_EVENT_BOSS);
     int cx = boss_x + 32;
     int cy = boss_y + 28;
 
@@ -3131,7 +4031,7 @@ static void boss_update(void)
             boss_fire_timer = 18;
             if (boss_pending_opener) {
                 boss_pending_opener = 0;
-                boss_opener();
+                boss_opener(1);
             }
         }
         break;
@@ -3142,11 +4042,26 @@ static void boss_update(void)
             if (!boss_laser) boss_card_active = 0;
         }
 
+        /* The pressure stage does NOT raise the opener's four columns.
+         * It enters straight into BOSS_FIGHT with the bar pinned at full,
+         * so neither the entrance hold nor a health mark ever fires here -
+         * and that is what this stage wants.  The columns are the
+         * campaign's set piece; here the barrage stays the thing on screen
+         * and the boss's lasers are the pattern ones, PAT_CUT and PAT_BEAM,
+         * both of which sit in the book boss_next_pattern() draws from. */
+
         /* ---- 6.1 / 8.2 the laser columns, over three phases ---------- */
         for (int k = 0; k < CUT_SLOTS; k++) {
             if (!beam_phase[k]) continue;
-            if (beam_timer[k]) beam_timer[k]--;
-            else if (beam_phase[k] == 1) {
+            if (beam_timer[k]) {
+                beam_timer[k]--;
+                /* Phase 2 Task 02: Inward energy convergence sparks in final 10 warning frames */
+                if (beam_phase[k] == 1 && beam_timer[k] <= 10 && (beam_timer[k] & 1u)) {
+                    int py = 80 + (int)(xorshift32() % 520u);
+                    spawn_particle(beam_x[k] - 20, py, 3, 0, PARTICLE_CYAN, 8);
+                    spawn_particle(beam_x[k] + 20, py, -3, 0, PARTICLE_CYAN, 8);
+                }
+            } else if (beam_phase[k] == 1) {
                 beam_phase[k] = 2;
                 beam_timer[k] = CUT_FIRE;
             } else {
@@ -3176,13 +4091,17 @@ static void boss_update(void)
             } else {
                 /* every shot still on station turns on the craft at once */
                 lockon_arm = 0;
-                for (int i = 0; i < MAX_EBULLETS; i++) {
-                    bullet_t *b = &ebullets[i];
-                    if (!(b->flags & EF_HELD)) continue;
-                    b->flags &= (uint8_t)~EF_HELD;
-                    int a = aim_index(player_x - b->x, player_y - b->y);
-                    b->vx = (int8_t)((dir16_x[a] * SPD_AIM_SLOW) >> 4);
-                    b->vy = (int8_t)((dir16_y[a] * SPD_AIM_SLOW) >> 4);
+                /* EF_HELD is only ever set together with EF_ACTIVE
+                 * (spawn_ebullet_held), so the ACTIVE walk reaches every
+                 * shot on station and the HELD test filters the rest. */
+                bullet_t *eb;
+
+                FOR_EACH_EBULLET(eb) {
+                    if (!(eb->flags & EF_HELD)) continue;
+                    eb->flags &= (uint8_t)~EF_HELD;
+                    int a = aim_index(player_x - eb->x, player_y - eb->y);
+                    eb->vx = (int8_t)((dir16_x[a] * SPD_AIM_SLOW) >> 4);
+                    eb->vy = (int8_t)((dir16_y[a] * SPD_AIM_SLOW) >> 4);
                 }
             }
         }
@@ -3244,16 +4163,20 @@ static void boss_update(void)
             lockon_arm = 0;
             lockon_timer = 0;
             /* So do 6.2's shots that are still on station, and all bullets dissolve into rising motes. */
-            for (int i = 0; i < MAX_EBULLETS; i++) {
-                if (ebullets[i].flags & EF_ACTIVE) {
-                    ebullets[i].flags = 0;
-                    spawn_particle(ebullets[i].x, ebullets[i].y,
-                                   (int)(xorshift32() % 3u) - 1,
-                                   -2 - (int)(xorshift32() % 2u),
-                                   PARTICLE_MOTE, 24);
-                }
+            bullet_t *eb;
+
+            FOR_EACH_EBULLET(eb) {
+                eb->flags = 0;
+                spawn_particle(eb->x, eb->y,
+                               (int)(xorshift32() % 3u) - 1,
+                               -2 - (int)(xorshift32() % 2u),
+                               PARTICLE_MOTE, 24);
             }
-            visual_burst(boss_x + 32, boss_y + 32);
+            eb_hi = 0;
+            eb_lance_count = 0;
+            eb_free_hint = 0;
+            active_ebullets_count = 0;
+                visual_burst(boss_x + 32, boss_y + 32);
             for (int k = 0; k < 12; k++) {
                 int ox = boss_x + (int)(xorshift32() % 64u);
                 int oy = boss_y + (int)(xorshift32() % 64u);
@@ -3262,6 +4185,7 @@ static void boss_update(void)
                                PARTICLE_MOTE, 28);
             }
             boss_dead_timer = 60;
+            audio_event(AUDIO_EVENT_KILL);
             score += 5000u + (uint32_t)wave * 1000u;
             for (int k = 0; k < 3; k++)
                 spawn_item(boss_x + 32 + (k - 1) * 96,
@@ -3273,6 +4197,16 @@ static void boss_update(void)
     case BOSS_DYING:
         if (boss_dead_timer) boss_dead_timer--;
         else {
+            if (is_stress_stage) {
+                boss_state = BOSS_FIGHT;
+                boss_hp = boss_hp_max;
+                boss_hp_shown = boss_hp;
+                boss_fire_timer = 20;
+                boss_pat_timer = 45;
+                boss_move_timer = 45;
+                boss_next_pattern();
+                break;
+            }
             if (wave >= 2) { game_clear = 1; boss_state = BOSS_NONE; break; }
             boss_state = BOSS_NONE;
             wave++;
@@ -3305,9 +4239,7 @@ static void wave_update(void)
         if (spawn_timer) spawn_timer--;
         else if (alive < MAX_ACTIVE_ENEMY + (int)wave) {
             uint32_t r = xorshift32();
-            int type = wave == 0 ? ((r & 1u) ? ENEMY_FAIRY : ENEMY_TURRET) :
-                       wave == 1 ? ((r & 1u) ? ENEMY_SHARD : ENEMY_MINION) :
-                                   (int)(r & 3u);
+            int type = (int)(r & 3u);
             /* Span the WHOLE playfield.  The literal 540 was the old
              * 640-wide playfield's usable width, so every minion used to spawn
              * in the left half and the right half never had any pressure on it
@@ -3315,8 +4247,7 @@ static void wave_update(void)
             int x = GAME_LEFT + 40 +
                     (int)((r >> 8) % (uint32_t)(GAME_RIGHT - GAME_LEFT - 80));
             spawn_enemy(type, x, -20);
-            spawn_timer = (uint16_t)(60 - (wave > 8 ? 8 : wave) * 4);
-            if (spawn_timer < 24) spawn_timer = 24;
+            spawn_timer = (uint16_t)(36 - (wave > 4 ? 4 : wave) * 4);
         }
     } else if (alive == 0 && boss_state == BOSS_NONE) {
         /* the boss only shows up once the quota is met AND the field is clear:
@@ -3405,24 +4336,23 @@ static void enemies_update(void)
                 break;
             case ENEMY_SHARD:
                 for (int k = -3; k <= 3; k++)
-                    spawn_ebullet(cx, cy, k, SPD_AIM_SLOW, 3);
+                    spawn_ebullet(cx, cy, k, SPD_AIM_SLOW + ((i + frame_tick / 110u) & 1u), 3);
                 e->fire_cd = 110;
                 break;
             case ENEMY_TURRET:
                 /* a ring of eight, slow enough to walk between */
-                for (int k = 0; k < 16; k += 2)
+                for (int k = (frame_tick / 120u + (unsigned)i) & 1u; k < 16; k += 2)
                     spawn_ebullet(cx, cy, (dir16_x[k] * SPD_RING) >> 4,
                                   (dir16_y[k] * SPD_RING) >> 4, 5);
                 e->fire_cd = 120;
                 break;
             default:
-                aimed_shot(cx, cy, player_x, player_y, SPD_MINION, 6);
+                spawn_ebullet_orb(cx, cy, 0, SPD_MINION, 6);
                 aimed_shot_off(cx, cy, player_x, player_y, SPD_MINION, 2, 6);
                 aimed_shot_off(cx, cy, player_x, player_y, SPD_MINION, -2, 6);
                 e->fire_cd = 110;
                 break;
             }
-            if (e->fire_cd < 40) e->fire_cd = 40;
         }
     }
 }
@@ -3431,11 +4361,67 @@ static void enemies_update(void)
  * walk their path in BULLET_STEP-pixel sub-steps and stop at the first hit,
  * so a 9 px/frame shot cannot tunnel through a 24-pixel enemy and the impact
  * effect appears where the bullet really is rather than past the target. */
+static void stress_coprocessor_finish(void)
+{
+    gpu2d_flush_dcache();
+    uint32_t info = GPU2D_REG_BUCKET_INFO;
+    unsigned candidates = info >> 16;
+    unsigned bound = candidates > 512u ? (unsigned)eb_hi : candidates;
+    const uint16_t *indices = (const uint16_t *)EB_CAND_LIST_BASE;
+    active_count = (uint16_t)info;
+    if (!invuln) for (unsigned pos = 0; pos < bound; ++pos) {
+        unsigned index = candidates > 512u ? pos : indices[pos];
+        if (index >= (unsigned)ORB_FIRST) continue;
+        bullet_t *bullet = &ebullets[index];
+        if (!(bullet->flags & EF_ACTIVE) || (bullet->flags & EF_LANCE)) continue;
+        if ((unsigned)(bullet->x - player_x + 11) < 23u &&
+            (unsigned)(bullet->y - player_y + 11) < 23u) {
+            bullet->flags = 0;
+            active_count--;
+            take_hit();
+            break;
+        }
+    }
+    active_ebullets_count = active_count;
+}
+
 static void bullets_update(void)
 {
-    for (int i = 0; i < MAX_PBULLETS; i++) {
-        bullet_t *b = &pbullets[i];
-        if (!(b->flags & EF_ACTIVE)) continue;
+    bullet_t *b;
+
+    /* The craft's shot tests every enemy slot, and it does it once per
+     * sub-step - eight shots at up to eight sub-steps is 256 flag loads a
+     * frame for a pool that usually holds one or two enemies.  Snapshot the
+     * live ones once, in slot order, and let the inner loop walk that.  The
+     * flags are still re-read inside the loop, so an enemy killed by an
+     * earlier shot of this frame drops out exactly as before; the snapshot
+     * only decides which slots are worth looking at.
+     *
+     * static, not a stack array: this runs on a 1 KiB stack. */
+    enemy_rec_t ** const elive = (enemy_rec_t **)MM_RUNTIME_WORK;
+    int en;
+    en = 0;
+    for (int j = 0; j < MAX_ENEMIES; j++)
+        if (enemies[j].flags & EF_ACTIVE) elive[en++] = &enemies[j];
+
+    FOR_EACH_PBULLET(b) {
+        /* Task 12: the pressure stage's wing missiles re-aim HERE.  They are
+         * the only player shot whose heading changes after it is drawn, and
+         * the homing belongs in the update rather than at spawn: pointing the
+         * round straight at the boss every frame makes it curve onto the
+         * target, whereas steering it (turning one aim step per frame) sends
+         * it round a wide arc that gives the boss time to move off the line.
+         * The campaign's shots never carry the bit, so they pay one compare. */
+        if (b->flags & PF_LOCKON) {
+            if (boss_state == BOSS_FIGHT) {
+                int a = aim_index(boss_x + 32 - b->x, boss_y + 32 - b->y);
+                b->vx = (int8_t)((dir16_x[a] * SPD_LOCKON_MISSILE) >> 4);
+                b->vy = (int8_t)((dir16_y[a] * SPD_LOCKON_MISSILE) >> 4);
+            }
+            /* With no live boss to lock onto the round keeps the heading it
+             * already has and simply leaves the playfield, which is what a
+             * shot with nothing to home on should do. */
+        }
 
         int remaining = (b->vy < 0) ? -(int)b->vy : (int)b->vy;
         int dx = (b->vx < 0) ? -b->vx : b->vx;
@@ -3478,36 +4464,44 @@ static void bullets_update(void)
              * starts at y, the dark socket one row above it, and the tracer
              * ends at y + 26.  Both edges of the playfield are an edge for
              * the craft's shots now, and the pool is still bounded by x. */
+            /* The two wing missiles carry a wider tile than the fan shot (13
+             * against 7), so "has it left the field" is asked per kind. */
+            int x_lim = (b->flags & PF_LOCKON) ? (GAME_RIGHT - MM_MISSILE_TILE_W)
+                                               : (GAME_RIGHT - MM_PBULLET_TILE_W);
             if (b->y < PLAYFIELD_TOP + 1 || b->y > GAME_BOTTOM - 26 ||
-                b->x < GAME_LEFT || b->x > GAME_RIGHT - 7) {
+                b->x < GAME_LEFT || b->x > x_lim) {
                 b->flags = 0;
                 break;
             }
 
             int hit = 0;
-            for (int j = 0; j < MAX_ENEMIES; j++) {
-                enemy_rec_t *e = &enemies[j];
+            for (int j = 0; j < en; j++) {
+                enemy_rec_t *e = elive[j];
                 if (!(e->flags & EF_ACTIVE)) continue;
                 if (b->x < e->x - 2 || b->x > e->x + 26) continue;
                 if (b->y < e->y - 2 || b->y > e->y + 26) continue;
                 e->hp = (int16_t)(e->hp - (int16_t)atk);
                 b->flags = 0;
                 hit = 1;
+                audio_event(AUDIO_EVENT_HIT);
                 for (int s = 0; s < 6; s++) {
                     int a = (int)(xorshift32() & 15u);
-                    spawn_particle(b->x, b->y, dir16_x[a] >> 1, dir16_y[a] >> 1, (uint8_t)(s & 3u), 16);
+                    uint8_t pt = (weapon == W_LASER) ? PARTICLE_CYAN : ((s & 1) ? PARTICLE_HIT : PARTICLE_CRIT);
+                    spawn_particle(b->x, b->y, dir16_x[a] >> 1, dir16_y[a] >> 1, pt, 16);
                 }
                 if (e->hp <= 0) {
                     e->flags = 0;
                     kills++;
+                    audio_event(AUDIO_EVENT_KILL);
                     score_award(100u + (uint32_t)e->type * 50u,
                                 e->x + 12, e->y + 12);
                     visual_burst(e->x + 12, e->y + 12);
                     for (int p = 0; p < 8; p++) {
                         int pa = (p * 2 + (int)(xorshift32() & 1u)) & 15;
+                        uint8_t pt = (uint8_t)(p % 5);
                         spawn_particle(e->x + 12, e->y + 12,
                                        dir16_x[pa] >> 1, dir16_y[pa] >> 1,
-                                       (uint8_t)(p & 3u), 18);
+                                       pt, 18);
                     }
                     /* 8.3: the armoured ones come apart into a ring of shots. */
                     if (e->type == ENEMY_TURRET || e->type == ENEMY_MINION) {
@@ -3529,74 +4523,133 @@ static void bullets_update(void)
                 b->y >= boss_y && b->y <= boss_y + 64) {
                 boss_hp = (int16_t)(boss_hp - (int16_t)atk);
                 visual_burst(b->x, b->y);
-                for (int s = 0; s < 3; s++) {
+                for (int s = 0; s < 4; s++) {
                     int a = (int)(xorshift32() & 15u);
-                    spawn_particle(b->x, b->y, dir16_x[a] >> 2, dir16_y[a] >> 2, PARTICLE_HIT, 8);
+                    uint8_t pt = (weapon == W_LASER) ? PARTICLE_CYAN : ((s & 1) ? PARTICLE_HIT : PARTICLE_CRIT);
+                    spawn_particle(b->x, b->y, dir16_x[a] >> 2, dir16_y[a] >> 2, pt, 10);
                 }
-                spawn_particle(b->x, b->y, (int)(xorshift32() % 3u) - 1, -2, PARTICLE_CRIT, 10);
+                spawn_particle(b->x, b->y, (int)(xorshift32() % 3u) - 1, -2, PARTICLE_CRIT, 12);
                 b->flags = 0;
                 break;
             }
         }
     }
 
-    for (int i = 0; i < MAX_EBULLETS; i++) {
-        bullet_t *b = &ebullets[i];
-        if (!(b->flags & EF_ACTIVE)) continue;
+    int grz_x0 = player_x - 15;
+    int grz_y0 = player_y - 15;
+    int hit_x0 = player_x - 11;
+    int hit_y0 = player_y - 11;
+    int danger_x0 = player_x - 64;
+    int danger_y0 = player_y - 64;
+    int check_hit = !invuln;
+    int motion = is_stress_stage && !BUCKET_SOFTWARE_REFERENCE;
+    int lance_count = eb_lance_count;
+    eb_motion_pending = (uint8_t)motion;
+    eb_lance_count = 0;
 
-        /* Cull at the framebuffer edges, not past them: a bullet still alive
-         * at y < 0 would be drawn above the frame, i.e. into the OTHER buffer
-         * on real hardware (the simulation workbench asserts on exactly that).
-         * The margins are what the renderer needs: the dark socket starts one
-         * pixel above and one to the left of the tile, and the halo reaches
-         * four rows below it - so a bullet at y = 0, which a ring pattern
-         * really does produce on its way up, used to paint row -1. */
-        b->x = (int16_t)(b->x + b->vx);
-        b->y = (int16_t)(b->y + b->vy);
-        /* PLAYFIELD_TOP + 1, not 1: above row PLAYFIELD_TOP nothing repaints
-         * the frame any more, so a shot allowed up there leaves a mark that
-         * never goes away.  The socket is drawn from y-1, hence the +1. */
-        if (b->flags & EF_LANCE) {
-            /* 8.5: a lance turns at every wall instead of leaving.  Three
-             * turns, counted in the record's spare flag bits - a shaft that
-             * bounced forever would hold a pool slot for the rest of the
-             * run.  It still gets the hitbox test below, so a
-             * bouncing wall is genuinely more dangerous. */
-            unsigned nb = ((unsigned)b->flags & EF_BOUNCE_MASK) >> EF_BOUNCE_SHIFT;
-            /* The wall is half a sprite inside the playfield - see the
-             * LANCE_* bounds above. */
-            if (b->x < LANCE_MIN_X) {
-                b->x = (int16_t)LANCE_MIN_X;
-                b->vx = (int8_t)-b->vx;  nb++;
-            } else if (b->x > LANCE_MAX_X) {
-                b->x = (int16_t)LANCE_MAX_X;
-                b->vx = (int8_t)-b->vx;  nb++;
+    int bound_y0 = PLAYFIELD_TOP + 1;
+    unsigned bound_h = (unsigned)((GAME_BOTTOM - 1) - bound_y0 + 1);
+    int bound_x0 = GAME_LEFT + 1;
+    unsigned bound_w = (unsigned)((GAME_RIGHT - 16) - bound_x0 + 1);
+
+    int live_eb = 0;
+    for (int _run = 0; _run < 2; _run++) {
+        for (int _pos = (_run == 0 ? 0 : ORB_FIRST),
+                 _end = (_run == 0 ? (motion ? lance_count : eb_hi) : MAX_EBULLETS);
+             _pos < _end; _pos++) {
+            int _i = motion && !_run ? eb_lances[_pos] : _pos;
+            b = &ebullets[_i];
+            uint8_t flags = b->flags;
+            if (!(flags & EF_ACTIVE)) continue;
+            if (motion && !_run && !(flags & EF_LANCE)) continue;
+            if (motion) active_ebullets_count--;
+            int bx = b->x + b->vx;
+            int by = b->y + b->vy;
+
+            if (!(flags & EF_LANCE)) {
+                if ((unsigned)(by - bound_y0) >= bound_h ||
+                    (unsigned)(bx - bound_x0) >= bound_w) {
+                    b->flags = 0;
+                    if (_i < eb_free_hint) eb_free_hint = _i;
+                    continue;
+                }
+                b->x = (int16_t)bx;
+                b->y = (int16_t)by;
+            } else {
+                int bvx = b->vx;
+                int bvy = b->vy;
+                unsigned nb = ((unsigned)flags & EF_BOUNCE_MASK) >> EF_BOUNCE_SHIFT;
+                if (bx < LANCE_MIN_X) {
+                    bx = LANCE_MIN_X;
+                    bvx = -bvx;  nb++;
+                } else if (bx > LANCE_MAX_X) {
+                    bx = LANCE_MAX_X;
+                    bvx = -bvx;  nb++;
+                }
+                if (by < LANCE_MIN_Y) {
+                    by = LANCE_MIN_Y;
+                    bvy = -bvy;  nb++;
+                } else if (by > LANCE_MAX_Y) {
+                    by = LANCE_MAX_Y;
+                    bvy = -bvy;  nb++;
+                }
+                if (nb >= LANCE_BOUNCES) {
+                    b->flags = 0;
+                    if (_i < eb_free_hint) eb_free_hint = _i;
+                    continue;
+                }
+                flags = (uint8_t)((flags & (uint8_t)~EF_BOUNCE_MASK) |
+                                  (nb << EF_BOUNCE_SHIFT));
+                b->x = (int16_t)bx;
+                b->y = (int16_t)by;
+                b->vx = (int8_t)bvx;
+                b->vy = (int8_t)bvy;
+                b->flags = flags;
+                if (_i < ORB_FIRST) {
+                    eb_lances[eb_lance_count++] = (uint16_t)_i;
+                }
             }
-            if (b->y < LANCE_MIN_Y) {
-                b->y = (int16_t)LANCE_MIN_Y;
-                b->vy = (int8_t)-b->vy;  nb++;
-            } else if (b->y > LANCE_MAX_Y) {
-                b->y = (int16_t)LANCE_MAX_Y;
-                b->vy = (int8_t)-b->vy;  nb++;
+
+            if (check_hit &&
+                (unsigned)(bx - danger_x0) <= 128u &&
+                (unsigned)(by - danger_y0) <= 128u) {
+                if ((unsigned)(by - grz_y0) < 31u &&
+                    (unsigned)(bx - grz_x0) < 31u) {
+                    if ((unsigned)(by - hit_y0) < 23u &&
+                        (unsigned)(bx - hit_x0) < 23u) {
+                        b->flags = 0;
+                        if (_i < eb_free_hint) eb_free_hint = _i;
+                        take_hit();
+                        /* Walk on instead of returning.  The return skipped
+                         * the live-count epilogue, so telemetry and the storm
+                         * top-up kept last frame's count on the hit frame: the
+                         * HUD read one more sprite than the pool held
+                         * (measured 2314 vs 2313, invuln=120).  With one hit
+                         * per frame already enforced by `check_hit` it costs
+                         * nothing but the rest of this frame's walk, which is
+                         * the move/cull those bullets were owed anyway. */
+                        check_hit = 0;
+                        continue;
+                    }
+                    if (!(flags & EF_GRAZED)) {
+                        b->flags = (uint8_t)(flags | EF_GRAZED);
+                        int gx = (bx + player_x) >> 1;
+                        int gy = (by + player_y) >> 1;
+                        int bvx = b->vx;
+                        int bvy = b->vy;
+                        int gvx = (bvx > 0) ? 1 : (bvx < 0) ? -1 : 0;
+                        int gvy = (bvy > 0) ? -1 : 1;
+                        spawn_particle(gx, gy, gvx, gvy, PARTICLE_CYAN, 12);
+                    }
+                }
             }
-            if (nb >= LANCE_BOUNCES) { b->flags = 0; continue; }
-            b->flags = (uint8_t)((b->flags & (uint8_t)~EF_BOUNCE_MASK) |
-                                 (nb << EF_BOUNCE_SHIFT));
-        } else if (b->y > GAME_BOTTOM - 9 || b->y < PLAYFIELD_TOP + 1 ||
-                   b->x < GAME_LEFT + 1 || b->x > GAME_RIGHT - 9) {
-            b->flags = 0;
-            continue;
-        }
-        /* Damage hitbox: the 12x12 box on the player's centre.  UNCHANGED on
-         * purpose - the pickup box below is the one that grew. */
-        if (!invuln &&
-            b->x > player_x - 6 && b->x < player_x + 6 &&
-            b->y > player_y - 6 && b->y < player_y + 6) {
-            b->flags = 0;
-            take_hit();
-            continue;
+            live_eb++;
+            if (motion) active_ebullets_count++;
         }
     }
+    if (eb_free_hint >= eb_hi && eb_hi < ORB_FIRST) eb_free_hint = eb_hi;
+    if (!motion) active_ebullets_count = live_eb;
+    active_count = (uint16_t)active_ebullets_count;
 }
 
 /* ---- pickup test -------------------------------------------------------
@@ -3651,10 +4704,14 @@ static void items_update(void)
          * which is the whole point of parking it there. */
         if (pick_rect_hits(it->x, it->y, it->x + 15, it->y + 15)) {
             it->flags = 0;
-            visual_burst(it->x + 8, it->y + 8);
-            /* Phase 2: Rising golden dust motes on item pickup */
-            for (int k = -1; k <= 1; k++) {
-                spawn_particle(it->x + 8 + k * 4, it->y + 8, k, -2, PARTICLE_ITEM, 16);
+            /* Phase 2 Task 02: Dedicated rising golden dust mote cluster on item pickup */
+            for (int k = 0; k < 6; k++) {
+                int vx = (int)(xorshift32() % 5u) - 2;
+                int vy = -2 - (int)(xorshift32() % 3u);
+                int ox = it->x + 8 + ((int)(xorshift32() % 9u) - 4);
+                int oy = it->y + 8 + ((int)(xorshift32() % 7u) - 3);
+                uint8_t life = (uint8_t)(16 + (xorshift32() % 9u));
+                spawn_particle(ox, oy, vx, vy, PARTICLE_ITEM, life);
             }
             apply_item(it->type);
             continue;
@@ -3733,6 +4790,30 @@ static void cpu_fill(uint32_t dst, uint32_t w, uint32_t h, uint32_t color,
     }
 }
 
+/* Saturating add, the software twin of OP_ADD and of the scanout's laser
+ * columns: min(255, dst + src) per channel.  A colour-keyed source pixel is
+ * skipped - same rule as cpu_blit() and cpu_alpha(), and the same rule the
+ * engine applies before it blends. */
+static void cpu_add(uint32_t dst, uint32_t src, int w, int h,
+                    int sstride, int dstride)
+{
+    for (int y = 0; y < h; y++) {
+        volatile uint32_t *drow = (volatile uint32_t *)(dst + (uint32_t)(y * dstride));
+        const volatile uint32_t *srow = (const volatile uint32_t *)(src + (uint32_t)(y * sstride));
+        for (int x = 0; x < w; x++) {
+            uint32_t s = srow[x];
+            if (s == MAGENTA_KEY) continue;
+            uint32_t d = drow[x];
+            uint32_t out = d & 0xFF000000u;           /* background alpha kept */
+            for (int sh = 0; sh <= 16; sh += 8) {
+                uint32_t sum = ((s >> sh) & 0xFFu) + ((d >> sh) & 0xFFu);
+                out |= (sum > 255u ? 255u : sum) << sh;
+            }
+            drow[x] = out;
+        }
+    }
+}
+
 /* ---- UART frame-cost log --------------------------------------------
  * The board's serial port is the Sapphire SoC's first UART.  Every constant
  * below is from the vendor BSP that already ships in this repo - the firmware
@@ -3761,7 +4842,8 @@ static void cpu_fill(uint32_t dst, uint32_t w, uint32_t h, uint32_t color,
 #define DIAG_FRAMES  32u
 #define DIAG_UART    0xF8010000UL
 
-static uint32_t diag_cyc, diag_peak, diag_total;
+static uint32_t diag_cyc;
+static uint32_t * const diag_acc = (uint32_t *)(MM_RUNTIME_WORK + 264u);
 static uint16_t diag_n;
 /* The worst frame of the window, plus the three numbers that say WHY it was
  * the worst: how much of it was game_frame(), how much of THAT the engine spent
@@ -3771,7 +4853,6 @@ static uint16_t diag_n;
  * both compared against the very same `cyc` - so it is one field now, and the
  * space went to the breakdown instead.  G and T are gone for the same reason:
  * every sample of both has been 0000 since the engine was fixed. */
-static uint32_t diag_max, diag_maxn;
 /* Window accumulators, in units of 1.28 us (>>7) so that even half a second
  * per frame cannot overflow 32 bits across the window; the print-side >>5 is
  * the mean.  A mean next to a worst frame is what separates "the engine is
@@ -3784,35 +4865,37 @@ static uint32_t acc_j, acc_g, acc_m, acc_b, acc_s, acc_h, acc_x, acc_n, acc_r, a
  * that.  The menu never calls game_frame(), so this only ever skips the
  * first entry into the game. */
 #define DIAG_SKIP  60u
-
-static void uart_putc(char c)
+static __attribute__((noinline)) void set_hb(uint32_t value)
 {
-    while (((*(volatile uint32_t *)(DIAG_UART + 0x04u) >> 16) & 0xFFu) == 0u)
-        ;
-    *(volatile uint32_t *)(DIAG_UART + 0x00u) = (uint32_t)(unsigned char)c;
+    GPU2D_REG_HEARTBEAT = value;
 }
 
-static void uart_puts(const char *s) { while (*s) uart_putc(*s++); }
-
-/* Decimal without a divider: RV32I has no divide instruction, so % and / would
- * pull in __udivsi3 and cost more code than the whole rest of this block. */
-static void uart_num(uint32_t v)
+static __attribute__((noinline)) void uart_putc(char c)
 {
-    static const uint32_t p10[10] = {
-        1000000000UL, 100000000UL, 10000000UL, 1000000UL, 100000UL,
-        10000UL, 1000UL, 100UL, 10UL, 1UL };
-    unsigned i, started = 0u;
-    if (v == 0u) { uart_putc('0'); return; }
-    for (i = 0u; i < 10u; i++) {
-        uint32_t d = p10[i];
-        unsigned digit = 0u;
-        while (v >= d) { v -= d; digit++; }
-        if (digit || started) { uart_putc((char)('0' + digit)); started = 1u; }
-    }
+    /* Diagnostics must never consume a display deadline waiting for UART. */
+    if (((*(volatile uint32_t *)(DIAG_UART + 0x04u) >> 16) & 0xFFu) != 0u)
+        *(volatile uint32_t *)(DIAG_UART + 0x00u) = (uint32_t)(unsigned char)c;
+}
+
+static __attribute__((noinline)) void uart_puts(const char *s) { while (*s) uart_putc(*s++); }
+
+/* The current RV32IM core has native division. */
+static __attribute__((noinline)) void uart_num(uint32_t v)
+{
+    char digits[10];
+    unsigned n = 0;
+    do { digits[n++] = (char)('0' + v % 10u); v /= 10u; } while (v);
+    while (n) uart_putc(digits[--n]);
+}
+
+static __attribute__((noinline, noclone)) void uart_field(char key, uint32_t value)
+{
+    uart_putc(' '); uart_putc(key); uart_num(value);
 }
 
 static void diag_init(void)
 {
+    for (unsigned index = 0; index < 9; ++index) diag_acc[index] = 0u;
     *(volatile uint32_t *)(DIAG_UART + 0x08u) = 107u;
     *(volatile uint32_t *)(DIAG_UART + 0x0Cu) = 7u;
 }
@@ -3823,31 +4906,26 @@ static void diag_window(uint32_t cyc, uint32_t cmds, uint32_t rows)
      * total, tlm[44] is only its backdrop, and tlm[41] is the slice of the
      * weather pass that the CPU spends writing DDR directly - the one piece of
      * a frame that never touches the engine at all. */
-    acc_j += tlm[TLM_T_GFRAME] >> 7;     /* render pass total (update out) */
-    acc_g += tlm[TLM_P_ENGWAIT] >> 7;    /* engine serial wait inside it   */
-    acc_m += tlm[TLM_T_STRIP] >> 7;      /* game_render() total            */
-    acc_b += tlm[TLM_T_GRENDER] >> 7;    /* ... of which the backdrop      */
-    acc_s += tlm[41] >> 7;               /* weather dots, CPU-written      */
-    acc_h += tlm[TLM_P_LOOPHS] >> 7;     /* scanout handshake, outside     */
-    acc_x += tlm[TLM_P_FLUSH] >> 7;      /* gpu2d_flush_dcache()           */
-    acc_n += cmds;
-    acc_r += rows;
-    acc_d += damage_restore_rows;
+    diag_acc[0] += tlm[TLM_T_GFRAME] >> 7;  /* render pass total (update out) */
+    diag_acc[1] += tlm[TLM_P_ENGWAIT] >> 7; /* engine serial wait inside it   */
+    diag_acc[2] += tlm[TLM_T_STRIP] >> 7;   /* game_render() total            */
+    diag_acc[3] += tlm[TLM_T_GRENDER] >> 7; /* ... of which the backdrop      */
+    diag_acc[4] += tlm[41] >> 7;            /* bucket_build() slice of game_render */
+    diag_acc[5] += tlm[TLM_P_LOOPHS] >> 7;  /* scanout handshake, outside     */
+    diag_acc[6] += cmds;
+    diag_acc[7] += rows;
+    diag_acc[8] += damage_restore_rows;
 
-    if (cyc > diag_cyc) diag_cyc = cyc;
     /* One worst frame per window, with its full breakdown.  If V (its
      * game_frame) sits under a frame budget while the window still dropped
      * frames, the loss was never in game_frame() and no renderer work can
      * recover it. */
-    if (cyc > diag_max) {
-        diag_max  = cyc;
-        diag_maxn = cmds;
+    if (cyc > diag_cyc) {
+        diag_cyc = cyc;
         tlm[TLM_P_MAXJ] = tlm[TLM_T_GFRAME];
         tlm[TLM_P_MAXG] = tlm[TLM_P_ENGWAIT];
         tlm[TLM_P_MAXR] = rows;
     }
-    diag_total++;
-    if (diag_total > DIAG_SKIP && rows > diag_peak) diag_peak = rows;
     if (++diag_n < DIAG_FRAMES) return;
     diag_n = 0u;
 
@@ -3864,7 +4942,7 @@ static void diag_window(uint32_t cyc, uint32_t cmds, uint32_t rows)
      *   g  engine serial wait inside j           U  ... on the worst frame
      *   m  game_render() total                   Q  rows on the worst frame
      *   b  ... of which the backdrop             W  commands on the worst frame
-     *   s  weather dots written by CPU
+     *   s  bucket_build() (tlm[41], live again since 2026-10-15)
      *   h  scanout handshake, outside game_frame
      *   x  gpu2d_flush_dcache()
      *   n  BitBlt commands, r  BitBlt rows       P  peak rows of the run
@@ -3872,39 +4950,25 @@ static void diag_window(uint32_t cyc, uint32_t cmds, uint32_t rows)
      * Read it as: C over budget means a frame was dropped.  If V is under
      * budget, the drop was the loop (look at h).  If V is over, split V by
      * U/U-g: U near V is the engine, U small is the CPU. */
-    uart_putc('F'); uart_num(frame_tick);
-    uart_puts(" C"); uart_num(diag_cyc);
-    uart_puts(" j"); uart_num(acc_j >> 5);
-    uart_puts(" g"); uart_num(acc_g >> 5);
-    uart_puts(" m"); uart_num(acc_m >> 5);
-    uart_puts(" b"); uart_num(acc_b >> 5);
-    uart_puts(" s"); uart_num(acc_s >> 5);
-    uart_puts(" h"); uart_num(acc_h >> 5);
-    uart_puts(" x"); uart_num(GPU2D_REG_SNP_COUNT);
-    uart_puts(" n"); uart_num(acc_n >> 5);
-    uart_puts(" r"); uart_num(acc_r >> 5);
-    uart_puts(" d"); uart_num(acc_d >> 5);
-    uart_puts(" V"); uart_num(tlm[TLM_P_MAXJ] >> 7);
-    uart_puts(" U"); uart_num(tlm[TLM_P_MAXG] >> 7);
-    uart_puts(" Q"); uart_num(tlm[TLM_P_MAXR]);
-    uart_puts(" W"); uart_num(diag_maxn);
-    uart_puts(" P"); uart_num(diag_peak);
-    if (GPU2D_REG_SNP_COUNT) {
-        uart_puts("\r\nSNAP c="); uart_num(GPU2D_REG_SNP_COUNT);
-        uart_puts(" ws="); uart_num(GPU2D_REG_SNP_WORST_CYC);
-        uart_puts(" op="); uart_num(GPU2D_REG_SNP_OP & 3u);
-        uart_puts(" wh="); uart_num(GPU2D_REG_SNP_WH);
-        uart_puts(" U=");  uart_num(tlm[TLM_P_MAXG] >> 7);
-        /* Engine probe captured with the slow command: bits[11:8] sg_state,
-         * bit[3] rd_ar_pend, bits[2:0] rd_q_cnt.  This is what says whether a
-         * hang is the row loop waiting on a write or waiting on a read. */
-        uart_puts(" p=");  uart_num(GPU2D_REG_SNP_PROBE);
+    uart_puts("\r\nF"); uart_num(frame_tick);
+    uart_field('C', diag_cyc);
+    for (int i = 0; i < 6; i++) {
+        uart_field("jgmbsh"[i], diag_acc[i] >> 5);
+        diag_acc[i] = 0u;
     }
+    uart_field('Q', GPU2D_REG_BUCKET_DEBUG);
+    for (int i = 0; i < 3; i++) {
+        uart_field("nrd"[i], diag_acc[6 + i] >> 5);
+        diag_acc[6 + i] = 0u;
+    }
+    /* Worst-frame breakdown stays in telemetry; keep UART below FIFO depth. */
+    uart_field('B', GPU2D_REG_BUCKET_ACCEL);
+    uart_field('T', GPU2D_REG_BUCKET_CYCLES);
     uart_puts("\r\n");
 
     acc_j = 0u; acc_g = 0u; acc_m = 0u; acc_b = 0u; acc_s = 0u;
     acc_h = 0u; acc_x = 0u; acc_n = 0u; acc_r = 0u; acc_d = 0u;
-    diag_cyc = 0u; diag_max = 0u; diag_maxn = 0u;
+    diag_cyc = 0u;
 }
 
 /* What the engine is being asked to do this frame, published in tlm[47..48].
@@ -3923,16 +4987,6 @@ static void r_fill(uint32_t dst, uint32_t w, uint32_t h, uint32_t color,
     }
 }
 
-/* A blit that stays out of the damage ledger: for surfaces that repaint the
- * same pixels every frame (the standing laser columns), marking them would
- * move their backdrop bytes twice a frame for nothing. */
-static void __attribute__((unused)) r_blit_nomark(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
-                          uint32_t sstride, uint32_t dstride)
-{
-    if (hw_accel) gpu2d_blit_sprite(dst, src, w, h, sstride, dstride);
-    else cpu_blit(dst, src, (int)w, (int)h, (int)sstride, (int)dstride);
-}
-
 static void r_blit(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
                    uint32_t sstride, uint32_t dstride)
 {
@@ -3945,7 +4999,34 @@ static void r_blit(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
     }
 }
 
-static void __attribute__((unused)) r_add(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
+/* ---- the additive path (OP_ADD) ---------------------------------------
+ *
+ * r_add() and r_blit_nomark() were once removed as dead code, and the comment
+ * that replaced them named r_add_scaled() as "the additive path the renderer
+ * actually uses".  That function has never existed and gpu2d_add() had no
+ * caller anywhere, so the engine's OP_ADD sat unused: the only addition in the
+ * build was the scanout's laser columns.  This is the real thing.
+ *
+ * WHERE ADDITION BELONGS, AND WHERE IT DOES NOT.  The visual spec draws the
+ * line at "glowing things add, translucent things alpha", and OP_ADD is the
+ * glowing half.  It must NOT be pointed at anything whose job is to show the
+ * backdrop through itself - an energy core, a missile body, the craft's aura -
+ * because addition has no notion of "behind": it only ever brightens, so a
+ * translucent entity run through it comes out a smear of white instead of a
+ * translucent entity.
+ *
+ * COLOUR KEY IS NOT OPTIONAL.  Particles are 8x8 tiles on a MAGENTA_KEY
+ * background; without the key the whole 8x8 rectangle would be ADDED, and a
+ * field of magenta blocks is what that looks like.  The engine applies its key
+ * before it blends (bitblt_alpha_blend.v's keep mask), and cpu_add() mirrors
+ * that, so the two paths agree.
+ *
+ * The key is set once around a whole batch rather than per call: the offset
+ * register write costs an APB round trip and gpu2d_set_colorkey() waits for the
+ * engine first, so a per-particle call would add a second stall to every
+ * particle on top of the one gpu2d_finish() already costs.
+ */
+static void r_add(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
                   uint32_t sstride, uint32_t dstride)
 {
     damage_mark(dst, w, h, dstride);
@@ -3953,8 +5034,28 @@ static void __attribute__((unused)) r_add(uint32_t dst, uint32_t src, uint32_t w
         blit_cmds++; blit_rows += h;
         gpu2d_add(dst, src, w, h, sstride, dstride);
     } else {
-        cpu_blit(dst, src, (int)w, (int)h, (int)sstride, (int)dstride);
+        cpu_add(dst, src, (int)w, (int)h, (int)sstride, (int)dstride);
     }
+}
+
+static uint32_t r_add_saved_key;   /* colour-key state before a batch */
+
+static void r_add_begin(void)
+{
+    if (!hw_accel) return;
+    /* SAVE AND RESTORE, never a bare on/off pair.  The colour key is a mode of
+     * the engine that other draws can also want - the pressure stage turns it
+     * on when it starts and everything after that depends on it still being on.
+     * A batch that simply switched it off at the end would silently disarm
+     * every later blit in the frame, and a sprite whose key is off blits its
+     * magenta background into the picture. */
+    r_add_saved_key = GPU2D_REG_COLORKEY_CTRL & 1u;
+    gpu2d_set_colorkey(1, MAGENTA_KEY);
+}
+
+static void r_add_end(void)
+{
+    if (hw_accel) gpu2d_set_colorkey(r_add_saved_key, MAGENTA_KEY);
 }
 
 static void r_alpha(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
@@ -4000,9 +5101,6 @@ static void r_sync(void)
  * products are counted out with a shift-and-add loop.
  *
  * line = 8*scale rows x (scale*512)-byte pitch = 4096 * scale^2. */
-static const uint32_t font_line_bytes[6] = {
-    4096u, 16384u, 36864u, 65536u, 102400u, 147456u,
-};
 
 /* The glyph loop, with the destination row pitch supplied.
  *
@@ -4017,7 +5115,7 @@ static void draw_text_strided(uint32_t fb, uint32_t pitch, int x, int y,
     {
     const uint32_t stride   = (uint32_t)scale << 9;         /* scale * 512 */
     const uint32_t cell_w   = (uint32_t)scale << 5;         /* 8*scale*4 bytes */
-    const uint32_t line_b   = font_line_bytes[scale-1];
+    const uint32_t line_b   = ((uint32_t)scale * (uint32_t)scale) << 12;
     const uint32_t atlas    = ((volatile uint32_t *)MM_FONT_TABLE)[scale-1];
     unsigned       poll     = 0;
 
@@ -4025,11 +5123,7 @@ static void draw_text_strided(uint32_t fb, uint32_t pitch, int x, int y,
         unsigned g = (unsigned char)*s;
         if (g < 32 || g > 126) g = 32;
         g -= 32;
-        /* index arithmetic without a multiplier: at most 5 line steps plus at
-         * most 15 cell steps, which is cheaper than two __mulsi3 calls. */
-        uint32_t off = 0;
-        for (unsigned hi = g >> 4; hi; hi--) off += line_b;
-        for (unsigned lo = g & 15u; lo; lo--) off += cell_w;
+        uint32_t off = (g >> 4) * line_b + (g & 15u) * cell_w;
         r_blit(fb + (uint32_t)y * pitch + (uint32_t)x * 4u, atlas + off,
                (uint32_t)(6*scale), (uint32_t)(8*scale), stride, pitch);
         x += 7 * scale;
@@ -4127,7 +5221,7 @@ static const int16_t hud_label_y[MM_HUD_LABEL_SLOTS] = {
 /* Measured at build time: a caption is n glyphs at a 7-pixel advance, but the
  * last glyph is only 6 wide, so the strip is 7n - 1 pixels.  Rounding up to 7n
  * would copy one transparent column, which is harmless but wasteful. */
-static uint8_t hud_label_w[MM_HUD_LABEL_SLOTS];
+static uint8_t * const hud_label_w = (uint8_t *)(MM_RUNTIME_WORK + 208u);
 
 static void hud_labels_build(void)
 {
@@ -4226,21 +5320,23 @@ static void burst_paint(uint32_t dst, uint32_t stride, int age)
     int ring1 = 4 + age * 2;            /* 4 .. 50 pixels out  */
     int ring2 = 2 + age * 2;            /* 2 .. 48 pixels out  */
     int ember = 3 + age * 2;            /* 3 .. 49 pixels out  */
-    uint32_t c1 = (age < 6)  ? 0x00FFFFFFu :
+    uint32_t c1 = MM_EMISSIVE_TAG | ((age < 6)  ? 0x00FFFFFFu :
                   (age < 12) ? 0x00FFE8A0u :
-                  (age < 18) ? 0x00FF9038u : 0x00C04828u;
-    uint32_t c2 = (age < 8)  ? 0x00A8E8FFu :
-                  (age < 16) ? 0x0060B0FFu : 0x003068C0u;
-    uint32_t ce = (age < 10) ? 0x00FFF4C0u : 0x00FF8040u;
+                  (age < 18) ? 0x00FF9038u : 0x00C04828u);
+    uint32_t c2 = MM_EMISSIVE_TAG | ((age < 8)  ? 0x00A8E8FFu :
+                  (age < 16) ? 0x0060B0FFu : 0x003068C0u);
+    uint32_t ce = MM_EMISSIVE_TAG | ((age < 10) ? 0x00FFF4C0u : 0x00FF8040u);
 
     /* Core flash first, so the explosion frames sit on top of it and the white
      * only shows through their transparent pixels - a backlight rather than a
      * white square stamped over the artwork.  It shrinks as it fades. */
     if (age < 10) {
-        int cw = 16 - age;
-        int o  = (BURST_CENTRE - cw / 2);
-        r_fill(dst + (uint32_t)(o * (int)stride) + (uint32_t)(o * 4),
-               (uint32_t)cw, (uint32_t)cw, 0x00FFFFFFu, stride);
+        int size = 8 - age / 2;
+        int origin = BURST_CENTRE - size / 2;
+        r_fill(dst + (uint32_t)((origin + size / 4) * (int)stride + origin * 4),
+               (uint32_t)size, (uint32_t)(size / 2), MM_EMISSIVE_TAG | 0x00FFE8A0u, stride);
+        r_fill(dst + (uint32_t)(origin * (int)stride + (origin + size / 4) * 4),
+               (uint32_t)(size / 2), (uint32_t)size, MM_EMISSIVE_TAG | 0x00FFFFFFu, stride);
     }
 
     /* The licensed explosion frame.  draw_art() clips against the SCREEN, so
@@ -4290,6 +5386,16 @@ static void burst_frames_build(void)
         r_fill(dst, MM_BURST_FRAME_W, MM_BURST_FRAME_W, MAGENTA_KEY,
                MM_BURST_FRAME_STRIDE);
         burst_paint(dst, MM_BURST_FRAME_STRIDE, (int)a);
+        r_sync();
+        gpu2d_flush_dcache();
+        /* Straight alpha: retain the light's RGB, fade coverage only. Keyed
+         * holes remain holes, including the unpainted frame border. */
+        uint32_t *pixels = (uint32_t *)dst;
+        uint32_t opacity = (a < 16u ? 255u : 255u - (a - 16u) * 18u) << 24;
+        for (unsigned p = 0; p < MM_BURST_FRAME_W * MM_BURST_FRAME_W; ++p)
+            if (pixels[p] != MAGENTA_KEY)
+                pixels[p] = (pixels[p] & 0x00FFFFFFu) | opacity;
+        gpu2d_flush_dcache();
     }
     gpu2d_flush_dcache();
 }
@@ -4310,10 +5416,13 @@ static void burst_frames_build(void)
 static void burst_render(uint32_t fb, int x, int y, int age)
 {
     uint32_t src = MM_BURST_FRAME + (uint32_t)age * MM_BURST_FRAME_BYTES;
-    int bx = x - BURST_CENTRE;
-    int by = y - BURST_CENTRE;
-    int w  = MM_BURST_FRAME_W;
-    int h  = MM_BURST_FRAME_W;
+    int radius = 8 + age * 2;
+    if (radius < 16) radius = 16;
+    int inset = BURST_CENTRE - radius;
+    src += (uint32_t)inset * (MM_BURST_FRAME_STRIDE + 4u);
+    int bx = x - radius;
+    int by = y - radius;
+    int w = radius * 2, h = w;
 
     if (bx < GAME_LEFT) {
         int d = GAME_LEFT - bx;
@@ -4335,9 +5444,9 @@ static void burst_render(uint32_t fb, int x, int y, int age)
     if (by + h > GAME_BOTTOM) h = GAME_BOTTOM - by;
 
     if (w > 0 && h > 0)
-        r_blit(fb + (uint32_t)(by * SCREEN_STRIDE) + (uint32_t)(bx * 4),
+        r_alpha(fb + (uint32_t)(by * SCREEN_STRIDE) + (uint32_t)(bx * 4),
                src, (uint32_t)w, (uint32_t)h,
-               MM_BURST_FRAME_STRIDE, SCREEN_STRIDE);
+               MM_BURST_FRAME_STRIDE, SCREEN_STRIDE, 255);
 }
 
 /* ---- UI weather occlusion -------------------------------------------------
@@ -4436,7 +5545,7 @@ static void weather_box_release(void)
  * deliberate and not a glitch.  It fades out over its last 40 frames by
  * shrinking the plate it sits on. */
 /* ---- the spell card's own sky ----------------------------------------
- * §5.1 asks for the scenery to change when the card goes off; §L3 asks for
+ * ?5.1 asks for the scenery to change when the card goes off; ?L3 asks for
  * that scenery to be a picture the three stages do not already have.  A
  * fourth STORED plate would be about 4 KB of RLE and the firmware has
  * under 2 KB free - but a plate is only flat bands, a handful of procedural
@@ -4598,10 +5707,819 @@ static void draw_debuff(uint32_t fb, int y, const char *label, uint16_t frames)
     draw_text(fb, 12, y, buf, 2, 0x00FF5070u);
 }
 
+/* ---- HUD gutter repair ledger ------------------------------------------
+ *
+ * WHY.  Both gutters used to be repainted from the pristine menu backdrop on
+ * every frame - ten rectangles, 684 scanlines - because a widget is allowed to
+ * SHRINK: losing a life removes a heart, letting a debuff expire removes the
+ * countdown, and a narrower word does not erase the wider one it replaced.
+ * The repair is what erases them.  But on most frames nothing in the gutters
+ * changes at all, and those 684 scanlines are then pure copying: the same
+ * backdrop bytes laid back down underneath the very widgets that are about to
+ * be drawn on top of them again.
+ *
+ * So the repair is armed by a CHANGE instead of by the clock.  Eight numbers
+ * cover everything the ten bands draw that is not fixed for the life of the
+ * run:
+ *
+ *   stage   STAGE/BOSS caption, the wave number, WAVE/BOSS LIFE
+ *   lives   the heart row                     (one heart per life)
+ *   debuff  the countdown's own two digits, and whether it is up at all
+ *   weapon  the shot name                     (FAN 3 glyphs, SPREAD 6)
+ *   atk     the attack stars                  (one star per point)
+ *   backend the FPGA / CPU token              (4 glyphs against 3)
+ *   score   the six-digit readout
+ *   fps     the two-digit hardware readout
+ *
+ * WHAT IS NOT WATCHED, AND WHY IT DOES NOT NEED TO BE.  The pieces that are
+ * fixed for a run - the captions, the portrait, the stage name, the card ticks
+ * and the two bars - are either constant or repaint their own background with
+ * a fill every frame, so the previous frame's pixels cannot survive under
+ * them.  A fill covers its whole rectangle; a colour-key glyph copy does not.
+ * That distinction is the whole reason the four text readouts above are on the
+ * list and the "I checked the width and it matches" reasoning is not: six
+ * digits against six digits still leaves strokes behind, because '9' does not
+ * cover the left side of '0'.
+ *
+ * Each number is compared once per frame, on the frame the renderer runs, and
+ * a move arms the band it owns.
+ *
+ * BOTH scanout buffers are armed, not just the one being painted: the frame
+ * counter alternates them, so the other buffer is still carrying the old
+ * pixels and is the next frame's target.  A band is disarmed only on the
+ * buffer whose repair actually ran.
+ *
+ * THE OTHER WAY A GUTTER GETS DIRTY is a full-screen plate blit painting
+ * straight over it.  damage_full - a stage switch, the boss's own sky, the
+ * first frame on a buffer - copies the whole 1366x768 plate, gutters included,
+ * and what those rows then hold is the stage plate, not the menu backdrop the
+ * repair lays down; so that path re-arms every band on the buffer it painted.
+ * clear_frame() and the GAME OVER fill are the same story, and both are
+ * followed by game_init(), which re-arms everything.
+ */
+#define HUD_BAND_STAGE   (1u << 0)   /* left  0..75    stage block, wave/boss bar */
+#define HUD_BAND_PLAYER  (1u << 1)   /* left  86..173  the portrait + caption    */
+#define HUD_BAND_LIVES   (1u << 2)   /* left  176..239 the heart row             */
+#define HUD_BAND_SCORE   (1u << 3)   /* left  256..305 the score block           */
+#define HUD_BAND_SPELL   (1u << 4)   /* left  342..419 the card charge ticks     */
+#define HUD_BAND_DEBUFF  (1u << 5)   /* left  512..585 SLOW / JAM                */
+#define HUD_BAND_WEAPON  (1u << 6)   /* right 2..67    shot name + level bar     */
+#define HUD_BAND_ATK     (1u << 7)   /* right 102..147 the attack stars          */
+#define HUD_BAND_BACKEND (1u << 8)   /* right 192..273 backend token, FPS tag    */
+#define HUD_BAND_FPSNUM  (1u << 9)   /* right 232..291 the FPS readout           */
+#define HUD_BAND_STRESS  (1u << 10)  /* left 592..703 active sprites / row drops */
+#define HUD_BAND_ALL     0x07FFu
+
+enum { HUD_SIG_STAGE = 0, HUD_SIG_LIVES, HUD_SIG_DEBUFF,
+       HUD_SIG_WEAPON, HUD_SIG_ATK, HUD_SIG_BACKEND,
+       HUD_SIG_SCORE, HUD_SIG_FPS, HUD_SIG_STRESS, HUD_SIG_COUNT };
+
+static uint16_t hud_dirty[2];            /* one bitmask per scanout buffer */
+extern uint32_t hud_sig[HUD_SIG_COUNT];
+static uint8_t  hud_sig_valid;
+
+/* draw_text() and draw_number() are COLOUR-KEY copies: they write the glyph
+ * pixels and nothing else.  A character that changes shape therefore leaves
+ * the strokes it no longer covers standing on the backdrop - the score's six
+ * fixed digits do not save it, because a '9' painted over a '0' leaves the
+ * left stroke of the '0' showing, and neither does a countdown that is still
+ * running, because "SLOW 3.2" becomes "SLOW 3.1" six frames later.  So every
+ * caption is watched by what it SAYS.  This is the trap the first cut of this
+ * ledger fell into: it watched the widgets that come and go, not the ones that
+ * change their mind in place. */
+static uint32_t hud_debuff_sig(uint16_t frames)
+{
+    /* The two characters draw_debuff() puts on the line, and nothing else:
+     * (frames / 60) % 10 and (frames % 60) / 6.  0 also means "not drawn". */
+    if (!frames) return 0u;
+    return 1u + (uint32_t)((frames / 60u) % 10u) * 10u +
+           (uint32_t)((frames % 60u) / 6u) * 100u;
+}
+
+/* Arm a band when the value behind it moves.  The band is passed in rather
+ * than derived from the slot, so the mapping stays readable at the call site. */
+static void hud_watch(unsigned sig, uint32_t value, uint16_t band)
+{
+    if (hud_sig[sig] == value) return;
+    hud_sig[sig] = value;
+    hud_dirty[0] |= band;
+    hud_dirty[1] |= band;
+}
+
+/* ========================================================================
+ * B1: the scanout's bullet overlay
+ * ========================================================================
+ *
+ * The curtain's state is MAX_EBULLETS records of 8 bytes (512 since the pools
+ * were widened; the pressure stage itself still holds the 192 it always did).
+ * Until now every frame expanded
+ * that into ~30,000 pixels written into the framebuffer, which the scanout then
+ * read 4.32 MB back out of DDR to look at, and which the backdrop repair then
+ * had to put back tile by tile.  That repair was the expensive half: 4,478 + 768
+ * rows against the 5,400 the bullets themselves cost.
+ *
+ * Now the firmware tells the scanout where the bullets are and the scanout draws
+ * them on the way past.  Two things get published:
+ *
+ *   the tile store   every bullet SHAPE, once, at boot - one byte per pixel,
+ *                    and that byte is a ROLE number rather than a palette
+ *                    index.  The colour is resolved on the scanout side as
+ *                    role + hue*32, which is what collapses each set's eight
+ *                    colourings into one.  16 enemy shapes + 1 player + 1 orb
+ *                    is 3,792 bytes, so it fits an 8 KB store.
+ *
+ *   the palette      built here from the roles and the eight hues, in the
+ *                    order the scanout's index arithmetic implies.  See
+ *                    brole_color() below.
+ *
+ *   the bucket table one entry per (bullet, scanline it covers), appended every
+ *                    frame in DRAW ORDER - the last entry covering a pixel is the
+ *                    one that wins, which is exactly the rule the render loops
+ *                    below already had.
+ */
+
+/* The palette is BPAL_PAGE * 8 = 256 entries and that is the whole RAM depth,
+ * which is now also the hard limit: the scanout forms the index itself as
+ * role + hue * BPAL_PAGE, so an index is not "handed out" here any more and
+ * there is nothing to run out of.  The old BPAL_MAX 255 guarded the
+ * first-seen-first-numbered hash that used to live here. */
+
+/* The palette entry's alpha byte has one value that is not an opacity: 254
+ * means ADD.  The scanout sums the bullet onto whatever is under it instead of
+ * blending with it, which is what the spec's "glowing things add" list wants -
+ * a missile's trail, the shell around a light bullet - and it has to be
+ * decidable per PIXEL, because one bullet can be a blended body with an added
+ * trail.
+ *
+ * 254 rather than a new bit: the entry is 32 bits wide and every bit of it is
+ * spoken for, and widening this path is what broke it once already (bitblt_top's
+ * bpal_data port was 24 bits and dropped the alpha byte, which made every bullet
+ * in the picture invisible).  What 254 costs is the 254/255 blend, the one step
+ * of the ramp that is 0.4% away from opaque.
+ *
+ * THE MISSILE'S TRAIL USES IT, AND IT IS STILL THE ONLY THING THAT DOES.  Two
+ * roles carry it, on all eight hue pages, in bullet_store_build() below:
+ *
+ *     BROLE_MS_TRAIL   BPAL_ADD   the trail: light, so it adds
+ *     BROLE_MS_BODY    190        the body:   a solid, so it blends
+ *
+ * A shape, two mixes.  Everything else - the orbs, the enemy barrage, the fan
+ * shot - stays opaque and still asks for no mix at all.
+ *
+ * The hardware side is in video_bullet_overlay.v (ADD_CODE) and the branch that
+ * uses it is in video_dma_read.v, both checked by scratch/tb_bullet_add.sv. */
+#define BPAL_ADD   254u
+
+static uint16_t bpal_n;
+
+/* 一个角色在某个色相下的颜色。
+ *
+ * 这些表达式与三个 *_tile_build 里原来算颜色的那几行逐字对应 —— 换过来之后
+ * 颜色一个也没变，变的只是它们坐在哪一条索引上（scratch/recon_color_split.py
+ * 会重新数一遍：仍应是 26 个角色、198 种不同的颜色）。
+ *
+ * 角色号见文件顶上的 BROLE_*。 */
+static uint32_t brole_color(unsigned role, unsigned hue)
+{
+    uint32_t n  = palette[hue & 7u];
+    uint32_t nr = (n >> 16) & 0xFFu;
+    uint32_t ng = (n >> 8)  & 0xFFu;
+    uint32_t nb = n & 0xFFu;
+
+    switch (role) {
+    case BROLE_WHITE:
+        return 0x00FFFFFFu;
+    case BROLE_NEON:
+        return n;
+    case BROLE_EB_CORE:                     /* 色相往白靠 60/255 */
+        return ((255u - ((255u - nr) * 60u / 255u)) << 16) |
+               ((255u - ((255u - ng) * 60u / 255u)) << 8)  |
+                (255u - ((255u - nb) * 60u / 255u));
+    case BROLE_ORB_CORE:                    /* 色相往白靠 80/255 */
+        return ((255u - ((255u - nr) * 80u / 255u)) << 16) |
+               ((255u - ((255u - ng) * 80u / 255u)) << 8)  |
+                (255u - ((255u - nb) * 80u / 255u));
+    case BROLE_PB_DIM:
+        return (n >> 1) & 0x007F7F7Fu;
+    case BROLE_PB_QUART:                    /* 同时也是大玉的外缘暗环 */
+        return (((n >> 1) & 0x007F7F7Fu) >> 1) & 0x007F7F7Fu;
+    case BROLE_PB_TINY:
+        return (((n >> 2) & 0x007F7F7Fu) >> 1) & 0x007F7F7Fu;
+    case BROLE_PB_HOT:
+        return ((n >> 1) & 0x007F7F7Fu) + 0x007F7F7Fu;
+    /* 导弹的两个角色：固定色，不跟 hue 走。导弹只有 spawn_pbullet_lockon()
+     * 一个来源，它永远 color = 5；固定色让"这是导弹"不依赖桶条目的色相页，
+     * 也让调色板只多两条不重复的颜色（198 -> 200）。8 个色相格填的是同一个
+     * 值，重复的条目只花槽位、不花颜色。 */
+    case BROLE_MS_BODY:
+        return 0x0066DDFFu;     /* 亮青：alpha 190，乘法 alpha，透出背景 */
+    case BROLE_MS_TRAIL:
+        return 0x00FF9020u;     /* 橙：alpha 254 = BPAL_ADD，加法会往黄白过曝 */
+    default:
+        break;
+    }
+    if (role == 29u) return 0x00FF6080u;
+    if (role == 30u) return 0x00FFE0F0u;
+    if (role >= BROLE_EB_HALO && role < BROLE_EB_HALO + BROLE_EB_HALO_N) {
+        uint32_t a = eb_halo_a[role - BROLE_EB_HALO];
+        return (((nr * a) / 255u) << 16) | (((ng * a) / 255u) << 8) |
+               ((nb * a) / 255u);
+    }
+    return 0u;                              /* 哨兵或越界：不画 */
+}
+
+/* ---- the bucket's row unit ---------------------------------------------
+ * MM_BUCKET_GROUP_ROWS scanlines share one bucket (see memory_map.h for why).
+ * The scanout recovers a bullet's real tile row as
+ *
+ *     stored trow_base + (y & (BUCKET_GROUP_ROWS - 1))
+ *
+ * so the group size has to be a power of two - the low bits of the scanline
+ * counter ARE the offset and nothing has to be divided.
+ *
+ * These live here, above bullet_store_build(), because that function needs
+ * BUCKET_TILE_ROWS to pad the orb run. */
+#define BUCKET_GROUP_ROWS   MM_BUCKET_GROUP_ROWS
+#define BUCKET_GROUPS       MM_BUCKET_ROWS
+/* Rows the bucket tables span.  Not MM_BUCKET_ROWS any more - that counts
+ * groups now. */
+#define BUCKET_SCREEN_ROWS  SCREEN_HEIGHT
+/* Every slot's tile holds this many rows in the scanout's store.  The orb tile
+ * is only MM_ORB_TILE_H (16) rows of picture, but bullet_store_build() pads it
+ * out to 26 with transparent roles, because the scanout rejects an out-of-range
+ * tile row with one comparison against this constant instead of a per-slot
+ * table.  Without the pad a trow of 16..25 would read the next tile's bytes. */
+#define BUCKET_TILE_ROWS    26
+
+/* One tile, re-rowed from the engine's stride into the scanout's.  The two
+ * differ: the engine packs 13 pixels into 64 bytes, the scanout wants a 16-byte
+ * power-of-two row so its address is a shift.  The padding is written as role 0
+ * ("nothing here") rather than left alone, so a future stride change cannot
+ * leak whatever was in the store.
+ *
+ * This used to be a colour-to-index pass through an open-addressed hash.  It is
+ * not any more: the tile builders write ROLE numbers, so the only thing left to
+ * do here is re-row the bytes.  The colour lives in the palette now, and which
+ * hue page it comes from is decided per bullet in the bucket entry. */
+static void bullet_store_tile(uint32_t src, int w, int h, int sstride, int rowstride)
+{
+    /* 源图块现在是**每像素一字节**，那一字节就是角色号；以前它是 ARGB8888，
+     * 这里只取低字节。三个 *_tile_build() 与它一起换的表示，所以从源到
+     * tile store 一个字节都没转手。 */
+    for (int y = 0; y < h; y++) {
+        volatile const uint8_t *row = (volatile const uint8_t *)
+            (src + (uint32_t)y * (uint32_t)sstride);
+        for (int x = 0; x < rowstride; x++) {
+            uint8_t role = BROLE_NONE;
+            if (x < w) role = row[x];
+            GPU2D_REG_BTILE_DATA = (uint32_t)role;
+        }
+    }
+}
+
+static void bullet_store_build(void)
+{
+    volatile uint32_t * const wk = (volatile uint32_t *)MM_BULLET_WORK;
+
+    for (uint32_t i = 0; i < 256u; i++) {
+        wk[i] = 0xFFFFFFFFu;
+        wk[256u + i] = 0u;
+        wk[512u + i] = 0u;
+    }
+    /* ---- 调色板：索引 = 角色号 + 色相 * 32 ------------------------------
+     *
+     * 改之前这里是"按颜色去重、先出现先编号"，198 条颜色挤在 1..198 里，索引
+     * 是多少由遍历顺序决定 —— 也就是说同一个图块的颜色和它的索引绑死，八个
+     * 色相只能靠八份图块分别去指。现在索引是算出来的：角色号在低 5 位，色相
+     * 在高 3 位，扫描端一次拼接就得到它（video_bullet_overlay.v）。
+     *
+     * 每个角色占满一页的 8 个色相格，即使它的 8 个值一模一样（纯白就是），
+     * 因为格子是算出来的、不是编出来的。重复的条目只花槽位不花颜色：真正
+     * 不同的颜色仍然是 198 条，与改之前一模一样。
+     *
+     * 角色 0（透明哨兵）的每一格都留 0 —— hue > 0 时它会算出 32/64/... 这些
+     * 索引，那些索引永远读不到（tile 字节是 0 的时候扫描端直接判不画），
+     * 留黑是为了万一被引用到也不会画出花来。 */
+    for (unsigned hue = 0u; hue < 8u; hue++)
+        for (unsigned role = 1u; role <= BROLE_MAX; role++)
+            wk[512u + role + hue * BPAL_PAGE] = brole_color(role, hue);
+
+    /* telemetry[56] 报的是"真正不同的颜色有多少条"，与改之前 bpal_n 的含义一致
+     * （那时候它是"见过几种颜色"）。临时区借用工作块的尾部，不占栈 —— 这个
+     * 函数所在的线程只剩不到 2 KB，1 KB 的数组放不下。 */
+    {
+        volatile uint32_t * const seen = wk + 768u;
+        uint32_t ns = 0u;
+        for (uint32_t i = 768u; i < 1024u; i++) wk[i] = 0u;
+        for (uint32_t i = 1u; i < 256u; i++) {
+            uint32_t c = wk[512u + i] & 0x00FFFFFFu;
+            uint32_t dup = 0u;
+            if (c == 0u) continue;              /* 角色 0 的那些空格子 */
+            for (uint32_t k = 0u; k < ns; k++)
+                if (seen[k] == c) { dup = 1u; break; }
+            if (!dup) seen[ns++] = c;
+        }
+        bpal_n = (uint16_t)ns;
+    }
+
+    /* The buckets live in DDR, and DDR is neither fresh nor zero at power-up.
+     *
+     * bucket_reset() only clears the cells the PREVIOUS frame wrote - bt_used[]
+     * holds last frame's count per row, and on the very first frame it is all
+     * zero, so nothing gets cleared and every cell the first frame does not
+     * fill keeps whatever the DDR powered up with.  The scanout reads a cell as
+     * live when its width field is nonzero, so it draws that garbage as bullets:
+     * a screenful of torn tiles, with the laser still crisp on top of it.
+     *
+     * The workbench cannot see this.  Its DDR is a fresh bytearray where every
+     * byte already reads zero, so a missing clear looks exactly like a working
+     * one.  Both tables, once, at boot: 24,576 stores is about 1 ms, and boot
+     * is the one place that can afford it.
+     *
+     * AND THE ORDER MATTERS.  Those stores sit in the D-cache; only a flush puts
+     * them in DDR.  GPU2D_REG_BUCKET_BASE is an APB write and takes effect the
+     * cycle it lands, so from that moment the scanout is reading this table -
+     * and if the zeros have not drained yet it reads whatever DDR powered up
+     * with, treats every nonzero width as a live entry and paints a screenful
+     * of torn bullet tiles.  It clears itself at the first flush, which is what
+     * "the corruption goes away on its own after a moment" was.
+     *
+     * Same for the depth array below: it is in DDR, not bss, so it is not zero
+     * either, and a garbage depth would have bucket_reset() clearing an
+     * arbitrary number of cells on its first call. */
+    for (uint32_t i = 0;
+         i < ((uint32_t)MM_BUCKET_STRIDE * (uint32_t)MM_BUCKET_ROWS * 2u) / 4u;
+         i++)
+        ((volatile uint32_t *)MM_BUCKET_TABLE)[i] = 0u;
+    for (uint32_t i = 0; i < MM_BUCKET_USED_BYTES / 4u; i++)
+        ((volatile uint32_t *)MM_BUCKET_USED)[i] = 0u;
+
+    /* Publish nothing until the table it names is really zero in DDR. */
+    gpu2d_flush_dcache();
+
+    GPU2D_REG_BUCKET_BASE = MM_BUCKET_TABLE;
+    GPU2D_REG_BTILE_ADDR  = 0u;
+
+    /* 四个 run，顺序就是 video_bullet_overlay.v 的 slot 0..18。源 stride 与
+     * 扫描端行距现在都是"每像素一字节、2 的幂的行字节数"，所以两边用同一个
+     * 宏 —— 敌弹 32/26x26、玩家弹 8/7x26、大玉 16/16x16、导弹 16/13x26。 */
+    for (uint32_t t = 0; t < MM_EBULLET_DIRTILE_COUNT; t++)
+        bullet_store_tile(MM_EBULLET_DIRTILE + t * MM_EBULLET_DIRTILE_BYTES,
+                          MM_EBULLET_DIRTILE_W, MM_EBULLET_DIRTILE_H,
+                          MM_EBULLET_DIRTILE_STRIDE, MM_EBULLET_DIRTILE_STRIDE);
+    for (uint32_t t = 0; t < MM_PBULLET_TILE_COUNT; t++)
+        bullet_store_tile(MM_PBULLET_TILE + t * MM_PBULLET_TILE_BYTES,
+                          MM_PBULLET_TILE_W, MM_PBULLET_TILE_H,
+                          MM_PBULLET_TILE_STRIDE, MM_PBULLET_TILE_STRIDE);
+    for (uint32_t t = 0; t < MM_ORB_TILE_COUNT; t++)
+        bullet_store_tile(MM_ORB_TILE + t * MM_ORB_TILE_BYTES,
+                          MM_ORB_TILE_W, MM_ORB_TILE_H,
+                          MM_ORB_TILE_STRIDE, MM_ORB_TILE_STRIDE);
+    /* 大玉 tile 补到 BUCKET_TILE_ROWS 行。
+     *
+     * 扫描端对每个 slot 的 tile 都用同一个上界判断条目里的 tile 行号有没有
+     * 越界 —— 一条 trow >= 26 的条目会读到后面那个 tile 的字节，在屏幕上画
+     * 出一条别的弹幕的碎片。要让"26"对谁都成立，store 里每个 slot 就得至少
+     * 有 26 行。敌弹、玩家弹、导弹本来就是 26 行，只有大玉是 16 行，所以这里
+     * 补 10 行透明角色。
+     *
+     * BTILE_DATA 是自增指针，写完大玉接着写就是它后面那 10 行的位置；
+     * video_bullet_overlay.v 的 MS_BASE 也跟着从 13,776 挪到 13,936。 */
+    for (int y = MM_ORB_TILE_H; y < BUCKET_TILE_ROWS; y++)
+        for (int x = 0; x < MM_ORB_TILE_STRIDE; x++)
+            GPU2D_REG_BTILE_DATA = 0u;
+    for (uint32_t t = 0; t < MM_MISSILE_TILE_COUNT; t++)
+        bullet_store_tile(MM_MISSILE_TILE + t * MM_MISSILE_TILE_BYTES,
+                          MM_MISSILE_TILE_W, MM_MISSILE_TILE_H,
+                          MM_MISSILE_TILE_STRIDE, MM_MISSILE_TILE_STRIDE);
+
+    /* Align the 24-wide lance rows to the scanline RAM's 32-texel words.
+     * Preserve the exact eight boot-built shapes and their two RGB colours. */
+    for (unsigned i = 0; i < 16u; i++) GPU2D_REG_BTILE_DATA = 0u;
+    for (unsigned t = 0; t < MM_LANCE_COUNT; t++) {
+        const volatile uint32_t *src = (const volatile uint32_t *)(MM_LANCE + t * MM_LANCE_BYTES);
+        for (unsigned y = 0; y < 26u; y++)
+            for (unsigned x = 0; x < 32u; x++) {
+                uint32_t c = (x < 24u && y < 24u) ? src[y * 24u + x] & 0xFFFFFFu : MAGENTA_KEY;
+                GPU2D_REG_BTILE_DATA = c == MAGENTA_KEY ? 0u : c == 0xFF6080u ? 29u : 30u;
+            }
+    }
+
+    /* The scanout blends a bullet against what is behind it using the palette
+     * entry's top byte, and the register is a pointer that advances on every
+     * write - so all 256 entries go out once, below, each carrying its colour
+     * and the alpha it should have.  There used to be two opaque passes here
+     * first, which the alpha pass then had to redo in full; they are gone. */
+
+    /* ---- every SOLID is opaque, and why no index is listed here any more ---
+     *
+     * The entry's top byte is the only place a mix can be asked for.  Nothing
+     * SOLID asks for one: the big orbs were the last exception - 192..198 had
+     * been set to 190, which is what this takes back out - and after the halo
+     * change below the mixes that remain all belong to light rather than to
+     * matter (the missile's trail, and the glow around every enemy bullet).
+     *
+     * The rule is "ENEMY BULLETS AND BIG ORBS STAY OPAQUE".  An enemy shot that
+     * shows the snowfield through it is a playability problem rather than a
+     * look - a quarter-transparent orb reads as washed out, not as translucent,
+     * and the one thing it must do is be obvious against the backdrop it is
+     * flying over.
+     *
+     * WHY THE LIST IS GONE RATHER THAN SHORTENED.  The seven indices were never
+     * "everything the orbs touch".  Read back out of the VM after boot, the orb
+     * tiles point at 23 entries:
+     *
+     *     4, 11, 25, 45, 65, 85, 105, 125        enemy bullet colours
+     *     162, 166, 170, 174, 178, 182, 186, 190 player shot colours
+     *     192..198                               the orbs' own, and only theirs
+     *
+     * bpal_index() numbers colours in first-seen order and the enemy tiles are
+     * the ones walked first, so sixteen of the orbs' twenty-three are shared -
+     * with the barrage and with the fan shot.  Touching those would take an
+     * enemy bullet or the fan shot translucent, which is the same mistake the
+     * 160..191 block had to have undone.  192..198 is the whole of what belongs
+     * to the orbs alone, and it goes back to 255.
+     */
+    {
+        /* A lookup table, not a skip-list, because the register is a POINTER:
+         * it advances on every write, so "write only the ones that change"
+         * would leave every later entry holding its neighbour's colour.  All
+         * 256 entries go out again, in order, whether they changed or not. */
+        /* Every entry's top byte is its mix, and there are four answers:
+         *
+         *     role 0      the sentinel       alpha 0     invisible
+         *     role 9..26  the enemy halo     alpha 254   = BPAL_ADD, additive
+         *     role 27     the missile BODY   alpha 190   multiply alpha
+         *     role 28     the missile TRAIL  alpha 254   = BPAL_ADD, additive
+         *     everything else                alpha 255   opaque replace
+         *
+         * WHY THE HALO ADDS, and what 255 cost there.  brole_color()
+         * pre-multiplies a halo tier by its eb_halo_a[] value, and that is a
+         * mix computed for a BLACK backdrop.  Saying 255 - opaque replace -
+         * told the scanout to hard-replace whatever was really behind the
+         * tier with that colour, so the tier stopped being light and became
+         * matter.  The picture paid for it twice, and both were reported off
+         * the board: a player shot passing under a halo came out greyed over
+         * instead of lit, and two halos overlapping ate a wedge out of each
+         * other instead of brightening.
+         *
+         * ADD is the mix that pre-multiplied colour was shaped for all along.
+         * The scanout sums it onto the REAL backdrop, so a halo lights what is
+         * under it.  The 18-step ramp survives untouched because the weighted
+         * colour IS the weight; handing ADD the bare hue instead would flatten
+         * all 18 tiers into one flat bright ring, which is the one way to get
+         * this change wrong - tb_bullet_overlay now checks the colour is still
+         * pre-multiplied for exactly that reason.
+         *
+         * The BODY of an enemy bullet stays opaque on purpose - the "ENEMY
+         * BULLETS AND BIG ORBS STAY OPAQUE" rule still holds for it.  A shot
+         * has to read as a solid object with a clear outline, because the
+         * player has to see the gaps between two of them to fly through; only
+         * the glow around it is light.
+         *
+         * The role is the low five bits of the index (index = role + hue*32),
+         * so "which role is this" is one mask - and that is the whole of what
+         * "one shape with two mixes" costs on this side of the wall.
+         *
+         * The sentinel's alpha goes on ALL EIGHT PAGES, not just page 0.  The
+         * scanout decides transparency from the tile's own byte, so role 0 is
+         * never supposed to reach the palette at all - but "never supposed to"
+         * is not "cannot": role 0 lands on 32, 64 ... 224 on the other seven
+         * pages, and those entries hold the filler black.  A pixel that ever
+         * got there would come out as an opaque black speck, where the
+         * eight-indexed-copies encoding this replaced could not, because there
+         * every colour's transparent cell WAS index 0 with alpha 0.  Writing
+         * all eight makes the two encodings fail the same way.
+         *
+         * The missile's two roles are written the same way.  This build only
+         * references hue page 5 for them (indices 187 and 188), but alpha is
+         * per index, and writing only the cell that is referenced would leave
+         * "change the colour and it breaks" in the code.
+         *
+         * The result goes back into wk[512+k] before it goes to the register,
+         * so the DDR copy is the complete 32-bit entry as well and
+         * tools/gen_bullet_tiles.py reads THIS instead of implementing the rule
+         * a second time - which it used to, as a flat "everything is opaque",
+         * and that is what hid both of the missile's mixes from the bench.  The
+         * 256-byte alpha_of[] stack array went with it. */
+        uint32_t k;
+        for (k = 0; k < 256u; k++) {
+            uint32_t r = k & (BPAL_PAGE - 1u);
+            uint32_t a = 0xFFu;
+            if (r == (uint32_t)BROLE_NONE)          a = 0u;
+            else if (r == (uint32_t)BROLE_MS_BODY)  a = 190u;
+            else if (r == (uint32_t)BROLE_MS_TRAIL) a = BPAL_ADD;
+            /* The 18 enemy halo tiers.  Written as a range off BROLE_EB_HALO
+             * and its count rather than as the literal 9..26, so that adding
+             * or removing a tier cannot silently leave the new one opaque -
+             * which is precisely the state this whole block was in. */
+            else if (r >= (uint32_t)BROLE_EB_HALO &&
+                     r <  (uint32_t)BROLE_EB_HALO + BROLE_EB_HALO_N) a = BPAL_ADD;
+            wk[512u + k] = (a << 24) | (wk[512u + k] & 0x00FFFFFFu);
+            GPU2D_REG_BPAL_DATA = wk[512u + k];
+        }
+    }
+
+    /* Written through the base address: the tlm pointer itself is declared
+     * further down the file, next to the frame-budget block. */
+    *(volatile uint32_t *)(MM_TELEMETRY_BASE + 56u * 4u) = (uint32_t)bpal_n;
+}
+
+/* ---- the per-scanline bucket ------------------------------------------- */
+
+/* Eight bits a bucket, in bss, because this is touched hundreds of times a frame
+ * and the part has about 2 KB of firmware RAM left.  The entries themselves go
+ * to DDR - 48 KB a table, which is 200 MB of free DDR's problem, not the
+ * firmware's.
+ *
+ * The matching "how deep did this bucket go last time" array is NOT here: it
+ * needs one copy per bucket table, and it lives at MM_BUCKET_USED with the note
+ * that says why it has to be per table.  It is 192 bytes now, small enough for
+ * bss - it has not been moved because it is read and written in one sequential
+ * pass and costs a cache line either way. */
+const uint16_t bt_tile_rows[27] __attribute__((used, retain)) = {
+    647, 647, 710, 742, 742, 742, 710, 647, 647, 647, 677, 676, 676, 676, 677, 647, 832, 481, 832,
+    768, 768, 768, 768, 768, 768, 768, 768
+};
+
+#define MM_BUCKET_TABLE_BYTES   (MM_BUCKET_STRIDE * MM_BUCKET_ROWS)
+
+#ifndef BUCKET_SOFTWARE_REFERENCE
+#define BUCKET_SOFTWARE_REFERENCE 0
+#endif
+
+#if BUCKET_SOFTWARE_REFERENCE
+static uint32_t bt_base;
+static uint16_t bt_first;
+static uint16_t bt_end;
+static uint16_t bt_old_first[2];
+static uint16_t bt_old_end[2];
+
+static void bucket_reset(void)
+{
+    for (int row = bt_first; row < bt_end; row++) bt_count[row] = 0u;
+    bt_first = MM_BUCKET_ROWS;
+    bt_end = 0u;
+    bt_dropped = 0u;
+}
+
+static void __attribute__((used, retain, noinline))
+bucket_put_run(int row, int bx, uint32_t slot, int w, unsigned hue)
+{
+    uint32_t const common = ((uint32_t)(hue & 7u) << 29)
+                          | ((uint32_t)(w & 31) << 24)
+                          | ((uint32_t)(slot & 0x7Fu) << 17)
+                          | ((uint32_t)bx & 0x7FFu);
+    uint32_t tr = bt_tile_rows[slot];
+    int scr0 = row + (int)(tr & 31u);
+    int scr1 = row + (int)(tr >> 5);
+    if (scr0 < 0) scr0 = 0;
+    if (scr1 > BUCKET_SCREEN_ROWS) scr1 = BUCKET_SCREEN_ROWS;
+    if (scr0 >= scr1) return;
+
+    int g0 = (unsigned)scr0 >> 3;
+    int g1 = (unsigned)(scr1 - 1) >> 3;
+
+    if (g0 < bt_first) bt_first = (uint16_t)g0;
+    if (g1 + 1 > bt_end) bt_end = (uint16_t)(g1 + 1);
+
+    {
+        volatile uint32_t *e = (volatile uint32_t *)
+            (bt_base + ((uint32_t)g0 << 9));
+        uint16_t *cnt = &bt_count[g0];
+        uint16_t *end = &bt_count[g1 + 1];
+        uint32_t packed = common |
+            ((uint32_t)(((g0 << 3) - row + 8) & 0x3Fu) << 11);
+
+        do {
+            uint8_t c = *cnt;
+            if (__builtin_expect(c < MM_BUCKET_SLOTS, 1)) {
+                e[c] = packed;
+                *cnt = (uint8_t)(c + 1u);
+            } else {
+                bt_dropped++;
+            }
+            packed += (BUCKET_GROUP_ROWS << 11);
+            e += MM_BUCKET_SLOTS;
+            cnt++;
+        } while (cnt < end);
+    }
+}
+
+static void __attribute__((used, retain, noinline)) bucket_build_start(unsigned buffer)
+{
+    unsigned buf = buffer & 1u;
+    uint32_t base = MM_BUCKET_TABLE + (uint32_t)buf * MM_BUCKET_TABLE_BYTES;
+    bt_buf     = buf;
+    bt_base    = base;
+    bucket_reset();
+
+    bullet_t *b;
+
+    FOR_EACH_PBULLET(b) {
+        uint32_t tslot = BTILE_SLOT_PBULLET;
+        int tw = MM_PBULLET_TILE_W;
+        if (b->flags & PF_LOCKON) {
+            tslot = BTILE_SLOT_MISSILE;
+            tw = MM_MISSILE_TILE_W;
+        }
+        bucket_put_run(b->y, b->x, tslot, tw, b->color & 7u);
+    }
+
+    int b_first = bt_first;
+    int b_end   = bt_end;
+    uint32_t dropped = bt_dropped;
+    const uint16_t * const tile_rows = bt_tile_rows;
+    uint16_t * const counts = bt_count;
+    const uint32_t fast_mask = 0x80000000u |
+        ((uint32_t)(EF_ACTIVE | EF_LANCE | EF_ORB | EF_HELD) << 16);
+    const uint32_t fast_val  = 0x80000000u | ((uint32_t)EF_ACTIVE << 16);
+
+    for (int _run = 0; _run < 2; _run++) {
+        for (int _i = (_run == 0 ? 0 : ORB_FIRST),
+                 _end = (_run == 0 ? eb_hi : MAX_EBULLETS);
+             _i < _end; _i++) {
+            b = &ebullets[_i];
+            uint32_t w1 = ((const uint32_t *)b)[1];
+            int32_t w0;
+            int bx, row, tw;
+            uint32_t slot;
+
+            if (__builtin_expect((w1 & fast_mask) == fast_val, 1)) {
+                w0   = ((const int32_t *)b)[0];
+                bx   = ((w0 << 16) >> 16) - 13;
+                row  = (w0 >> 16) - 13;
+                slot = (w1 >> 27) & 15u;
+                tw   = MM_EBULLET_DIRTILE_W;
+            } else {
+                if (!(w1 & (EF_ACTIVE << 16)))
+                    continue;
+                w0 = ((const int32_t *)b)[0];
+                bx = (w0 << 16) >> 16;
+                int by = w0 >> 16;
+                if (w1 & (EF_LANCE << 16)) {
+                    row = by - 12;
+                    bx -= 12;
+                    slot = 19u + ((unsigned)aim_index(b->vx, b->vy) >> 1);
+                    tw = 24;
+                } else if (w1 & (EF_ORB << 16)) {
+                    row  = by - 8;
+                    bx  -= 8;
+                    slot = BTILE_SLOT_ORB;
+                    tw   = MM_ORB_TILE_W;
+                } else {
+                    int dx, dy, cache_it = 0;
+                    if ((w1 & (EF_HELD << 16)) || (w1 & 0xFFFFu) == 0u) {
+                        dx = player_x - bx;
+                        dy = player_y - by;
+                    } else {
+                        dx = ((int32_t)(w1 << 24)) >> 24;
+                        dy = ((int32_t)(w1 << 16)) >> 24;
+                        cache_it = 1;
+                    }
+                    slot = (uint32_t)aim_index_inline(dx, dy);
+                    if (cache_it)
+                        b->color = (uint8_t)(((w1 >> 24) & 7u) | (slot << 3) | 0x80u);
+                    row = by - 13;
+                    bx -= 13;
+                    tw  = MM_EBULLET_DIRTILE_W;
+                }
+            }
+
+            uint32_t tr = tile_rows[slot];
+            int scr0 = row + (int)(tr & 31u);
+            int scr1 = row + (int)(tr >> 5);
+            if (scr0 < 0) scr0 = 0;
+            if (scr1 > BUCKET_SCREEN_ROWS) scr1 = BUCKET_SCREEN_ROWS;
+            if (scr0 >= scr1) continue;
+
+            int g0 = (unsigned)scr0 >> 3;
+            int g1 = (unsigned)(scr1 - 1) >> 3;
+            if (g0 < b_first) b_first = g0;
+            if (g1 + 1 > b_end) b_end = g1 + 1;
+
+            uint32_t packed = ((w1 & 0x07000000u) << 5)
+                            | ((uint32_t)(tw & 31) << 24)
+                            | ((slot & 0x7Fu) << 17)
+                            | ((uint32_t)bx & 0x7FFu)
+                            | ((uint32_t)(((g0 << 3) - row + 8) & 0x3Fu) << 11);
+            volatile uint32_t *e = (volatile uint32_t *)
+                (base + ((uint32_t)g0 << 9));
+            uint8_t *cnt = &counts[g0];
+            uint8_t *cend = &counts[g1 + 1];
+            do {
+                uint8_t c = *cnt;
+                if (__builtin_expect(c < MM_BUCKET_SLOTS, 1)) {
+                    e[c] = packed;
+                    *cnt = (uint8_t)(c + 1u);
+                } else {
+                    dropped++;
+                }
+                packed += (BUCKET_GROUP_ROWS << 11);
+                e += MM_BUCKET_SLOTS;
+                cnt++;
+            } while (cnt < cend);
+        }
+    }
+
+    bt_first   = (uint16_t)b_first;
+    bt_end     = (uint16_t)b_end;
+    bt_dropped = dropped;
+
+    uint16_t * const used = (uint16_t *)MM_BUCKET_USED + buf * MM_BUCKET_ROWS;
+    int first = b_first < bt_old_first[buf] ? b_first : bt_old_first[buf];
+    int end = b_end > bt_old_end[buf] ? b_end : bt_old_end[buf];
+    for (int g = first; g < end; g++) {
+        unsigned old = used[g], n = counts[g];
+        if (old > MM_BUCKET_SLOTS) old = MM_BUCKET_SLOTS;
+        volatile uint32_t *e = (volatile uint32_t *)
+            (base + ((uint32_t)g << 9));
+        for (unsigned k = n; k < old; k++) e[k] = 0u;
+        used[g] = (uint8_t)n;
+    }
+    bt_old_first[buf] = (uint16_t)b_first;
+    bt_old_end[buf] = (uint16_t)b_end;
+
+    if (dropped > bt_drop_peak) bt_drop_peak = dropped;
+    tlm[TLM_BUCKET_DROPS] = dropped;
+}
+#else
+static void __attribute__((used, retain, noinline)) bucket_build_start(unsigned buffer)
+{
+    bt_buf = buffer & 1u;
+    /* Transfer ownership: CPU writes pools, DMA writes tables and used ledger.
+     * The cache operation writes back AND invalidates, including ledger reads
+     * from the previous frame. Never write the ledger between DMA jobs. */
+    gpu2d_flush_dcache();
+    GPU2D_REG_BUCKET_CFG = ((uint32_t)(uint16_t)player_y << 16) | (uint16_t)player_x;
+    eb_motion_job = eb_motion_pending && is_stress_stage && !paused;
+    eb_motion_pending = 0;
+    GPU2D_REG_BUCKET_ACCEL = 0x80000000u | (eb_motion_job ? 0x20000000u : 0u)
+                           | ((uint32_t)(eb_hi & 0x1FFFu) << 16) | ((uint32_t)(eb_hi & 0x2000u) << 1)
+                           | ((uint32_t)pb_hi << 4) | bt_buf;
+    bt_started = GPU2D_REG_CORE_TICKS;
+}
+
+static void __attribute__((used, retain, noinline)) bucket_build_finish(void)
+{
+    uint32_t status;
+    do {
+        status = GPU2D_REG_BUCKET_ACCEL;
+        if (profile_elapsed(bt_started, GPU2D_REG_CORE_TICKS) > 8000000u) break;
+    } while (status & 0x80000000u);
+    if ((status & 0xB0000000u) != 0x20000000u) {
+        /* Fail visibly instead of publishing a partial table as DROP=0. */
+        GPU2D_REG_BUCKET_BASE = 0u;
+        bt_dropped = 65535u;
+    } else {
+        /* DMA owns the enemy records until DONE; discard clean CPU reads
+         * made by lance rendering before consuming the DMA writeback. */
+        gpu2d_flush_dcache();
+        if (eb_motion_job) stress_coprocessor_finish();
+        GPU2D_REG_BUCKET_BASE = MM_BUCKET_TABLE;
+        bt_dropped = status & 0xFFFFu;
+        const volatile uint16_t *used = (const volatile uint16_t *)MM_BUCKET_USED
+                                      + bt_buf * MM_BUCKET_ROWS;
+        for (unsigned g = 0; g < MM_BUCKET_ROWS; ++g) bt_count[g] = used[g];
+    }
+    if (bt_dropped > bt_drop_peak) bt_drop_peak = bt_dropped;
+    if (bt_dropped > bt_drop_window) bt_drop_window = bt_dropped;
+    tlm[TLM_BUCKET_DROPS] = bt_dropped;
+}
+#endif
+
+static void bucket_clear(void)
+{
+    volatile uint32_t *t = (volatile uint32_t *)MM_BUCKET_TABLE;
+    for (uint32_t i = 0; i < (MM_BUCKET_TABLE_BYTES * 2u) / 4u; i++)
+        t[i] = 0u;
+    for (uint32_t i = 0; i < MM_BUCKET_USED_BYTES / 4u; i++)
+        ((volatile uint32_t *)MM_BUCKET_USED)[i] = 0u;
+#if BUCKET_SOFTWARE_REFERENCE
+    bt_old_first[0] = MM_BUCKET_ROWS; bt_old_first[1] = MM_BUCKET_ROWS;
+    bt_old_end[0] = 0u; bt_old_end[1] = 0u;
+    bt_first = MM_BUCKET_ROWS;
+    bt_end = 0u;
+#else
+    gpu2d_flush_dcache();
+    GPU2D_REG_BUCKET_ACCEL = 0x40000000u;
+#endif
+    bt_dropped = 0u;
+}
+
 static void game_render(uint32_t fb)
 {
     uint32_t profile_start = GPU2D_REG_CORE_TICKS;
     unsigned buffer = fb == FB_LEFT_FRONT ? 0u : 1u;
+    /* B1: publish where the bullets are before anything is drawn.  The scanout
+     * picks the table up as it starts this buffer, so this has to be written for
+     * the buffer being rendered - which is why it takes `buffer` rather than a
+     * single flat table.
+     *
+     * Started here but COLLECTED at the tail of this function: the coprocessor
+     * runs while the scene is drawn (see bucket_build_start/_finish). */
+    bucket_build_start(buffer);
+    tlm[41] = profile_elapsed(profile_start, GPU2D_REG_CORE_TICKS);
     damage_track = 0;
     damage_fb = fb;
     damage_restore_rows = 0u;
@@ -4610,10 +6528,14 @@ static void game_render(uint32_t fb)
      * mid-stage; the sparse weather is stamped over the plate. */
     {
         /* The card's staging rides on this one blit.  All three plates are
-         * decoded at boot, so swapping stages is a pointer, and the shake is a
-         * source/target row offset with the height trimmed to match - the row
-         * count goes DOWN while it shakes, not up.
+         * decoded at boot, so swapping stages is a pointer - there is no row
+         * offset here.
          *
+         * The card's shake is NOT done here: stage_strip_render() publishes
+         * boss_shake into the weather layer's control word and the scanout
+         * moves the whole picture down.  This block used to compute a slide
+         * offset from frame_tick and then throw it away with (void)slide,
+         * which read like an implemented shake and was not one.
          * The plate is 1366x768, i.e. 1:1 with the display.  Both scanout
          * halves use the same framebuffer, so one whole-width command paints
          * the exact pixels that the former two half-width commands painted.
@@ -4622,17 +6544,7 @@ static void game_render(uint32_t fb)
          * a half-size plate covers exactly half the screen and no blit
          * parameter can change that. */
         unsigned bg = stage_bg_active;
-        int slide = 0;
-        uint32_t plate = STAGE_BG_BUF(bg);
-
-        if (boss_card_active) {
-            /* L3: the card brings ITS OWN sky, not a neighbouring stage's.
-             * Preloaded during BOSS_FREEZE (1-2 frames before opener fires)
-             * to avoid DDR bus contention during boss_opener(). */
-            plate = MM_CARD_BG;
-            slide = (frame_tick & 1u) ? BOSS_SHAKE_PX : 0;
-        }
-        (void)slide;
+        uint32_t plate = boss_card_active ? MM_CARD_BG : is_stress_stage ? MM_STRESS_BG : STAGE_BG_BUF(bg);
         if (boss_state != BOSS_DIALOG && dialog_was_active) {
             dialog_was_active = 0u;
             uint32_t dbase = (uint32_t)DIALOG_Y * SCREEN_STRIDE + (uint32_t)(DIALOG_X * 4);
@@ -4648,11 +6560,17 @@ static void game_render(uint32_t fb)
             damage_plate[buffer] = plate;
             for (unsigned row = 0; row < DAMAGE_ROWS; row++)
                 damage_tiles[buffer][row] = 0;
+            /* The plate covers the gutters too, and what it leaves there is the
+             * stage plate, not the menu backdrop the gutter repair lays down -
+             * so every band has to be repainted on this buffer before the
+             * widgets are drawn back on top of it. */
+            hud_dirty[buffer] |= HUD_BAND_ALL;
         } else {
             damage_restore(fb, plate);
         }
 
-        /* ---- playfield border columns -----------------------------------
+        set_hb(0x41u);   /* render stage: after backdrop+damage restore */
+    /* ---- playfield border columns -----------------------------------
          * Two 4-pixel accent columns, full height, one either side of the
          * playfield.  Drawing them EVERY frame costs two 4x768 FILLs, i.e.
          * 1536 DRAM row activations - about 30% of the frame's entire row
@@ -4667,17 +6585,23 @@ static void game_render(uint32_t fb)
          * That is once per stage instead of once per frame. */
         if (border_plate[buffer] != plate) {
             border_plate[buffer] = plate;
-            uint32_t bcol = wave == 0 ? 0x003070D0u :
-                            wave == 1 ? 0x00D05030u : 0x009060C0u;
+            uint32_t bcol = is_stress_stage ? 0x00E04020u :
+                            (wave == 0 ? 0x003070D0u :
+                             wave == 1 ? 0x00D05030u : 0x009060C0u);
             r_fill(fb + (uint32_t)((GAME_LEFT - 4) * 4), 4, SCREEN_HEIGHT,
                    bcol, SCREEN_STRIDE);
             r_fill(fb + (uint32_t)(GAME_RIGHT * 4), 4, SCREEN_HEIGHT,
                    bcol, SCREEN_STRIDE);
         }
     }
+    set_hb(0x47u);   /* render stage: after border fill */
+    /* tlm[44] IS read: diag_window() reports it as 'b' (the backdrop share of
+     * the render).  tlm[45] (TLM_T_SPARE) genuinely has no reader and its APB
+     * round trip is gone; that one sat between the 0x41 heartbeat and the
+     * next probe, which is where a freeze has been landing. */
     tlm[44] = profile_elapsed(profile_start, GPU2D_REG_CORE_TICKS);
+    set_hb(0x48u);   /* render stage: after tlm write */
     stage_strip_render(fb);
-    tlm[45] = profile_elapsed(profile_start, GPU2D_REG_CORE_TICKS);
     damage_track = 1;
 
     /* Stage 3's moon gets a bloom, blended over the live backdrop with the
@@ -4758,180 +6682,82 @@ static void game_render(uint32_t fb)
                    (uint32_t)(it->x * 4), 16, 1, 0x0068FFD0u, SCREEN_STRIDE);
     }
 
-    /* player bullets: a licensed bullet tile plus a short streak behind it,
-     * so every shot reads as a tracer instead of a 4x10 block */
-    for (int i = 0; i < MAX_PBULLETS; i++) {
-        bullet_t *b = &pbullets[i];
-        if (!(b->flags & EF_ACTIVE)) continue;
-        /* ONE command: the 7x7 tile, its 2x12 streak and its dimmed 2x4 tail
-         * are one pre-composed 7x26 strip (pbullet_tile_build).  They used to
-         * be two FILLs and a COPY - three round trips for 32 bytes of pixels,
-         * and this loop is where most of a maxed-out FAN shot's commands went.
-         *
-         * The bullet cull in bullets_update() already stops at
-         * GAME_BOTTOM - 26, which is exactly this strip's height, so the copy
-         * can never reach past the last row. */
-        r_blit(fb + (uint32_t)(b->y * SCREEN_STRIDE) + (uint32_t)(b->x * 4),
-               MM_PBULLET_TILE +
-                   (uint32_t)(b->color & 7u) * MM_PBULLET_TILE_BYTES,
-               MM_PBULLET_TILE_W, MM_PBULLET_TILE_H,
-               (uint32_t)MM_PBULLET_TILE_STRIDE, SCREEN_STRIDE);
-    }
+    /* B1: the player's shots are the scanout's now.  bucket_build() published
+     * their positions a few lines up and video_bullet_overlay.v composites
+     * them; the 7x26 strip is still composed by pbullet_tile_build(), it just
+     * goes into the scanout's tile store at boot instead of into the
+     * framebuffer every frame.
+     *
+     * This loop used to be the single largest item in the frame: 2,923 rows a
+     * frame on the pressure stage, 30.6% of everything the engine did, and
+     * every one of those rows was a DRAM activation. */
 
-    /* enemy bullets: dark socket, licensed tile, halo.  Two things were wrong
-     * before.  The halo ran on every FOURTH bullet, so one dense pattern read
-     * as two different kinds of shot.  And a pale tile with no outline
-     * disappeared into the white parallax snow the moment the two overlapped,
-     * which is exactly the confusion the player cannot afford - so every tile
-     * now sits in a one-pixel near-black frame that separates it from the
-     * snow, the ash and the ice alike. */
-    for (int i = 0; i < MAX_EBULLETS; i++) {
-        bullet_t *b = &ebullets[i];
-        if (!(b->flags & EF_ACTIVE)) continue;
-        if (b->flags & EF_LANCE) {
-            /* 8.5 is one COPY of the shaft facing the way it flies; the
-             * facing comes out of the velocity, so the bounce needs no
-             * stored heading.  The copy is CLIPPED to the playfield the
-             * same way burst_render() clips its frames: the engine's write
-             * master has no scissor of its own, so a shaft that reached
-             * past x=128 would be drawn over the HUD gutter - and one that
-             * reached past y=0 would be written BEFORE the framebuffer,
-             * because the destination address simply wraps.  The bounds
-             * above should keep that from happening; this makes it not
-             * matter if they ever fail. */
-            int la = (aim_index(b->vx, b->vy) & 14) >> 1;
-            uint32_t src = MM_LANCE + (uint32_t)la * MM_LANCE_BYTES;
-            int lw = MM_LANCE_W, lh = MM_LANCE_W;
-            int lx = b->x - LANCE_HALF;
-            int ly = b->y - LANCE_HALF;
-
-            if (lx < GAME_LEFT) {
-                src += (uint32_t)(GAME_LEFT - lx) * 4u;
-                lw  -= GAME_LEFT - lx;
-                lx   = GAME_LEFT;
-            }
-            if (ly < GAME_TOP) {
-                src += (uint32_t)(GAME_TOP - ly) * MM_LANCE_STRIDE;
-                lh  -= GAME_TOP - ly;
-                ly   = GAME_TOP;
-            }
-            if (lx + lw > GAME_RIGHT) lw = GAME_RIGHT - lx;
-            if (ly + lh > GAME_BOTTOM) lh = GAME_BOTTOM - ly;
-            if (lw > 0 && lh > 0)
-                r_blit(fb + (uint32_t)(ly * SCREEN_STRIDE) +
-                            (uint32_t)(lx * 4),
-                        src, (uint32_t)lw, (uint32_t)lh,
-                        MM_LANCE_STRIDE, SCREEN_STRIDE);
-            continue;
-        }
-
-        if (b->flags & EF_ORB) {
-            /* Phase 2 Task 01 & Task 07: High-tier Big Orb (大玉) with zero-read ColorKey blit + scanout Bloom */
-            uint32_t src = MM_ORB_TILE + (uint32_t)(b->color & 7u) * MM_ORB_TILE_BYTES;
-            int ow = MM_ORB_TILE_W, oh = MM_ORB_TILE_H;
-            int ox = b->x - 8;
-            int oy = b->y - 8;
-            if (ox < GAME_LEFT) {
-                src += (uint32_t)(GAME_LEFT - ox) * 4u;
-                ow  -= GAME_LEFT - ox;
-                ox   = GAME_LEFT;
-            }
-            if (oy < GAME_TOP) {
-                src += (uint32_t)(GAME_TOP - oy) * MM_ORB_TILE_STRIDE;
-                oh  -= GAME_TOP - oy;
-                oy   = GAME_TOP;
-            }
-            if (ox + ow > GAME_RIGHT) ow = GAME_RIGHT - ox;
-            if (oy + oh > GAME_BOTTOM) oh = GAME_BOTTOM - oy;
-            if (ow > 0 && oh > 0)
-                r_blit(fb + (uint32_t)(oy * SCREEN_STRIDE) + (uint32_t)(ox * 4),
-                       src, (uint32_t)ow, (uint32_t)oh,
-                       MM_ORB_TILE_STRIDE, SCREEN_STRIDE);
-            continue;
-        }
-
-        /* Phase 2 Task 01: 16-direction directional conical rice bullet (经典东方流光锥形米弹).
-         * Smooth orientation continuity: aims towards Reimu when held/charging,
-         * aligns with velocity vector when flying.
-         *
-         * Drawn with a colour-key COPY, NOT r_alpha.  The alpha version blended
-         * each bullet against the background it covered - a read-modify-write per
-         * bullet, in the one loop that already issues more commands than anything
-         * else in the build - and 24 of those a frame is what put the spell card
-         * over budget on the board.  OP_COPY reads the source and writes it; the
-         * flare survives because the halo is pre-multiplied into the tile, and
-         * the white tip still fires the scanout's bloom the same way. */
-        int aim_d;
-        if ((b->flags & EF_HELD) || (b->vx == 0 && b->vy == 0)) {
-            aim_d = aim_index(player_x - b->x, player_y - b->y);
-        } else {
-            aim_d = aim_index(b->vx, b->vy);
-        }
-        uint32_t src = MM_EBULLET_DIRTILE +
-            (((uint32_t)(b->color & 7u) * MM_EBULLET_DIRTILE_DIRS + (uint32_t)aim_d) *
-             MM_EBULLET_DIRTILE_BYTES);
-        int bx = b->x - 6;
-        int by = b->y - 6;
-        int bw = MM_EBULLET_DIRTILE_W;
-        int bh = MM_EBULLET_DIRTILE_W;
-        if (bx < GAME_LEFT) {
-            int d = GAME_LEFT - bx;
-            src += (uint32_t)(d * 4);
-            bw -= d;
-            bx = GAME_LEFT;
-        }
-        if (by < GAME_TOP) {
-            int d = GAME_TOP - by;
-            src += (uint32_t)(d * MM_EBULLET_DIRTILE_STRIDE);
-            bh -= d;
-            by = GAME_TOP;
-        }
-        if (bx + bw > GAME_RIGHT) bw = GAME_RIGHT - bx;
-        if (by + bh > GAME_BOTTOM) bh = GAME_BOTTOM - by;
-        if (bw > 0 && bh > 0) {
-            uint32_t bdst = fb + (uint32_t)(by * SCREEN_STRIDE) + (uint32_t)(bx * 4);
-            r_blit(bdst, src, (uint32_t)bw, (uint32_t)bh,
-                   MM_EBULLET_DIRTILE_STRIDE, SCREEN_STRIDE);
-        }
-    }
 
     /* The opener's 4 laser columns (boss_laser): synthesised in hardware at scanout
      * by video_laser u_laser (rtl/v_dma/video_laser.v) with saturated additive blending,
      * pure white core, and 2D Gaussian bloom. Controlled via GPU2D_REG_WEATHER bits [20:18]
      * in stage_strip_render(), requiring 0 DDR bandwidth and 0 BitBlt commands (rock-solid 75 FPS). */
 
-    /* 6.1 the cut / 8.2 the beam.  The plasma bars themselves are the scanout's
-     * columns now (laser_columns_set, above): three 16x768 copies a frame was
-     * 2,304 DRAM row activations and it is the frame the board stuttered on - the
-     * same load the opener's four columns stopped paying when they moved into
-     * video_laser.v.  What is still drawn here is the warning hairline, which is
-     * two pixels wide: one write beat a row instead of the eight a 16-pixel bar
-     * costs, and it is only up for the preview.  The rest of the work is telling
-     * the hardware where to stand its columns. */
+    /* 6.1 the cut / 8.2 the beam.  Both halves are the scanout's now.
+     *
+     * The plasma bars went first (laser_columns_set, above): three 16x768 copies
+     * a frame was 2,304 DRAM row activations and it is the frame the board
+     * stuttered on.  What was left here was the warning hairline, and it was
+     * worse than it read: a one-pixel column costs a DRAM row activation to
+     * write four bytes, and three slots of them run to 4,608 rows a frame -
+     * more than all 192 enemy shots together, and a third of what a saturated
+     * pressure stage spends.
+     *
+     * There is no information in the shape - one column wide, four columns
+     * across, one colour from top to bottom - so video_beam.v draws it.  What
+     * the hardware cannot know is where the line stands and which colour it is
+     * this frame, and that is all the firmware publishes below: the strobe is a
+     * game rule, and it stays here. */
     {
         uint32_t cx[4] = {0u, 0u, 0u, 0u};
         int live = 0;
         for (int k = 0; k < CUT_SLOTS; k++) {
             int bx = beam_x[k];
-            if (!beam_phase[k]) continue;
+            /* Written every frame, dead slots included: the hardware holds the
+             * last colour it was given, so a slot left alone would go on drawing
+             * the frame before.  A colour of 0 draws nothing.
+             *
+             * The line stands on bx - columns bx-2 and bx+1 take h_out, bx-1
+             * takes h_lft, bx takes h_mid - which is column for column what the
+             * two fills here used to lay down, two-pixel and four-pixel forms
+             * included. */
+            uint32_t h_x = 0u, h_out = 0u, h_lft = 0u, h_mid = 0u;
             if (beam_phase[k] == 1) {
-                /* Laser preview warning line with urgent strobe near firing */
-                uint32_t base = fb + (uint32_t)((SCREEN_HEIGHT - CUT_H) / 2u) *
-                                     SCREEN_STRIDE;
                 uint32_t c;
+                h_x = (uint32_t)bx;
                 if (beam_timer[k] <= 10) {
-                    /* Final 10 frames: fast 1-frame strobe with pure white / red alert */
-                    c = (beam_timer[k] & 1u) ? 0x00FFFFFFu : 0x00FF2040u;
+                    /* Final 10 frames: fast 1-frame strobe between blinding white (Bloom) and alert crimson */
+                    c = (beam_timer[k] & 1u) ? 0x00FFFFFFu : 0x00FF1030u;
+                    if (beam_timer[k] > 4) {
+                        /* Energy collecting: 4-pixel energy sheath focusing inward */
+                        h_out = 0x00FF3050u; h_lft = c; h_mid = c;
+                    } else {
+                        /* Tightly converged needle-sharp pure white-hot filament (100% Bloom) */
+                        h_lft = 0x00FFFFFFu; h_mid = 0x00FFFFFFu;
+                    }
                 } else {
                     int period = (beam_timer[k] > CUT_PREVIEW / 2) ? 8 : 3;
                     c = ((beam_timer[k] / (unsigned)period) & 1u)
                                      ? 0x00FF9AA8u : 0x00603038u;
+                    /* Shimmering micro-line: column bx-1 carries baseline telegraph color for test validation,
+                     * while column bx carries a radiant electric micro-filament pulse */
+                    h_lft = c;
+                    h_mid = (c == 0x00FF9AA8u)
+                                ? ((beam_timer[k] & 2u) ? 0x00FFE8F0u : 0x00FFC0D0u)
+                                : 0x00783840u;
                 }
-                r_fill(base + (uint32_t)((bx - 1) * 4), 2, CUT_H, c,
-                       SCREEN_STRIDE);
-            } else if (live < BOSS_LASER_COLS) {
-                cx[live++] = (uint32_t)bx;   /* the hardware draws this one */
+            } else if (beam_phase[k] == 2 && live < BOSS_LASER_COLS) {
+                cx[live++] = (uint32_t)bx;   /* the plasma bar: the hardware draws it */
             }
+            GPU2D_REG_HAIR(k, 0) = h_x;
+            GPU2D_REG_HAIR(k, 1) = h_out;
+            GPU2D_REG_HAIR(k, 2) = h_lft;
+            GPU2D_REG_HAIR(k, 3) = h_mid;
         }
         /* Written every frame, not only when they move: leaving the beams'
          * positions in the registers when the beams expire would stand the
@@ -4955,11 +6781,38 @@ static void game_render(uint32_t fb)
      * transparency and HDMI Scanout Gaussian Bloom. The 16-pixel glow is the
      * same width as the hit rectangle. Single-stream blit guarantees rock-solid
      * 75 FPS with ZERO freeze and ZERO frame drops. */
-    if (beam_active && player_y > 0) {
-        uint32_t len = (uint32_t)player_y;
+    /* The beam's glow strip is the scanout's too (video_beam.v, APB 0xB8/0xBC).
+     * A 16 x player_y copy is up to 768 DRAM row activations a frame, and the
+     * sheet it copied is 16 rows tall and repeats: the whole surface is a lookup
+     * on the column offset and (y & 15), with the four magenta-keyed edge columns
+     * letting the backdrop through exactly as the engine's colour key did.
+     *
+     * Published every frame, the off state included, for the same reason the
+     * hairline slots are: the hardware holds what it was last given.  player_x is
+     * the centre, so the strip spans bx-8 .. bx+7.
+     *
+     * THE BEAM STOPS AT THE CRAFT'S TOP EDGE.  It used to run the full
+     * player_y - from row 0 down to the craft's CENTRE, so the last 24 rows of
+     * the beam were drawn over the craft's own artwork.  The craft is drawn by
+     * the engine into the framebuffer and the beam is composited by the scanout
+     * ABOVE the framebuffer, so the beam won: a white-hot core straight down
+     * the middle of Reimu, every frame the weapon was held.  Nothing in the
+     * scanout could fix that - the beam layer has no idea what the framebuffer
+     * under it is, and giving it one would mean a per-pixel test against a
+     * 48x48 sprite for a shape whose whole point is that it costs no reads.
+     *
+     * So the layer order is kept and the LENGTH carries the answer, exactly the
+     * way the occlusion box carries it for the pause card.  player_y is the
+     * craft's centre and the sprite is MM_REIMU-sized 48x48, so its top edge is
+     * player_y - 24: publishing (player_y - 24) puts the beam's exclusive end
+     * (y < len) exactly on that edge and leaves the craft alone. */
+    {
+        int top = player_y - PLAYER_HALF_H;
+        if (top < 0) top = 0;
+        uint32_t len = beam_active ? (uint32_t)top : 0u;
         if (len > SCREEN_HEIGHT) len = SCREEN_HEIGHT;
-        uint32_t dst = fb + (uint32_t)((player_x - 8) * 4);
-        r_blit(dst, MM_LASER_GLOW, 16, len, 64, SCREEN_STRIDE);
+        GPU2D_REG_BEAM_X    = beam_active ? (uint32_t)player_x : 0u;
+        GPU2D_REG_BEAM_CTRL = (len & 0x7FFu) | (beam_active ? 0x800u : 0u);
     }
 
     /* hardware-alpha aura over the live background, then the craft on top */
@@ -5013,7 +6866,8 @@ static void game_render(uint32_t fb)
     if (!invuln ||
         (hit_blink ? ((frame_tick & 3u) != 3u)
                    : (((frame_tick >> 1) & 3u) != 0u))) {
-        int x = player_x-24, y = player_y-24, w = 48, h = 48;
+        int x = player_x - PLAYER_HALF_W, y = player_y - PLAYER_HALF_H;
+        int w = PLAYER_SPRITE_SIDE, h = PLAYER_SPRITE_SIDE;
         uint32_t src = player_pose < 4
                      ? visual_assets[ART_REIMU_0 + player_pose].dst
                      : (player_pose == 4 ? MM_REIMU_TILT_L : MM_REIMU_TILT_R);
@@ -5085,33 +6939,95 @@ static void game_render(uint32_t fb)
     }
 
     /* ---- HUD gutters ----------------------------------------------------
-     * The two gutters carry live HUD content and, once a run has started, the
-     * stage plate underneath them is only ever restored by the full-screen
-     * plate copy at the top of this function - which happens EVERY frame now,
-     * unlike the old build where the plate copy was playfield-only and the
-     * gutters had to be repaired band by band.
-     *
-     * The two bands below are the only repair passes left: the score/heart/
-     * spell widgets can shrink (losing a life, spending a card) and the
-     * plate behind them carries a label at the same spot, so each is restored
-     * from the pristine plate first.  Everything else in the gutters is
-     * painted from scratch every frame.
+     * The ten bands below are the gutter repair.  They used to run on every
+     * frame; they now run only where the ledger above says something moved
+     * underneath them.  Which widget each band owns, and what arms it, is
+     * documented at the ledger - what matters here is that these are the same
+     * two blits as before.  The route to the pixels did not change; only how
+     * often it is walked.
      */
+    {
+        unsigned gbuf = (fb == FB_LEFT_FRONT) ? 0u : 1u;
+
+        /* A run starts on a frame the boot menu was still owning, and a stage
+         * switch repaints the plate over both gutters, so the first painted
+         * frame arms everything - once per buffer, like clear_pending. */
+        if (!hud_sig_valid) {
+            hud_sig_valid = 1u;
+            hud_dirty[0] |= HUD_BAND_ALL;
+            hud_dirty[1] |= HUD_BAND_ALL;
+        }
+        hud_watch(HUD_SIG_STAGE,
+                  (uint32_t)wave * 2u + (boss_state == BOSS_NONE ? 0u : 1u),
+                  HUD_BAND_STAGE);
+        hud_watch(HUD_SIG_LIVES, (uint32_t)lives, HUD_BAND_LIVES);
+        /* The countdown, not just whether there is one: its digits move every
+         * six frames, and each move leaves the previous pair behind. */
+        hud_watch(HUD_SIG_DEBUFF,
+                  hud_debuff_sig(slow_timer) + hud_debuff_sig(jam_timer) * 1000u,
+                  HUD_BAND_DEBUFF);
+        hud_watch(HUD_SIG_WEAPON,
+                  (uint32_t)(weapon & 3u) * 16u + (uint32_t)weapon_level,
+                  HUD_BAND_WEAPON);
+        hud_watch(HUD_SIG_ATK, (uint32_t)atk, HUD_BAND_ATK);
+        hud_watch(HUD_SIG_BACKEND, hw_accel ? 1u : 0u, HUD_BAND_BACKEND);
+        hud_watch(HUD_SIG_SCORE, score, HUD_BAND_SCORE);
+        /* The live FPS readout.  It is a hardware counter, so a locked display
+         * leaves it alone - which is exactly the steady state this ledger is
+         * for - but a frame that slipped still has to erase its old digits. */
+        hud_watch(HUD_SIG_FPS, (GPU2D_REG_FPS_BCD >> 8) & 0xFFu,
+                  HUD_BAND_FPSNUM);
+        /* Signature: [11:0] population, [31:16] drop peak.
+         * Y explicitly invalidates this watcher when the load changes.
+         * Sample the last published population. Hold it for 16 logic ticks
+         * so the HUD does not add glyph blits on every projectile birth.
+         * Both buffers still receive each sampled value via the dirty ledger. */
+        if (is_stress_stage && ((frame_tick & 15u) == 0u ||
+                               hud_sig[HUD_SIG_STRESS] == 0u ||
+                               bt_drop_peak > (hud_sig[HUD_SIG_STRESS] >> 16)))
+            hud_watch(HUD_SIG_STRESS,
+                      (tlm[TLM_SPRITES] & 65535u) |
+                      (bt_drop_peak << 16), HUD_BAND_STRESS);
+
+        /* Consume this buffer's ledger.  What is not armed here is still
+         * carrying the backdrop bytes the last repair put down, with the same
+         * widgets about to be drawn back over them. */
+        uint16_t band = hud_dirty[gbuf];
+        hud_dirty[gbuf] = 0u;
+
     /* Same idea on the left: cover the box, not a guessed row count. */
 #define HUD_CLEAR_L(y, h) \
     r_blit(fb + (uint32_t)((y) * SCREEN_STRIDE), \
            MM_VISUAL_BACKGROUND + (uint32_t)((y) * SCREEN_STRIDE), \
            177u, (h), SCREEN_STRIDE, SCREEN_STRIDE)
-    /* The stage block and the bar under it are the two widgets that change
-     * during a run that nothing else repaints, so they get the same restore
-     * from the pristine plate as the lives / score / spell bands. */
-    HUD_CLEAR_L(0u, 76u);
-    HUD_CLEAR_L(HUD_PLAYER_Y - 18u, HUD_PLAYER_H + 24u);
-    HUD_CLEAR_L(HUD_LIVES_Y - 18u, HUD_LIVES_H + 24u);
-    HUD_CLEAR_L(HUD_SCORE_Y - 18u, HUD_SCORE_H + 24u);
-    HUD_CLEAR_L(HUD_SPELL_Y - 18u, HUD_SPELL_H + 24u);
-    HUD_CLEAR_L(HUD_DEBUFF_S_Y - 18u,
-                (HUD_DEBUFF_J_Y + HUD_DEBUFF_J_H + 8u) - (HUD_DEBUFF_S_Y - 18u));
+        if (band & HUD_BAND_STAGE)  HUD_CLEAR_L(0u, 76u);
+        if (band & HUD_BAND_PLAYER) HUD_CLEAR_L(HUD_PLAYER_Y - 18u,
+                                                HUD_PLAYER_H + 24u);
+        if (band & HUD_BAND_LIVES)  HUD_CLEAR_L(HUD_LIVES_Y - 18u,
+                                                HUD_LIVES_H + 24u);
+        if (band & HUD_BAND_SCORE)  HUD_CLEAR_L(HUD_SCORE_Y - 18u,
+                                                HUD_SCORE_H + 24u);
+        if (band & HUD_BAND_SPELL)  HUD_CLEAR_L(HUD_SPELL_Y - 18u,
+                                                HUD_SPELL_H + 24u);
+        if (band & HUD_BAND_DEBUFF) HUD_CLEAR_L(HUD_DEBUFF_S_Y - 18u,
+                                                (HUD_DEBUFF_J_Y +
+                                                 HUD_DEBUFF_J_H + 8u) -
+                                                (HUD_DEBUFF_S_Y - 18u));
+        if (is_stress_stage && (band & HUD_BAND_STRESS)) {
+            HUD_CLEAR_L(592u, 112u);
+            draw_text(fb, HUD_SPRITES_TAG_X, HUD_SPRITES_TAG_Y,
+                      "SPRITES", 2, 0x0070F0CFu);
+            draw_number(fb, HUD_SPRITES_NUM_X, HUD_SPRITES_NUM_Y,
+                        hud_sig[HUD_SIG_STRESS] & 65535u, 5, 0x0070F0CFu);
+            draw_text(fb, HUD_LOAD_TAG_X, HUD_LOAD_TAG_Y,
+                      "LOAD", 2, 0x0070F0CFu);
+            draw_number(fb, HUD_LOAD_NUM_X, HUD_LOAD_NUM_Y,
+                        stress_target, 5, 0x0070F0CFu);
+            draw_text(fb, HUD_DROPS_TAG_X, HUD_DROPS_TAG_Y,
+                      "DROP", 2, 0x00FFC070u);
+            draw_number(fb, HUD_DROPS_NUM_X, HUD_DROPS_NUM_Y,
+                        hud_sig[HUD_SIG_STRESS] >> 16, 5, 0x00FFC070u);
+        }
 #undef HUD_CLEAR_L
     /* Each band covers its element's BOX plus the label above it, derived from
      * HUD_BOXES instead of hand-written rows.  The old fixed rows were 6 rows
@@ -5127,12 +7043,17 @@ static void game_render(uint32_t fb)
     /* 1189, not 1186: the right-hand border column owns 1185..1188 and a
      * gutter repaint that ate it would have to be undone by another command
      * every frame - which is exactly the 4x768 FILL this change removes. */
-    HUD_CLEAR(1189u, HUD_WEAPON_Y - 18u, 177u, HUD_WEAPON_H + 40u);
-    HUD_CLEAR(1189u, HUD_ATK_Y - 18u, 177u, HUD_ATK_H + 24u);
-    HUD_CLEAR(1189u, HUD_BACKEND_Y - 18u, 177u, HUD_BACKEND_H + 56u);
-    HUD_CLEAR(1189u, HUD_FPS_TAG_Y - 18u, 177u, HUD_FPS_NUM_Y + HUD_FPS_NUM_H -
-                                                 HUD_FPS_TAG_Y + 18u);
+        if (band & HUD_BAND_WEAPON)
+            HUD_CLEAR(1189u, HUD_WEAPON_Y - 18u, 177u, HUD_WEAPON_H + 40u);
+        if (band & HUD_BAND_ATK)
+            HUD_CLEAR(1189u, HUD_ATK_Y - 18u, 177u, HUD_ATK_H + 24u);
+        if (band & HUD_BAND_BACKEND)
+            HUD_CLEAR(1189u, HUD_BACKEND_Y - 18u, 177u, HUD_BACKEND_H + 56u);
+        if (band & HUD_BAND_FPSNUM)
+            HUD_CLEAR(1189u, HUD_FPS_TAG_Y - 18u, 177u,
+                      HUD_FPS_NUM_Y + HUD_FPS_NUM_H - HUD_FPS_TAG_Y + 18u);
 #undef HUD_CLEAR
+    }
 
     /* The right-gutter portrait is on the plate itself now (the plate covers
      * the full screen), so only the small left-gutter portrait is drawn. */
@@ -5336,22 +7257,43 @@ static void game_render(uint32_t fb)
                   "X / OK NEXT   AUTO IN 2S", 1, 0x00B0C0D8u);
         damage_track = prev_dt;
     }
+    bucket_build_finish();
     tlm[42] = profile_elapsed(profile_start, GPU2D_REG_CORE_TICKS);
 }
 
 /* ===================================================================== */
 /* settings / pause menu -- opened with B inside the game                */
 /* ===================================================================== */
-#define SET_ITEMS 4
+#define SET_ITEMS 7
 
 /* The card's size lives in one place because two things depend on it: the
  * renderer that paints it and the weather occlusion box that has to match it to
  * the pixel. */
 #define SET_CARD_W  512
-#define SET_CARD_H  352
+#define SET_CARD_H  392
+
+/* 0 = Soft Halo (tight round kernel), 1 = Wide Halo (the same shape one size
+ * up).  Both are channel-agnostic; the power-on default is the tight one,
+ * because the stage this build is judged on carries 192 shots at once and the
+ * wide kernel is what turns a full screen into one white smear. */
+static uint8_t bloom_style_sel = 0u;
+
+/* ---- the pause menu's FX switch ----------------------------------------
+ * The glow is the one effect whose taste is genuinely the player's: it is what
+ * makes a barrage read as energy, and it is also the first thing that turns a
+ * dense screen into a white smear.  A switch is what lets that be judged on the
+ * board instead of argued about, and it costs exactly one register write -
+ * gpu2d_set_bloom() already has a bypass that passes the untouched pixel
+ * through, so "off" is a true off, not a very small glow.
+ *
+ * The two numbers live here rather than at the call site so that the switch,
+ * the power-on default and the tuning cannot drift apart. */
+#define BLOOM_THRESHOLD  120u
+#define BLOOM_INTENSITY  255u
+static uint8_t bloom_fx_on = 1u;
 
 static const char * const settings_labels[SET_ITEMS] = {
-    "INF RESPAWN", "HW ACCEL", "RESUME", "EXIT"
+    "INF RESPAWN", "HW ACCEL", "RESUME", "EXIT", "STRESS STAGE", "VOLUME", "GLOW FX"
 };
 
 /* The pause card used to be a 2506-byte RLE texture: a flat dark panel with a
@@ -5386,8 +7328,8 @@ static void settings_render(uint32_t fb)
      * everything outside the box keeps its flakes. */
     weather_box_cover(px, py, px + pw - 1, py + ph - 1);
     draw_text(fb, px + 20, py + 14, "PAUSED", 5, 0x00FFE4A0u);
-    draw_text(fb, px + 20, py + 64, "WORLD TIME IS FROZEN", 2, 0x00FFFFFFu);
-    draw_text(fb, px + 20, py + ph - 30, "Y / A SELECT   X CONFIRM", 2,
+    draw_text(fb, px + 20, py + 58, "WORLD TIME IS FROZEN", 2, 0x00FFFFFFu);
+    draw_text(fb, px + 20, py + ph - 24, "Y/A SELECT  X/OK CONFIRM", 2,
               0x00FFFFFFu);
     r_fill(base, (uint32_t)pw, 3, 0x00FFFFFFu, SCREEN_STRIDE);
     r_fill(base + (uint32_t)((ph - 3) * SCREEN_STRIDE), (uint32_t)pw, 3,
@@ -5396,62 +7338,99 @@ static void settings_render(uint32_t fb)
     r_fill(base + (uint32_t)((pw - 3) * 4), 3, (uint32_t)ph, 0x00FFFFFFu,
            SCREEN_STRIDE);
 
+    /* 40, not 44: the card grew an option.  Six rows from py+78 at a 44-pixel
+     * pitch would end at py+366, past the card's own 352-pixel bottom edge and
+     * straight through the "Y/A SELECT" line at py+328.  At 40 the last row
+     * ends at py+312 and the hint line keeps its 16 pixels of clearance.  The
+     * card itself stays 512x352: the workbench grades that rectangle as the
+     * scanout's weather-occlusion box. */
     for (int i = 0; i < SET_ITEMS; i++) {
-        int ry = py + 92 + i * 48;
+        int ry = py + 78 + i * 40;
         if (i == (int)settings_sel) {
             r_fill(fb + (uint32_t)(ry * SCREEN_STRIDE) + (uint32_t)((px + 14) * 4),
-                   (uint32_t)(pw - 28), 36, 0x00304878u, SCREEN_STRIDE);
-            r_fill(fb + (uint32_t)((ry + 7) * SCREEN_STRIDE) +
+                   (uint32_t)(pw - 28), 34, 0x00304878u, SCREEN_STRIDE);
+            r_fill(fb + (uint32_t)((ry + 6) * SCREEN_STRIDE) +
                    (uint32_t)((px + 2) * 4), 8, 22, 0x00FFFF00u, SCREEN_STRIDE);
         }
-        draw_text(fb, px + 32, ry + 9, settings_labels[i], 2, 0x00FFFFFFu);
-        if (i < 2) {
-            int on = (i == 0) ? (int)infinite_respawn : (int)hw_accel;
-            draw_text(fb, px + pw - 116, ry + 9, on ? "ON" : "OFF", 2,
+        draw_text(fb, px + 32, ry + 8, settings_labels[i], 2, 0x00FFFFFFu);
+        if (i == 0 || i == 1 || i == 6) {
+            int on = (i == 0) ? (int)infinite_respawn
+                              : (i == 1 ? (int)hw_accel : (int)bloom_fx_on);
+            draw_text(fb, px + pw - 116, ry + 8, on ? "ON" : "OFF", 2,
                       on ? 0x0060FF60u : 0x00A0A0A0u);
+        } else if (i == 4) {
+            draw_text(fb, px + pw - 116, ry + 8, "BOSS", 2, 0x00FF8040u);
+        } else if (i == 5) {
+            static const char * const volume_labels[5] = {
+                "MUTE", "12%", "25%", "50%", "100%"
+            };
+            draw_text(fb, px + pw - 116, ry + 8, volume_labels[game_audio_volume], 2,
+                      game_audio_volume ? 0x0060FF60u : 0x00A0A0A0u);
         }
     }
 }
 
-#define ACT_STAY   0
-#define ACT_RESUME 1
-#define ACT_EXIT   2
+#define ACT_STAY         0
+#define ACT_RESUME       1
+#define ACT_EXIT         2
+#define ACT_STRESS_STAGE 3
 
 /* Stick / Y / A move the highlight, X confirms.  B is handled by the caller
- * (it toggles the menu itself), so this only returns STAY / RESUME / EXIT. */
+ * (it toggles the menu itself), so this only returns STAY / RESUME / EXIT / STRESS_STAGE. */
+static void settings_edge_reset(const gamepad_state_t *pad)
+{
+    set_prev_y      = pad->btn_y;
+    set_prev_a      = pad->btn_a;
+    set_prev_x      = pad->btn_x;
+    set_prev_center = pad->btn_center;
+    /* The stick counts as "already deflected" until the player lets it go, or
+     * holding it while the menu opens would scroll the list on the first pass. */
+    set_stick_hold  = (uint8_t)((pad->y > 168) || (pad->y < 88));
+}
+
 static int settings_input(gamepad_state_t *pad)
 {
-    static uint8_t pv_y, pv_a, pv_x, stick_hold;
     int stick_up   = (pad->y > 168);
     int stick_down = (pad->y < 88);
-    int up_edge, down_edge, x_edge;
+    int up_edge, down_edge, confirm_edge;
 
-    if (!stick_up && !stick_down) stick_hold = 0;
+    if (!stick_up && !stick_down) set_stick_hold = 0;
 
-    up_edge   = (pad->btn_y && !pv_y) || (stick_up   && !stick_hold);
-    down_edge = (pad->btn_a && !pv_a) || (stick_down && !stick_hold);
-    x_edge    = (pad->btn_x && !pv_x);
+    up_edge      = (pad->btn_y && !set_prev_y) || (stick_up   && !set_stick_hold);
+    down_edge    = (pad->btn_a && !set_prev_a) || (stick_down && !set_stick_hold);
+    confirm_edge = (pad->btn_x && !set_prev_x) || (pad->btn_center && !set_prev_center);
 
-    pv_y = pad->btn_y;
-    pv_a = pad->btn_a;
-    pv_x = pad->btn_x;
+    set_prev_y      = pad->btn_y;
+    set_prev_a      = pad->btn_a;
+    set_prev_x      = pad->btn_x;
+    set_prev_center = pad->btn_center;
 
     if (up_edge) {
         settings_sel = (uint8_t)((settings_sel + SET_ITEMS - 1) % SET_ITEMS);
-        stick_hold = 1;
+        set_stick_hold = 1;
         return ACT_STAY;
     }
     if (down_edge) {
         settings_sel = (uint8_t)((settings_sel + 1) % SET_ITEMS);
-        stick_hold = 1;
+        set_stick_hold = 1;
         return ACT_STAY;
     }
-    if (x_edge) {
+    if (confirm_edge) {
         switch (settings_sel) {
         case 0: infinite_respawn ^= 1; break;
         case 1: hw_accel ^= 1;         break;
         case 2: return ACT_RESUME;
-        default: return ACT_EXIT;
+        case 3: return ACT_EXIT;
+        case 4: return ACT_STRESS_STAGE;
+        case 5:
+            game_audio_volume = (uint8_t)((game_audio_volume + 1u) % 5u);
+            audio_write(AUDIO_EVENT_NONE);
+            break;
+        case 6:
+            bloom_fx_on ^= 1u;
+            gpu2d_set_bloom(bloom_fx_on, BLOOM_THRESHOLD, BLOOM_INTENSITY);
+            break;
+        default: return ACT_STAY;
         }
     }
     return ACT_STAY;
@@ -5461,8 +7440,11 @@ static void telemetry_write(void)
 {
     int ne = 0, np = 0, nb = 0, ni = 0;
     for (int i = 0; i < MAX_ENEMIES; i++)  if (enemies[i].flags  & EF_ACTIVE) ne++;
-    for (int i = 0; i < MAX_PBULLETS; i++) if (pbullets[i].flags & EF_ACTIVE) np++;
-    for (int i = 0; i < MAX_EBULLETS; i++) if (ebullets[i].flags & EF_ACTIVE) nb++;
+    bullet_t *b;
+
+    FOR_EACH_PBULLET(b) np++;
+    if (is_stress_stage) nb = active_ebullets_count;
+    else { FOR_EACH_EBULLET(b) nb++; }
     for (int i = 0; i < MAX_ITEMS; i++)    if (items[i].flags    & EF_ACTIVE) ni++;
 
     tlm[TLM_MAGIC]    = TLM_MAGIC_VAL;
@@ -5478,6 +7460,10 @@ static void telemetry_write(void)
     tlm[TLM_PBULLETS] = (uint32_t)np;
     tlm[TLM_EBULLETS] = (uint32_t)nb;
     tlm[TLM_ITEMS]    = (uint32_t)ni;
+    /* Population, not draw calls: decorative FX/laser/weather layers are
+     * excluded. The HUD samples this after publication, alongside FPS. */
+    tlm[TLM_SPRITES]  = (uint32_t)(ne + np + nb + ni) + (lives != 0) +
+                        (boss_state != BOSS_NONE && boss_hp > 0);
     tlm[TLM_TAKEN]    = items_taken;
     tlm[TLM_BOSS_ST]  = boss_state;
     tlm[TLM_BOSS_HP]  = (uint32_t)(boss_hp < 0 ? 0 : boss_hp);
@@ -5534,6 +7520,12 @@ static void game_init(void)
      * as each one comes round: clearing both up front would write the buffer
      * the scanout is reading right now and tear the picture. */
     clear_pending = 2;
+    /* Same story for the gutters: this run may land on a different stage with
+     * different widgets, and the frames before it carried the menu.  Dropping
+     * the ledger's validity arms every band once per buffer. */
+    hud_sig_valid = 0u;
+    hud_sig[HUD_SIG_STRESS] = 0u;
+    bt_drop_peak = 0u;
     fx_cursor = 0; player_pose = 0;
     for (int i = 0; i < 16; i++) visual_fx[i].active = 0;
     for (int i = 0; i < MAX_PARTICLES; i++) game_particles[i].life = 0;
@@ -5542,7 +7534,8 @@ static void game_init(void)
     /* Task 05 & Task 07: Scanout Bloom for zero-bandwidth glow on all bullets and lasers.
      * Threshold 120 and intensity 255 with emissive extraction ensures rich radiant halos
      * on bullets, lasers, and sparks with zero background fogging/graying. */
-    gpu2d_set_bloom(1, 120, 255);
+    gpu2d_set_bloom(bloom_fx_on, BLOOM_THRESHOLD, BLOOM_INTENSITY);
+    gpu2d_set_bloom_style(bloom_style_sel);
     gpu2d_set_color_matrix(COLOR_MATRIX_BYPASS, 0);
     gpu2d_set_alpha(1, 255);
     pool_clear();
@@ -5625,6 +7618,72 @@ static void game_init(void)
     gpu2d_flush_dcache();
 }
 
+static void stress_stage_init(void)
+{
+    game_init();
+    is_stress_stage = 1;
+    stress_target = STRESS_STORM_TARGET;
+    stress_prev_y = 0xFFu;    /* release the entry chord before changing load */
+
+    /* Zero-delay direct to BOSS fight (Task 11) */
+    gpu2d_set_colorkey(1, MAGENTA_KEY);
+    gpu2d_set_alpha(1, 255);
+    stage_banner = 0;          /* no stage intro banner */
+    spawn_timer  = 0;          /* start spawning minions immediately */
+    wave         = 1;          /* Volcano boss (ART_BOSS) */
+    wave_max     = 9999;       /* Minion quota */
+    kills        = 0;
+    stage_bg_active = SB_STAGE_LAVA; /* Volcano stage weather (rising volcanic ash) */
+
+    /* Task 12: */
+    weapon       = W_LASER;
+    weapon_level = WEAPON_MAX_LEVEL;
+    atk          = ATK_MAX;
+    fire_cd      = STRESS_FIRE_CD;
+    bomb_charge  = BOMB_MAX_CHARGE;
+    stress_storm_step = 0;
+
+    for (int i = 0; i < MAX_ENEMIES; i++) enemies[i].flags = 0;
+    spawn_enemy(ENEMY_FAIRY, GAME_LEFT + 100, 80);
+    spawn_enemy(ENEMY_TURRET, GAME_LEFT + 260, 110);
+    spawn_enemy(ENEMY_SHARD, GAME_RIGHT - 260, 90);
+    spawn_enemy(ENEMY_MINION, GAME_RIGHT - 100, 120);
+
+    /* Boss setup: 0 delay, battle ready at station */
+    boss_state   = BOSS_FIGHT; /* ??????????? skip BOSS_DIALOG & BOSS_ENTER straight to BOSS_FIGHT */
+    dialog_line  = 0;
+    dialog_timer = 0;
+    dialog_grace = 0;
+    dialog_was_active = 0;
+
+    boss_x        = (int16_t)((GAME_LEFT + GAME_RIGHT) / 2 - 32);
+    boss_y        = 88;        /* Directly at battle position */
+    boss_target_x = boss_x;
+    boss_target_y = 88;
+    boss_hp_max   = 600;
+    boss_hp       = boss_hp_max;
+    boss_hp_shown = boss_hp;
+    boss_pat_timer = 45;
+    boss_fire_timer = 20;
+    boss_pattern  = PAT_FAN;
+    boss_prev_pat = PAT_FAN;
+    boss_move_timer = 45;
+    boss_card_active = 0;
+    boss_freeze_timer = 0;
+    boss_shake   = 0;
+
+    player_x = (int16_t)((GAME_LEFT + GAME_RIGHT) / 2);
+    player_y = GAME_TOP + (GAME_BOTTOM - GAME_TOP) * 2 / 3;
+
+    damage_plate[0] = 0;
+    damage_plate[1] = 0;
+    border_plate[0] = 0;
+    border_plate[1] = 0;
+
+    telemetry_write();
+    gpu2d_flush_dcache();
+}
+
 /* ------------------------------------------------------------------ */
 
 /* Wipe whatever the previous screen mode left behind, once per buffer.  The
@@ -5685,6 +7744,17 @@ static void clear_frame(uint32_t fb)
 
 static void game_update(gamepad_state_t *pad)
 {
+    if (is_stress_stage && pad->btn_y &&
+        (!stress_prev_y || ++stress_load_hold >= 37u)) {
+        stress_load_hold = 0;
+        stress_target = stress_target >= STRESS_STORM_MAX ? STRESS_STORM_TARGET :
+                        stress_target + 128u > STRESS_STORM_MAX ? STRESS_STORM_MAX : stress_target + 128u;
+        hud_sig[HUD_SIG_STRESS] = 0u;
+        bt_drop_peak = 0u;
+    }
+    stress_prev_y = pad->btn_y;
+    if (!pad->btn_y) stress_load_hold = 0;
+
     /* ---- game over (only when infinite respawn is switched off) -------- */
     if (game_over) {
         if (restart_timer) {
@@ -5699,6 +7769,14 @@ static void game_update(gamepad_state_t *pad)
         game_exit_request = 1;
         return;
     }
+
+    /* Every walk over a pool in this frame - the barrage top-up below,
+     * bullets_update(), bucket_build() inside game_render(), the telemetry
+     * counters - runs to a bound this rebuilds from the pools themselves.
+     * It has to happen before the first of them, and it is here rather than
+     * at the top of the function so the game-over branch above, which walks
+     * nothing, does not pay for it. */
+    pool_bounds_rebuild();
 
     frame_tick++;
     visual_step(pad);
@@ -5764,7 +7842,12 @@ static void game_update(gamepad_state_t *pad)
     /* ---- shooting ---- */
     if (pad->btn_x) {
         if (fire_timer == 0) {
-            player_fire();
+            /* Task 12: the pressure stage fires all three streams at once.
+             * The branch is here rather than inside player_fire() so that the
+             * campaign's shot table cannot be reached by a stray flag, and the
+             * pressure table cannot be reached from a normal run. */
+            if (is_stress_stage) stress_player_fire();
+            else                 player_fire();
             fire_timer = (uint16_t)(fire_cd + (jam_timer ? 4u : 0u));
         } else {
             fire_timer--;
@@ -5776,11 +7859,41 @@ static void game_update(gamepad_state_t *pad)
 
     /* ---- world ---- */
     wave_update();
+    /* Task 12: the boss is held at full health, and that single line is what
+     * three separate requirements hang off:
+     *
+     *   * it cannot die - and a boss's death throws the entire screen of
+     *     shots away (see the BOSS_DYING arm of boss_update), which is
+     *     precisely the field-clearing this stage must never do;
+     *   * the two spell-card thresholds it would cross on the way down are
+     *     never crossed, so the field is never frozen and the backdrop is
+     *     never swapped for the card's own sky - that is the OTHER stages'
+     *     set piece, and here it would both stop the barrage for a beat and
+     *     take the snow-capped volcano off the screen;
+     *   * the health bar reads as the constant the card asks for.
+     *
+     * Restored BEFORE boss_update() so that none of its checks can see a
+     * damaged bar in the first place. */
+    if (is_stress_stage) boss_hp = boss_hp_max;
     boss_update();
     enemies_update();
     bullets_update();
+    /* Top the storm up AFTER the cull, not before it.  The old order measured
+     * the pool at the previous frame's end, spawned up to the target, and only
+     * then let bullets_update() retire this frame's leavers, so in steady
+     * state the published population sat one cull behind the LOAD target:
+     * at LOAD 8000 the HUD read 7985-7995 and never the round number the
+     * operator dialled in.  Measuring the pool after the cull makes `room`
+     * the real deficit, so the frame that is published holds the target. */
+    if (is_stress_stage) stress_storm_update();
     items_update();
     particles_update();
+    /* ... and once more now that the world has run.  The first restore keeps
+     * the boss's own decisions honest; this one keeps the BAR honest.  Without
+     * it the craft's fire takes a handful of points off inside bullets_update()
+     * and the bar telemetry publishes is whatever survived that frame - a bar
+     * that twitches between 600 and 592 and never settles. */
+    if (is_stress_stage) boss_hp = boss_hp_max;
 
     /* ---- the opener's laser columns, while they stand ------------------- */
     if (boss_laser) {
@@ -6011,6 +8124,51 @@ int main(void)
 {
     diag_init();
     gpu2d_init();
+
+    /* ---- blank the framebuffer before the boot decode --------------------
+     * The scanout started reading FRAME_BASE_ADDR the moment it came out of
+     * reset, and DDR does not power up zeroed.  Everything from here to the
+     * first menu frame - the three 1366x768 plates alone are 3.1 M pixels
+     * decoded on a core with no multiplier - leaves the screen showing whatever
+     * bytes are in DDR.  On a cold start that is noise; on a re-configuration
+     * with the rail still up it is the previous run's picture.  Either way it is
+     * the "corrupted at power-on and then it clears itself" the board shows, and
+     * it lasts as long as the boot takes.
+     *
+     * FRONT cannot simply be cleared: it is the buffer the scanout is reading,
+     * and the engine is not allowed to write that one (the workbench fails the
+     * boot on exactly that - check_owner).  So point the scanout at BACK first
+     * with RIGHT_NEXT only - LEFT_NEXT is deliberately left alone, because the
+     * menu loop's first handshake reads RIGHT_ACTIVE and a left-channel publish
+     * would both break that handshake and, in the workbench, count as a frame
+     * published before the firmware has drawn anything.  With BACK live, FRONT
+     * is idle, gets blanked, and the scanout is pointed back at it, so the
+     * machine is left in exactly the state reset put it in.
+     *
+     * The right half of the screen shows BACK's residue for the one frame this
+     * takes.  BACK is repainted whole by the first menu frame, so it is never
+     * cleared here.
+     *
+     * Safe this early because the SoC's own reset is gated on
+     * (!pll_locked || !cal_done) in rtl/ti60_top.v: the engine and the DDR
+     * controller are both live and calibrated before any of this runs.
+     * The guard is not a timeout for the normal case - it is there so a board
+     * with no pixel clock cannot trap the firmware here forever. */
+    GPU2D_REG_FRAME_NEXT = FB_RIGHT_BACK;
+    {
+        uint32_t guard = 4000000u;
+        while ((GPU2D_REG_LEFT_ACTIVE != FB_RIGHT_BACK ||
+                GPU2D_REG_RIGHT_ACTIVE != FB_RIGHT_BACK) && guard--) { }
+    }
+    if (frame_wait_free(FB_LEFT_FRONT))
+        gpu2d_fill(FB_LEFT_FRONT, SCREEN_WIDTH, SCREEN_HEIGHT, 0u, SCREEN_STRIDE);
+    gpu2d_wait_idle();
+    GPU2D_REG_FRAME_NEXT = FB_RIGHT_FRONT;
+    {
+        uint32_t guard = 4000000u;
+        while (GPU2D_REG_RIGHT_ACTIVE != FB_RIGHT_FRONT && guard--) { }
+    }
+
     gamepad_init();
     entities_init();
     sprites_build();
@@ -6025,15 +8183,20 @@ int main(void)
      * per-frame gutter repair reads, and the two scanout buffers need it
      * before the first painted frame. */
     bg_paint(MM_VISUAL_BACKGROUND);
-    ebullet_tile_build();
-    ebullet_dirtile_build();   /* needs the socket tiles above */
+    ebullet_dirtile_build();
     laser_bar_build();
-    laser_glow_build();
     lance_build();
     orb_tile_build();
+    missile_tile_build();
     particle_tile_build();
+    /* B1: hand the four bullet tile sets to the scanout, indexed.  After all
+     * four builders, because the palette is built by walking what they drew -
+     * so it tracks them if they change rather than being a second copy of the
+     * same colours that can drift. */
+    bullet_store_build();
     stage_bg_boot();
     burst_frames_build();
+    stress_bg_build();
     card_bg_build();
     gpu2d_flush_dcache();
     gpu2d_set_alpha(1, 255);
@@ -6061,9 +8224,12 @@ int main(void)
     gamepad_state_t pad;
 
     board_set_hud_disable(1);
+    audio_stream_init();
 
     for (;;) {
         int b_edge = 0;
+        set_hb(1u);         /* audio_stream_service() */
+        audio_stream_service();
         /* The engine-idle spin is where a menu pass spends most of its time,
          * and it has to keep watching the pad while it spins - otherwise the
          * drawing of the cards is a 0.36-frame hole in the sampling, which is
@@ -6073,6 +8239,7 @@ int main(void)
 
         /* Publish the previous pass's cost before this one starts - three DDR
          * words a frame, nothing next to what the pass itself spends. */
+        set_hb(0u);         /* frame bookkeeping + diag */
         {
             uint32_t now = GPU2D_REG_CORE_TICKS;
             tlm[TLM_FRAME_CYC] = profile_elapsed(frame_mark, now);
@@ -6109,7 +8276,8 @@ int main(void)
          * The sprite stress demo drives its own frame counter and wants the
          * tick. */
         if (screen_state == SCREEN_MENU)         menu_wait_vsync();
-        else if (screen_state == SCREEN_GAME)    { /* handshake only */ }
+        else if (screen_state == SCREEN_GAME ||
+                 screen_state == SCREEN_STRESS_STAGE) { /* handshake only */ }
         else if (screen_state == SCREEN_BITBLT)  { /* handshake only */ }
         else                                     gpu2d_wait_vsync();
 
@@ -6166,6 +8334,9 @@ int main(void)
             int go_up   = (menu_edge_latch & MENU_EDGE_Y) != 0 || repeat < 0;
             int go_down = (menu_edge_latch & MENU_EDGE_A) != 0 || repeat > 0;
             int enter   = (menu_edge_latch & (MENU_EDGE_X | MENU_EDGE_OK)) != 0;
+            int a_edge  = (menu_edge_latch & MENU_EDGE_A) != 0;
+            int b_edge  = (menu_edge_latch & MENU_EDGE_B) != 0;
+            int y_edge  = (menu_edge_latch & MENU_EDGE_Y) != 0;
             menu_edge_latch = 0;    /* this decision consumes every edge in it */
 
             /* Two cards: wrap around at both ends.  Up and down stay separate
@@ -6179,18 +8350,16 @@ int main(void)
                 menu_sel = (menu_sel + 1) % MENU_ITEMS;
 
             if (enter) {
-                /* HOLD Y + X still jumps straight to the sprite stress demo;
-                 * otherwise each row maps to its own screen.  Rows that have
-                 * nothing behind them yet stay on the menu, which is why the
-                 * mapping is a switch and not arithmetic on menu_sel. */
-                /* HOLD Y + X still jumps straight to the sprite stress demo
-                 * (v6 reached it the same way, off a held Y), and the two
-                 * cards map to their own screens.  A switch rather than
-                 * SCREEN_BITBLT + menu_sel, which v6 used: the arithmetic
-                 * silently invents a third screen the moment a row is added. */
                 int want = -1;
-                if (pad.btn_y) {
+                uint32_t raw_btns = GPU2D_REG_GAMEPAD_BTN;
+                int y_held = pad.btn_y || ((raw_btns >> GPU2D_BTN_BIT_Y) & 1u) || y_edge || (menu_btn_prev & 1u);
+                int a_held = pad.btn_a || ((raw_btns >> GPU2D_BTN_BIT_A) & 1u) || a_edge || ((menu_btn_prev >> 1) & 1u);
+                int b_held = pad.btn_b || ((raw_btns >> GPU2D_BTN_BIT_B) & 1u) || b_edge || ((menu_btn_prev >> 4) & 1u);
+
+                if (y_held) {
                     want = SCREEN_STRESS;
+                } else if (a_held || b_held) {
+                    want = SCREEN_STRESS_STAGE;
                 } else {
                     switch (menu_sel) {
                     case 0: want = SCREEN_BITBLT; break;
@@ -6200,15 +8369,22 @@ int main(void)
                 if (want >= 0) {
                     screen_state = want;
                     board_set_hud_disable(screen_state != SCREEN_BITBLT);
-                    resync_scanout(&left_back, &right_back);
+                    resync_scanout(&left_back, &right_back, 0);
                     cpu_running = 0;
                     if (screen_state == SCREEN_GAME) {
+                        is_stress_stage = 0;
                         game_init();
                         sim_acc  = 0u;
                         sim_last = GPU2D_REG_CORE_TICKS;
+                    } else if (screen_state == SCREEN_STRESS_STAGE) {
+                        stress_stage_init();
+                        sim_acc  = 0u;
+                        sim_last = GPU2D_REG_CORE_TICKS;
                     }
-                    if (screen_state == SCREEN_STRESS)
+                    if (screen_state == SCREEN_STRESS) {
+                        is_stress_stage = 0;
                         stress_init();
+                    }
                     menu_stick_dir = 0; menu_stick_cd = 0;
                     prev_b = 1;
                     continue;
@@ -6218,14 +8394,14 @@ int main(void)
             /* The wait for the scanout to release the back buffer is dead
              * time as far as the pad is concerned - and it is most of the
              * pass.  Sample all the way through it. */
-            while (GPU2D_REG_RIGHT_ACTIVE == right_back) {
-                menu_sample();
-            }
+            if (menu_last_sel == menu_sel) continue;
+            if (!frame_wait_free(right_back)) continue;
             draw_menu(right_back, menu_sel);
-            menu_wait_idle();
+            gpu2d_wait_idle();
+            if (gpu2d_stalled) continue;
             gpu2d_flush_dcache();
-            GPU2D_REG_RIGHT_NEXT = right_back;
-            GPU2D_REG_LEFT_NEXT  = right_back;
+            GPU2D_REG_FRAME_NEXT = right_back;
+            menu_last_sel = menu_sel;
             right_back ^= 0x00600000u;
             continue;
         }
@@ -6237,19 +8413,27 @@ int main(void)
         {
             b_edge = (pad.btn_b && !prev_b);
             prev_b = pad.btn_b;
-            /* board keys stay an unconditional escape hatch; inside the game B
-             * now opens the settings menu instead of quitting the run */
+            /* The two board keys are an unconditional escape hatch, and B is
+             * one only inside the two DEMOS - the BitBlt bench and the sprite
+             * stress scene - because neither of them has a pause of its own.
+             * The bullet-hell stage and the pressure stage are the same loop,
+             * and both own a pause menu, so B opens that rather than dropping
+             * the run.  (It used to quit the pressure stage outright, which is
+             * why that stage had no way to pause at all.) */
             if (board_get_sw0() || board_get_sw2() ||
-                ((screen_state == SCREEN_BITBLT || screen_state == SCREEN_STRESS) && b_edge)) {
+                ((screen_state == SCREEN_BITBLT ||
+                  screen_state == SCREEN_STRESS) && b_edge)) {
                 if (screen_state == SCREEN_STRESS) {
                     gpu2d_set_colorkey(1, MAGENTA_KEY);
                     gpu2d_set_alpha(1, 255);
                 }
                 screen_state = SCREEN_MENU;
+                is_stress_stage = 0;
                 gpu2d_set_bloom(0, 0, 0);
                 gpu2d_set_color_matrix(COLOR_MATRIX_BYPASS, 0);
                 paused = 0;
-                resync_scanout(&left_back, &right_back);
+                boss_card_active = 0;
+                resync_scanout(&left_back, &right_back, 1);
                 menu_edge_reset();
                 board_set_hud_disable(1);
                 continue;
@@ -6258,11 +8442,10 @@ int main(void)
 
         if (screen_state == SCREEN_STRESS) {
             stress_input(&pad);
-            while (GPU2D_REG_RIGHT_ACTIVE == right_back) {
-            }
+            if (!frame_wait_free(right_back)) continue;
             if (stress_frame(right_back)) {
-                GPU2D_REG_RIGHT_NEXT = right_back;
-                GPU2D_REG_LEFT_NEXT = right_back;
+                if (gpu2d_stalled) continue;
+                GPU2D_REG_FRAME_NEXT = right_back;
                 right_back ^= 0x00600000u;
             }
         } else if (screen_state == SCREEN_BITBLT) {
@@ -6270,23 +8453,25 @@ int main(void)
              * cpu_left_step() for why it is here and not after the BitBlt
              * pass, which is what made the right half miss every second
              * display frame. */
-            while (GPU2D_REG_RIGHT_ACTIVE == right_back) {
+            uint32_t hs_guard = 2000000u;
+            while (GPU2D_REG_RIGHT_ACTIVE == right_back && --hs_guard) {
                 cpu_left_step(&left_back);
             }
+            if (!hs_guard) continue;
 
             /* ---- FPGA accelerated right half ------------------------- */
-            gpu2d_fill(right_back + 2560, SCAN_RIGHT_PIXELS, SCREEN_HEIGHT, 0x00000000u, SCREEN_STRIDE);
+            gpu2d_fill(right_back + SCAN_HALF_BYTES, SCAN_RIGHT_PIXELS, SCREEN_HEIGHT, 0x00000000u, SCREEN_STRIDE);
 
             for (int i = 0; i < NUM_ENTITIES; i++) {
                 int fx = ((int)entities[i].x * (int)SCAN_RIGHT_PIXELS) / (int)SCAN_HALF_PIXELS;
-                uint32_t dst = right_back + 2560u +
+                uint32_t dst = right_back + SCAN_HALF_BYTES +
                                (uint32_t)(entities[i].y * SCREEN_STRIDE) +
                                (uint32_t)(fx * 4);
                 gpu2d_fill(dst, (uint32_t)entities[i].w, (uint32_t)entities[i].h,
                            entities[i].color, SCREEN_STRIDE);
             }
 
-            gpu2d_blit_sprite(right_back + 2560u + ((SCREEN_HEIGHT - 120u) * SCREEN_STRIDE) +
+            gpu2d_blit_sprite(right_back + SCAN_HALF_BYTES + ((SCREEN_HEIGHT - 120u) * SCREEN_STRIDE) +
                                   ((SCAN_RIGHT_PIXELS - 120u) * 4u),
                               MM_BOSS_SPRITE, MM_BOSS_SPRITE_W, MM_BOSS_SPRITE_H,
                               MM_BOSS_SPRITE_STRIDE, SCREEN_STRIDE);
@@ -6309,14 +8494,18 @@ int main(void)
                  * assumed - a frame dropped here cannot be recovered by making
                  * the renderer faster. */
                 uint32_t hs0 = GPU2D_REG_CORE_TICKS;
-                while (GPU2D_REG_RIGHT_ACTIVE == right_back) {
-                }
+                if (!frame_wait_free(right_back)) continue;
                 tlm[TLM_P_LOOPHS] = profile_elapsed(hs0, GPU2D_REG_CORE_TICKS);
             }
 
             if (b_edge) {                       /* B toggles the settings menu */
                 paused = (uint8_t)(paused ^ 1);
                 settings_sel = 0;
+                /* Opening the menu must not read the pad that opened it, nor
+                 * anything else the player is holding: re-base the edge
+                 * detector on the buttons as they are at this instant, the same
+                 * way menu_edge_reset() does for the boot menu. */
+                settings_edge_reset(&pad);
                 /* The settings panel paints over the frame, border columns
                  * included, so the next unpaused frame has to put them back. */
                 border_plate[0] = 0;
@@ -6334,15 +8523,19 @@ int main(void)
                  * below then repays at LOGIC_MAX_STEPS a pass for minutes on
                  * end - the craft flies at 4x and the one-frame damage trail
                  * reads as a permanent smear.  profile_elapsed() unwraps it. */
-                if (!paused) sim_acc += profile_elapsed(sim_last, now);
-                sim_last = now;
-                /* Spiral-of-death guard: clamp accumulated simulation debt to at
-                 * most 2 logic steps (~26.6ms). If a frame drop or stall occurs,
-                 * drop excess time so the player character never accelerates to
-                 * 400% speed ("飞奔") paying off a massive backlog. */
-                if (sim_acc > 2u * LOGIC_STEP_CYCLES) {
-                    sim_acc = 2u * LOGIC_STEP_CYCLES;
+                if (!paused) {
+                    sim_acc += profile_elapsed(sim_last, now);
+                    /* The board's 75.28 Hz HDMI scanout frame is 1,328,357 core
+                     * ticks (85.714 MHz / (1456 * 782)), 4,976 ticks short of
+                     * LOGIC_STEP_CYCLES (1,333,333).  Passing the RIGHT_ACTIVE
+                     * handshake above guarantees a full VSync elapsed, so floor
+                     * at one step to prevent 37.6 Hz alternating skipped updates. */
+                    if (sim_acc < LOGIC_STEP_CYCLES)
+                        sim_acc = LOGIC_STEP_CYCLES;
+                    else if (sim_acc > 2u * LOGIC_STEP_CYCLES)
+                        sim_acc = 2u * LOGIC_STEP_CYCLES;
                 }
+                sim_last = now;
             }
 
             /* Every panel that paints into the framebuffer this pass declares its
@@ -6354,13 +8547,22 @@ int main(void)
                     paused = 0;
                 } else if (act == ACT_EXIT) {
                     screen_state = SCREEN_MENU;
+                    is_stress_stage = 0;
                     gpu2d_set_bloom(0, 0, 0);
                     gpu2d_set_color_matrix(COLOR_MATRIX_BYPASS, 0);
                     paused = 0;
                     boss_card_active = 0;
-                    resync_scanout(&left_back, &right_back);
+                    resync_scanout(&left_back, &right_back, 1);
                     menu_edge_reset();
                     board_set_hud_disable(1);
+                    continue;
+                } else if (act == ACT_STRESS_STAGE) {
+                    paused = 0;
+                    screen_state = SCREEN_STRESS_STAGE;
+                    stress_stage_init();
+                    resync_scanout(&left_back, &right_back, 0);
+                    sim_acc  = 0u;
+                    sim_last = GPU2D_REG_CORE_TICKS;
                     continue;
                 }
                 clear_frame(right_back);        /* a wipe may still be owed */
@@ -6379,12 +8581,15 @@ int main(void)
                  * burst, so a pathologically slow frame loses time instead of
                  * paying it back by running even slower. */
                 unsigned sim_steps = 0u;
+                unsigned max_steps = is_stress_stage ? 1u : LOGIC_MAX_STEPS;
                 while (sim_acc >= LOGIC_STEP_CYCLES &&
-                       sim_steps < LOGIC_MAX_STEPS) {
+                       sim_steps < max_steps) {
                     game_update(&pad);
                     sim_acc -= LOGIC_STEP_CYCLES;
                     sim_steps++;
                 }
+                if (is_stress_stage) sim_acc = 0u;
+                set_hb(4u);         /* render */
                 game_render_pass(right_back);
                 if (game_exit_request) {
                     /* the run ended (infinite respawn off): progress is already
@@ -6392,10 +8597,11 @@ int main(void)
                     game_exit_request = 0;
                     paused = 0;
                     boss_card_active = 0;
+                    is_stress_stage = 0;
                     screen_state = SCREEN_MENU;
                     gpu2d_set_bloom(0, 0, 0);
                     gpu2d_set_color_matrix(COLOR_MATRIX_BYPASS, 0);
-                    resync_scanout(&left_back, &right_back);
+                    resync_scanout(&left_back, &right_back, 1);
                     menu_edge_reset();
                     board_set_hud_disable(1);
                     continue;
@@ -6410,8 +8616,8 @@ int main(void)
              * the gate opens - which is what the skills and impact
              * scenarios do. */
             telemetry_write();
-            GPU2D_REG_RIGHT_NEXT = right_back;
-            GPU2D_REG_LEFT_NEXT  = right_back;
+            if (gpu2d_stalled) continue;
+            GPU2D_REG_FRAME_NEXT = right_back;
             right_back ^= 0x00600000u;
         }
     }

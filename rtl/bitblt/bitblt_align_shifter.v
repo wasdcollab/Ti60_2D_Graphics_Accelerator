@@ -40,6 +40,21 @@ module bitblt_align_shifter #(
     // at the default of 2 the FIFO refuses the extra beats and the
     // master's queue stays empty.  Made a parameter so the effect can
     // be measured before anything is committed to it.
+    //
+    // DO NOT RAISE IT.  2 is this structure's ceiling, not a conservative
+    // starting point: pops can only run to need + 1, and need contains
+    // PREFETCH_BEATS, so a row that can only deliver row_beats reads gets
+    // pop_limit < need, beat_valid never rises, the write never issues, the
+    // row never completes, and the engine stops on its FIRST command - a
+    // timeout whose symptom says nothing about the parameter that caused it.
+    // Measured: an 8x8 OP_COPY completes with 2 and times out with 8.
+    //
+    // What a real fix would have to do: the pop limit must not be able to
+    // outrun what the current row can deliver, i.e. it has to be capped at
+    // need when the look-ahead cannot be met.  That cap changes the FIFO's
+    // occupancy and therefore the read/write overlap the read master was
+    // measured for (bench qmax), so it needs the full BitBlt regression and
+    // a board re-measure - not a one-line edit.
     parameter integer PREFETCH_BEATS = 2
 )(
     input  wire                     clk,

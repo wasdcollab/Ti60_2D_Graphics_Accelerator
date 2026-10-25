@@ -18,28 +18,151 @@ wire awvalid,wvalid,wlast,bready; reg awready=0,wready=0,bvalid=0;
 wire [127:0] wdata; wire [15:0] wstrb;
 wire [27:0] next_base; reg [27:0] active=28'h1000000; reg vsync=0;
 
-bitblt_top dut(
-    .clk(clk), .rst_n(rst_n),
-    .apb_paddr(pa), .apb_psel(ps), .apb_penable(pe), .apb_pwrite(pw), .apb_pwdata(pd),
-    .apb_prdata(pr), .apb_pready(pre), .apb_pslverr(per),
-    
-    // AXI Read
-    .m_axi_arid(arid), .m_axi_araddr(araddr), .m_axi_arlen(arlen), .m_axi_arsize(arsize),
-    .m_axi_arburst(arburst), .m_axi_arlock(arlock), .m_axi_arvalid(arvalid), .m_axi_arready(arready),
-    .m_axi_rid(rid), .m_axi_rdata(rdata), .m_axi_rresp(rresp), .m_axi_rlast(rlast),
-    .m_axi_rvalid(rvalid), .m_axi_rready(rready),
-    
-    // AXI Write
-    .m_axi_awid(awid), .m_axi_awaddr(awaddr), .m_axi_awlen(awlen), .m_axi_awsize(awsize),
-    .m_axi_awburst(awburst), .m_axi_awlock(awlock), .m_axi_awvalid(awvalid), .m_axi_awready(awready),
-    .m_axi_wid(wid), .m_axi_wdata(wdata), .m_axi_wstrb(wstrb), .m_axi_wlast(wlast),
-    .m_axi_wvalid(wvalid), .m_axi_wready(wready), .m_axi_bid(4'd2), .m_axi_bvalid(bvalid),
-    .m_axi_bready(bready),
-    
-    .vdma_next_base(next_base), .vdma_active_base(active), .vdma_right_active_base(active),
-    .vdma_right_next_base(), .cpu_fps_bcd(), .fpga_fps_bcd(), .scan_diagnostics(32'd0),
-    .vsync_flag(vsync)
-);
+    wire        cmd_start;
+    wire [1:0]  cmd_op_type;
+    wire [27:0] cmd_dst_addr;
+    wire [27:0] cmd_src_addr;
+    wire [10:0] cmd_rect_w;
+    wire [10:0] cmd_rect_h;
+    wire [31:0] cmd_color;
+    wire [15:0] cmd_src_stride;
+    wire [15:0] cmd_dst_stride;
+    wire        cmd_colorkey_en;
+    wire [31:0] cmd_colorkey_val;
+    wire        cmd_alpha_en;
+    wire [7:0]  cmd_global_alpha;
+    wire        cmd_busy;
+    wire        engine_timeout;
+    wire [3:0]  probe_q_cnt;
+    wire        probe_ar_pend;
+    wire [1:0]  probe_sg_state;
+
+    apb_command_dispatcher #(
+        .CLOCK_HZ (100_000_000)
+    ) u_dispatcher (
+        .clk                    (clk),
+        .rst_n                  (rst_n),
+        .apb_paddr              (pa),
+        .apb_psel               (ps),
+        .apb_penable            (pe),
+        .apb_pwrite             (pw),
+        .apb_pwdata             (pd),
+        .apb_prdata             (pr),
+        .apb_pready             (pre),
+        .apb_pslverr            (per),
+        .cmd_start              (cmd_start),
+        .cmd_op_type            (cmd_op_type),
+        .cmd_dst_addr           (cmd_dst_addr),
+        .cmd_src_addr           (cmd_src_addr),
+        .cmd_rect_w             (cmd_rect_w),
+        .cmd_rect_h             (cmd_rect_h),
+        .cmd_color              (cmd_color),
+        .cmd_src_stride         (cmd_src_stride),
+        .cmd_dst_stride         (cmd_dst_stride),
+        .cmd_colorkey_en        (cmd_colorkey_en),
+        .cmd_colorkey_val       (cmd_colorkey_val),
+        .cmd_alpha_en           (cmd_alpha_en),
+        .cmd_global_alpha       (cmd_global_alpha),
+        .cmd_busy               (cmd_busy),
+        .engine_timeout         (engine_timeout),
+        .diag_rd_q_cnt          (probe_q_cnt),
+        .diag_rd_ar_pend        (probe_ar_pend),
+        .diag_sg_state          (probe_sg_state),
+        .vdma_next_base         (next_base),
+        .vdma_right_next_base   (),
+        .vdma_active_base       (active),
+        .vdma_right_active_base (active),
+        .cpu_fps_bcd            (),
+        .fpga_fps_bcd           (),
+        .scan_diagnostics       (32'd0),
+        .vsync_flag             (vsync),
+        .gamepad_joy_x          (8'd0),
+        .gamepad_joy_y          (8'd0),
+        .gamepad_buttons        (5'd0),
+        .gamepad_online         (1'b0),
+        .key_sw0_level          (1'b0),
+        .key_sw2_level          (1'b0),
+        .key_sw0_pulse          (1'b0),
+        .key_sw2_pulse          (1'b0),
+        .i2c_slave_addr         (),
+        .force_hud_disable      (),
+        .weather_ctrl           (),
+        .weather_mask_x         (),
+        .weather_mask_y         (),
+        .laser_colx_lo          (),
+        .laser_colx_hi          (),
+        .laser_colx             (),
+        .beam_x                 (),
+        .beam_len               (),
+        .beam_en                (),
+        .hair_x                 (),
+        .hair_out               (),
+        .hair_lft               (),
+        .hair_mid               (),
+        .bucket_base            (),
+        .btile_addr             (),
+        .btile_data             (),
+        .btile_we               (),
+        .bpal_data              (),
+        .bpal_addr              (),
+        .bpal_we                (),
+        .color_matrix_ctrl      (),
+        .bloom_ctrl             ()
+    );
+
+    bitblt_top dut (
+        .clk                    (clk),
+        .rst_n                  (rst_n),
+        .cmd_start              (cmd_start),
+        .cmd_op_type            (cmd_op_type),
+        .cmd_dst_addr           (cmd_dst_addr),
+        .cmd_src_addr           (cmd_src_addr),
+        .cmd_rect_w             (cmd_rect_w),
+        .cmd_rect_h             (cmd_rect_h),
+        .cmd_color              (cmd_color),
+        .cmd_src_stride         (cmd_src_stride),
+        .cmd_dst_stride         (cmd_dst_stride),
+        .cmd_colorkey_en        (cmd_colorkey_en),
+        .cmd_colorkey_val       (cmd_colorkey_val),
+        .cmd_alpha_en           (cmd_alpha_en),
+        .cmd_global_alpha       (cmd_global_alpha),
+        .cmd_busy               (cmd_busy),
+        .engine_timeout         (engine_timeout),
+        .probe_q_cnt            (probe_q_cnt),
+        .probe_ar_pend          (probe_ar_pend),
+        .probe_sg_state         (probe_sg_state),
+        .m_axi_arid             (arid),
+        .m_axi_araddr           (araddr),
+        .m_axi_arlen            (arlen),
+        .m_axi_arsize           (arsize),
+        .m_axi_arburst          (arburst),
+        .m_axi_arlock           (arlock),
+        .m_axi_arvalid          (arvalid),
+        .m_axi_arready          (arready),
+        .m_axi_rid              (rid),
+        .m_axi_rdata            (rdata),
+        .m_axi_rresp            (rresp),
+        .m_axi_rlast            (rlast),
+        .m_axi_rvalid           (rvalid),
+        .m_axi_rready           (rready),
+        .m_axi_awid             (awid),
+        .m_axi_awaddr           (awaddr),
+        .m_axi_awlen            (awlen),
+        .m_axi_awsize           (awsize),
+        .m_axi_awburst          (awburst),
+        .m_axi_awlock           (awlock),
+        .m_axi_awvalid          (awvalid),
+        .m_axi_awready          (awready),
+        .m_axi_wid              (wid),
+        .m_axi_wdata            (wdata),
+        .m_axi_wstrb            (wstrb),
+        .m_axi_wlast            (wlast),
+        .m_axi_wvalid           (wvalid),
+        .m_axi_wready           (wready),
+        .m_axi_bid              (4'd2),
+        .m_axi_bvalid           (bvalid),
+        .m_axi_bready           (bready)
+    );
 
     // v2 engine: AXI bursts are no longer clamped to 16 beats
     // (see bitblt_stride_gen MAX_BURST_BEATS, default 64).

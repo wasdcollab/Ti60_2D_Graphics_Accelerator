@@ -30,11 +30,11 @@
 // INIT_FILE is one hex byte per line.  $readmemh loads one array element per
 // line, so a packed line would load a 32-bit value into an 8-bit element.
 // =============================================================================
-`include "bg_rle_path.vh"
+`include "asset_rom_path.vh"
 
 module bitblt_asset_rom #(
-    parameter         INIT_FILE  = `BG_ROM_INIT_FILE,
-    parameter integer ROM_BYTES  = 12313,
+    parameter         INIT_FILE  = `ASSET_ROM_INIT_FILE,
+    parameter integer ROM_BYTES  = 16384,
     parameter integer ADDR_WIDTH = 14
 )(
     input  wire                  clk,

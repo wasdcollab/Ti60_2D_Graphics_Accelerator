@@ -1,0 +1,6 @@
+PASS buffer=0 pb=0 eb=1088 drops=0 cycles=1441973
+PASS buffer=1 pb=0 eb=1079 drops=0 cycles=1437766
+PASS buffer=0 pb=0 eb=0 drops=0 cycles=870226
+PASS buffer=1 pb=0 eb=0 drops=0 cycles=870226
+PASS BOARD CONTENTION: 1088 load, serialized slow B, video priority, live tables and stale clears
+tests/tb_bucket_coprocessor_axi.sv:517: $finish called at 46202030000 (1ps)

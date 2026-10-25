@@ -107,7 +107,7 @@
     "encoded_bytes": 13,
     "palette_colors": 32,
     "shared": null,
-    "runtime_overlay": false
+    "runtime_overlay": true
   },
   {
     "name": "heart",

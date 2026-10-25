@@ -1,0 +1,1 @@
+PASS tb_bloom_filter: round halo (tight 7 px, wide 13 px) identical across R/G/B, everything else untouched, bypass clean.

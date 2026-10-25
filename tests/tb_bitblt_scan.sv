@@ -176,6 +176,7 @@ module tb_bitblt_scan;
     reg [31:0] status;
     reg [31:0] probe;
     integer guard;
+    integer n_timeout = 0;
     integer n_ok = 0, n_stall = 0, n_cfg = 0;
     longint t_start, worst = 0;
     localparam integer LIMIT = 1000000;
@@ -209,7 +210,12 @@ module tb_bitblt_scan;
                     n_rd, n_wr, n_ar, n_aw, LAT);
                 $fatal(1, "engine stalled");
             end
-            if (status[2] || status[3]) n_cfg = n_cfg + 1;
+            // bit2 is cfg_error_sticky and bit3 is timeout_sticky; they shared one
+            // counter, so an engine timeout was counted as a CONFIG ERROR, was neither
+            // an ok nor a failure, and the bench still ended with SCAN PASS - the one
+            // outcome this bench exists to catch.
+            if (status[3])      n_timeout = n_timeout + 1;
+            else if (status[2]) n_cfg     = n_cfg + 1;
             else begin
                 n_ok = n_ok + 1;
                 if ((cyc - t_start) > worst) worst = cyc - t_start;
@@ -270,7 +276,14 @@ module tb_bitblt_scan;
         end
         $display("---- B done ok=%0d cfg=%0d worst=%0d ----", n_ok, n_cfg, worst);
 
-        $display("SCAN PASS ok=%0d cfg=%0d stalled=%0d worst=%0d cycles", n_ok, n_cfg, n_stall, worst);
+        $display("SCAN ok=%0d cfg=%0d timeout=%0d stalled=%0d worst=%0d",
+                 n_ok, n_cfg, n_timeout, n_stall, worst);
+        if (n_timeout != 0 || n_cfg != 0 || n_stall != 0) begin
+            $display("SCAN FAIL: timeout=%0d cfg=%0d stalled=%0d",
+                     n_timeout, n_cfg, n_stall);
+            $finish(1);
+        end
+        $display("SCAN PASS ok=%0d worst=%0d cycles", n_ok, worst);
         $finish;
     end
 

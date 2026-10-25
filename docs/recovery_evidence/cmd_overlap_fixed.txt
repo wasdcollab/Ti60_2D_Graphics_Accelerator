@@ -1,0 +1,16 @@
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tests\tb_step3_bitblt_copy.sv:141: warning: Extra digits given for sized hex constant.
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tests\tb_step3_bitblt_copy.sv:142: warning: Extra digits given for sized hex constant.
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tests\tb_step3_bitblt_copy.sv:244: warning: Extra digits given for sized hex constant.
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tests\tb_step3_bitblt_copy.sv:245: warning: Extra digits given for sized hex constant.
+VEC 0 ok op=1 soff=4 doff=12 w=127 h=7 ss=528 ds=544 hash=e62e08f13859c04d
+VEC 1 ok op=1 soff=4 doff=12 w=127 h=7 ss=528 ds=544 hash=e62e08f13859c04d
+AVEC 0 ok p=3 soff=4 doff=12 w=127 h=7 ss=528 ds=544 ga=137 ck=1 key=00ff00ff hash=8d0f2f45d46502bc
+AVEC 1 ok p=3 soff=4 doff=12 w=127 h=7 ss=528 ds=544 ga=137 ck=1 key=00ff00ff hash=8d0f2f45d46502bc
+AVEC 2 ok p=3 soff=4 doff=12 w=127 h=7 ss=528 ds=544 ga=137 ck=1 key=00ff00ff hash=8d0f2f45d46502bc
+AVEC 3 ok p=3 soff=4 doff=12 w=127 h=7 ss=528 ds=544 ga=137 ck=1 key=00ff00ff hash=8d0f2f45d46502bc
+AVEC 4 ok p=3 soff=4 doff=12 w=127 h=7 ss=528 ds=544 ga=137 ck=1 key=00ff00ff hash=4849f54e144b3618
+AVEC 5 ok p=3 soff=4 doff=12 w=127 h=7 ss=528 ds=544 ga=137 ck=1 key=00ff00ff hash=4849f54e144b3618
+AVEC 6 ok p=3 soff=4 doff=12 w=127 h=7 ss=528 ds=544 ga=137 ck=1 key=00ff00ff hash=4849f54e144b3618
+VEC 9 ok op=0 soff=4 doff=12 w=127 h=7 ss=528 ds=544 hash=f1a2dc8ac09a7965
+PASS BitBlt OVERLAP: COPY/FILL/ALPHA/ADD survive next-command APB writes, exact pixels and AXI stalls
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tests\tb_step3_bitblt_copy.sv:930: $finish called at 114060000 (1ps)

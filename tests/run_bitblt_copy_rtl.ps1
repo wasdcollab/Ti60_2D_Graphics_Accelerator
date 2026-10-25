@@ -24,7 +24,7 @@ $projectRoot = Split-Path $PSScriptRoot -Parent
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 $rtl = @(
-    'bitblt_top.v', 'bitblt_apb_regs.v', 'bitblt_stride_gen.v',
+    'bitblt_top.v', '../apb/apb_command_dispatcher.v', 'bitblt_stride_gen.v',
     'bitblt_axi_master.v', 'bitblt_axi_read_master.v',
     'bitblt_read_fifo.v', 'bitblt_align_shifter.v', 'bitblt_alpha_blend.v',
     'bitblt_asset_rom.v'

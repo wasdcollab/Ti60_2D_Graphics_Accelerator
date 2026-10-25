@@ -37,6 +37,8 @@
 module bitblt_axi_master (
     input  wire         clk,
     input  wire         rst_n,
+    input  wire         abort,
+    output wire         busy,
 
     // Burst request interface from stride_gen
     input  wire         burst_req,
@@ -92,6 +94,10 @@ module bitblt_axi_master (
     localparam S_W    = 2'd2;
 
     reg [1:0] state;
+    reg padding, stalled;
+    reg [127:0] stalled_data;
+    reg [15:0] stalled_mask;
+    assign busy = state != S_IDLE;
     reg [7:0] beat_cnt;
 
     reg [7:0]   latch_len;
@@ -113,10 +119,26 @@ module bitblt_axi_master (
     wire [15:0] eff_stream_mask = stream_mask_en ? stream_mask
                                                  : (colorkey_en ? colorkey_mask : 16'hFFFF);
 
-    assign m_axi_wdata  = data_from_fifo ? align_data : latch_data;
-    assign m_axi_wstrb  = data_from_fifo ? (base_wstrb & eff_stream_mask) : base_wstrb;
-    assign m_axi_wvalid = (state == S_W) && data_valid;
-    assign beat_ack     = m_axi_wvalid && m_axi_wready;
+    assign m_axi_wdata  = stalled ? stalled_data : padding ? latch_data : data_from_fifo ? align_data : latch_data;
+    assign m_axi_wstrb  = stalled ? stalled_mask : padding ? 16'd0 : data_from_fifo ? (base_wstrb & eff_stream_mask) : base_wstrb;
+    assign m_axi_wvalid = (state == S_W) && (stalled || padding || data_valid);
+    assign beat_ack     = m_axi_wvalid && m_axi_wready && !padding && !abort;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            padding <= 1'b0;
+            stalled <= 1'b0;
+            stalled_data <= 128'd0;
+            stalled_mask <= 16'd0;
+        end else begin
+            if (state == S_IDLE) padding <= 1'b0;
+            else if (abort && (!m_axi_wvalid || m_axi_wready)) padding <= 1'b1;
+            stalled <= m_axi_wvalid && !m_axi_wready;
+            if (m_axi_wvalid && !m_axi_wready) begin
+                stalled_data <= m_axi_wdata;
+                stalled_mask <= m_axi_wstrb;
+            end
+        end
+    end
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

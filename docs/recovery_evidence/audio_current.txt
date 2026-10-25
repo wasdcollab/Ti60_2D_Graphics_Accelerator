@@ -1,0 +1,24 @@
+Asset ROM: 12313 background bytes + 760 font bytes in 16384 bytes
+rtl/apb/apb_command_dispatcher.v:208: warning: Extra digits given for sized hex constant.
+rtl/apb/apb_command_dispatcher.v:209: warning: Extra digits given for sized hex constant.
+rtl/apb/apb_command_dispatcher.v:252: warning: Extra digits given for sized hex constant.
+rtl/apb/apb_command_dispatcher.v:253: warning: Extra digits given for sized hex constant.
+TB_PASS: PCM FIFO ordering, wrap, full rejection, simultaneous IO, watermark and underflow recovery
+tests/tb_bgm_pcm_fifo.sv:67: $finish called at 37586000 (1ps)
+rtl/apb/apb_command_dispatcher.v:208: warning: Extra digits given for sized hex constant.
+rtl/apb/apb_command_dispatcher.v:209: warning: Extra digits given for sized hex constant.
+rtl/apb/apb_command_dispatcher.v:252: warning: Extra digits given for sized hex constant.
+rtl/apb/apb_command_dispatcher.v:253: warning: Extra digits given for sized hex constant.
+TB_PASS: audio APB isolation, one-write pulses, status, clear, all 760 font bytes
+tests/tb_audio_apb.sv:68: $finish called at 54500000 (1ps)
+......
+----------------------------------------------------------------------
+Ran 6 tests in 0.007s
+
+OK
+TB_PASS: PCM signed endpoints, exact 12 kHz rate, full wrap, disable/restart, reset
+tests/tb_bgm_pcm_rom.sv:58: $finish called at 626091000 (1ps)
+TB_PASS: PCM selected, stereo mix, all volumes, SFX coexistence, enable gates
+tests/tb_game_audio_pcm.sv:58: $finish called at 265840000 (1ps)
+PASS: I2S standard framing and samples verified
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tests\tb_i2s_tx.v:60: $finish called at 4535000 (1ps)

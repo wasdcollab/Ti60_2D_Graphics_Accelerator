@@ -8,7 +8,7 @@ module tb_video_75_timing;
     always #5 axi_clk = ~axi_clk;
 
     video_dma_read dut (
-        .axi_clk(axi_clk), .axi_rst_n(rst_n), .cal_done(1'b0),
+        .axi_clk(axi_clk), .axi_rst_n(rst_n), .cal_done(1'b1),
         .pixel_clk(pixel_clk), .pixel_rst_n(rst_n),
         .next_frame_base_addr(28'h0800000),
         .next_right_base_addr(28'h0e00000),

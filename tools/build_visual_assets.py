@@ -16,38 +16,13 @@ NEAREST = Image.Resampling.NEAREST
 KEY = 0x00FF00FF
 
 
-def mm_const(name):
-    """Read one #define out of sw/driver/memory_map.h.
-
-    The backdrop destination used to be a literal in this file.  When the
-    framebuffer grew to 1366x768 the firmware moved MM_VISUAL_BACKGROUND to
-    0x03800000 (the new surface no longer fits in the old scratch slot) while
-    this generator kept decoding to the old 0x01640000: the backdrop was
-    written to one address and scanned from another, so the boot menu came up
-    over DDR residue.  Read the address from the header the firmware itself
-    uses, so the two cannot drift apart again.
-    """
-    text = (ROOT / 'sw/driver/memory_map.h').read_text(encoding='utf-8',
-                                                    errors='replace')
-    m = re.search(r'^#define\s+%s\s+(0x[0-9A-Fa-f]+)UL' % re.escape(name),
-                  text, re.M)
-    if not m:
-        raise SystemExit('memory_map.h: %s not found' % name)
-    return int(m.group(1), 16)
-
-
 def source(path):
     return Image.open(SRC / path).convert('RGBA')
 
 
-def panel(size):
-    # Kenney's supplied frame, enlarged as a 9-slice (corners never stretched).
-    tile = source('ui/Tiles/Large tiles/Thick outline/tile_0002.png')
-    tile = tile.resize((32, 32), NEAREST)
-    out = Image.new('RGBA', size, (12, 15, 34, 255))
-    w, h = size
-    cuts = (0, 8, 24, 32)
-    xs, ys = (0, 8, w-8, w), (0, 8, h-8, h)
+# panel() and mm_const() used to sit here with no callers: the 9-slice menu
+# panel was replaced by bg_paint(), and the asset destinations are literals in
+# the asset table below because the table is the one place they are read from.
     for y in range(3):
         for x in range(3):
             part = tile.crop((cuts[x], cuts[y], cuts[x+1], cuts[y+1]))
@@ -88,22 +63,12 @@ def font(size):
 PLATE_W, PLATE_H = 1366, 768
 MENU_W, MENU_H = PLATE_W, PLATE_H
 
+# Empty since the plates stopped being bitmaps: labels are drawn by the
+# firmware with the same vector font as the numbers beside them (see the
+# HUD_LABELS.clear() in main() below).  The file is still written as [] so
+# tools/check_hud_layout.py can tell "no labels baked" from "the generator
+# never ran" - that checker carries the note too.
 HUD_LABELS = []          # (label, x0, y0, x1, y1), SCREEN pixels
-
-
-def text(im, xy, label, size=12, color=(214, 193, 146, 255)):
-    d = ImageDraw.Draw(im)
-    d.text((xy[0]+1, xy[1]+1), label, font=font(size), fill=(0, 0, 0, 255))
-    d.text(xy, label, font=font(size), fill=color)
-    # Every string this helper draws is a label baked into the backdrop, and
-    # the firmware draws live numbers right next to them.  Record the box so
-    # tools/check_hud_layout.py can check the two layouts against each other -
-    # the backdrop is blitted at 2x, so the screen box is the source box
-    # doubled.  Every collision this HUD has ever had was found by eye.
-    box = d.textbbox(xy, label, font=font(size))
-    # The plate is half-size and the firmware doubles it, so a label drawn at
-    # source (x, y) lands on screen at (2x, 2y) - and so does its box.
-    HUD_LABELS.append([label, box[0] * 2, box[1] * 2, box[2] * 2, box[3] * 2])
 
 
 def actor(im, size):
@@ -201,8 +166,12 @@ def build():
     # its own small copy.
     assets += [('boss_cirno', actor(source('fumocirno.png'), (64, 64)), 0x01621000, 1),
                ('shade', actor(dream, (24, 24)), 0x01631000, 1)]
-    # Reuse the centre row of Kenney's vertical projectile. Firmware repeats
-    # this one row 512 times in DDR, instead of storing 512 copies in BRAM.
+    # Reuse the centre row of Kenney's vertical projectile.  The firmware does
+    # NOT repeat this row: laser_glow_build() (sw/app/main.c) generates all 768
+    # rows of MM_LASER_GLOW itself at boot, after sprites_build(), and this
+    # 16x1 stream is only where the glow row's colours come from.
+    # check_ddr_layout.py sizes that surface as 16 x 4 x 768, and the manifest
+    # marks it runtime_overlay for the same reason.
     beam_src = source('shmup/Tiles/tile_0000.png').resize((32, 16), NEAREST)
     laser = Image.new('RGBA', (16, 1))
     beam_row = []
@@ -237,13 +206,18 @@ def build():
     # it at boot (reimu_bob_build) instead of carrying a second 48x48 stream.
     shared = {'reimu_hud_small': 'reimu_0', 'reimu_hud_large': 'reimu_0',
               'reimu_3': 'reimu_1'}
-    lazy = set()
+    # laser_glow is the one asset whose pixels the firmware does NOT take from
+    # this stream: laser_glow_build() (sw/app/main.c) fills all 768 rows of it
+    # at boot and overwrites row 0.  This used to be an empty set, so every
+    # entry in manifest.json said runtime_overlay false - including that one,
+    # which made the field worse than useless to anyone reading it.
+    runtime_overlay = {'laser_glow'}
+
     def color_limit(name):
-        # The plate is a stepped sky (6 tones) over a stepped ground (3 tones)
-        # plus two flat silhouette tones - 8 covers it with room to spare.
-        # Measured: 8 -> 4118 B, 4 -> 4099 B, so the extra tones are nearly
-        # free and the plate keeps its depth.
-        return 8 if name == 'background' else 32
+        # No asset is named 'background' any more: the backdrop is painted by
+        # the firmware, so the branch that used to give it 8 tones is gone.
+        # Measured when it existed: 8 -> 4118 B, 4 -> 4099 B.
+        return 32
     for idx, (name, im, addr, scale) in enumerate(assets):
         im.save(OUT / (name+'.png'))
         cols, runs = quantize(im, color_limit(name), name == 'laser_glow')
@@ -257,7 +231,7 @@ def build():
                          bytes=4*im.width*im.height*scale*scale,
                          encoded_bytes=0 if name in shared else 4*len(cols)+len(runs),
                          palette_colors=color_limit(name), shared=shared.get(name),
-                         runtime_overlay=name in lazy))
+                         runtime_overlay=name in runtime_overlay))
     body += ['const visual_asset_t visual_assets[] = {']
     # A shared asset points at another one's stream, so it must also take that
     # stream's LENGTH: its own would be right only for as long as the two

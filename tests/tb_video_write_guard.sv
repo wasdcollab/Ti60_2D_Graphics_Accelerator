@@ -159,12 +159,12 @@ module tb_video_write_guard;
         $display("");
         $display("WGRESULT pass=%0d fail=%0d", pass, fail);
         $display("WGDONE");
-        $finish;
+        $finish(fail ? 1 : 0);
     end
 
     initial begin
         #500000;
         $display("WGDONE timeout");
-        $finish;
+        $finish(1);
     end
 endmodule

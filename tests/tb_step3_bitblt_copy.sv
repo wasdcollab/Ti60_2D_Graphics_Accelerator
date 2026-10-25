@@ -37,6 +37,11 @@
 module tb_step3_bitblt_copy;
 
     localparam integer MAXB = `BITBLT_MAX_BURST;
+`ifdef BITBLT_OVERLAP_TEST
+    localparam integer COPY_POLL_LIMIT = 20000;
+`else
+    localparam integer COPY_POLL_LIMIT = 500000;
+`endif
 
     reg clk = 0;
     always #5 clk = ~clk;
@@ -81,6 +86,98 @@ module tb_step3_bitblt_copy;
     // satisfied.  That is exactly what the first 192-beat run did: the
     // generator reserved 129 beats and issued none of them.  (The board's own
     // configuration in ti60_top.v already satisfies this: 512 > 2*192 + 4.)
+    wire        cmd_start;
+    wire [1:0]  cmd_op_type;
+    wire [27:0] cmd_dst_addr;
+    wire [27:0] cmd_src_addr;
+    wire [10:0] cmd_rect_w;
+    wire [10:0] cmd_rect_h;
+    wire [31:0] cmd_color;
+    wire [15:0] cmd_src_stride;
+    wire [15:0] cmd_dst_stride;
+    wire        cmd_colorkey_en;
+    wire [31:0] cmd_colorkey_val;
+    wire        cmd_alpha_en;
+    wire [7:0]  cmd_global_alpha;
+    wire        cmd_busy;
+    wire        engine_timeout;
+    wire [3:0]  probe_q_cnt;
+    wire        probe_ar_pend;
+    wire [1:0]  probe_sg_state;
+
+    apb_command_dispatcher #(
+        .CLOCK_HZ (100_000_000)
+    ) u_dispatcher (
+        .clk                    (clk),
+        .rst_n                  (rst_n),
+        .apb_paddr              (pa),
+        .apb_psel               (ps),
+        .apb_penable            (pe),
+        .apb_pwrite             (pw),
+        .apb_pwdata             (pd),
+        .apb_prdata             (pr),
+        .apb_pready             (pre),
+        .apb_pslverr            (per),
+        .cmd_start              (cmd_start),
+        .cmd_op_type            (cmd_op_type),
+        .cmd_dst_addr           (cmd_dst_addr),
+        .cmd_src_addr           (cmd_src_addr),
+        .cmd_rect_w             (cmd_rect_w),
+        .cmd_rect_h             (cmd_rect_h),
+        .cmd_color              (cmd_color),
+        .cmd_src_stride         (cmd_src_stride),
+        .cmd_dst_stride         (cmd_dst_stride),
+        .cmd_colorkey_en        (cmd_colorkey_en),
+        .cmd_colorkey_val       (cmd_colorkey_val),
+        .cmd_alpha_en           (cmd_alpha_en),
+        .cmd_global_alpha       (cmd_global_alpha),
+        .cmd_busy               (cmd_busy),
+        .engine_timeout         (engine_timeout),
+        .diag_rd_q_cnt          (probe_q_cnt),
+        .diag_rd_ar_pend        (probe_ar_pend),
+        .diag_sg_state          (probe_sg_state),
+        .vdma_next_base         (next_base),
+        .vdma_right_next_base   (right_next_base),
+        .vdma_active_base       (28'h0100_0000),
+        .vdma_right_active_base (28'h0100_0000),
+        .cpu_fps_bcd            (cpu_fps),
+        .fpga_fps_bcd           (fpga_fps),
+        .scan_diagnostics       (32'd0),
+        .vsync_flag             (1'b0),
+        .gamepad_joy_x          (8'd128),
+        .gamepad_joy_y          (8'd128),
+        .gamepad_buttons        (5'd0),
+        .gamepad_online         (1'b0),
+        .key_sw0_level          (1'b0),
+        .key_sw2_level          (1'b0),
+        .key_sw0_pulse          (1'b0),
+        .key_sw2_pulse          (1'b0),
+        .i2c_slave_addr         (i2c_addr),
+        .force_hud_disable      (hud_dis),
+        .weather_ctrl           (),
+        .weather_mask_x         (),
+        .weather_mask_y         (),
+        .laser_colx_lo          (),
+        .laser_colx_hi          (),
+        .laser_colx             (),
+        .beam_x                 (),
+        .beam_len               (),
+        .beam_en                (),
+        .hair_x                 (),
+        .hair_out               (),
+        .hair_lft               (),
+        .hair_mid               (),
+        .bucket_base            (),
+        .btile_addr             (),
+        .btile_data             (),
+        .btile_we               (),
+        .bpal_data              (),
+        .bpal_addr              (),
+        .bpal_we                (),
+        .color_matrix_ctrl      (),
+        .bloom_ctrl             ()
+    );
+
     bitblt_top #(
         .MAX_BURST_BEATS (MAXB),
         .READ_FIFO_DEPTH (2*MAXB + 8),
@@ -88,34 +185,57 @@ module tb_step3_bitblt_copy;
         .DST_FIFO_DEPTH  (2*MAXB + 8),
         .DST_FIFO_AW     (10)
     ) dut (
-        .clk(clk), .rst_n(rst_n),
-        .apb_paddr(pa), .apb_psel(ps), .apb_penable(pe), .apb_pwrite(pw),
-        .apb_pwdata(pd), .apb_prdata(pr), .apb_pready(pre), .apb_pslverr(per),
-
-        .m_axi_arid(arid), .m_axi_araddr(araddr), .m_axi_arlen(arlen),
-        .m_axi_arsize(arsize), .m_axi_arburst(arburst), .m_axi_arlock(arlock),
-        .m_axi_arvalid(arvalid), .m_axi_arready(arready),
-        .m_axi_rid(RID), .m_axi_rdata(rdata), .m_axi_rresp(rresp),
-        .m_axi_rlast(rlast), .m_axi_rvalid(rvalid), .m_axi_rready(rready),
-
-        .m_axi_awid(awid), .m_axi_awaddr(awaddr), .m_axi_awlen(awlen),
-        .m_axi_awsize(awsize), .m_axi_awburst(awburst), .m_axi_awlock(awlock),
-        .m_axi_awvalid(awvalid), .m_axi_awready(awready),
-        .m_axi_wid(wid), .m_axi_wdata(wdata), .m_axi_wstrb(wstrb),
-        .m_axi_wlast(wlast), .m_axi_wvalid(wvalid), .m_axi_wready(wready),
-        .m_axi_bid(bid), .m_axi_bvalid(bvalid), .m_axi_bready(bready),
-
-        .vdma_next_base(next_base), .vdma_active_base(28'h0100_0000),
-        .vdma_right_next_base(right_next_base),
-        .vdma_right_active_base(28'h0100_0000),
-        .cpu_fps_bcd(cpu_fps), .fpga_fps_bcd(fpga_fps),
-        .scan_diagnostics(32'd0), .vsync_flag(1'b0),
-
-        .gamepad_joy_x(8'd128), .gamepad_joy_y(8'd128), .gamepad_buttons(5'd0),
-        .gamepad_online(1'b0),
-        .key_sw0_level(1'b0), .key_sw2_level(1'b0),
-        .key_sw0_pulse(1'b0), .key_sw2_pulse(1'b0),
-        .i2c_slave_addr(i2c_addr), .force_hud_disable(hud_dis)
+        .clk                    (clk),
+        .rst_n                  (rst_n),
+        .cmd_start              (cmd_start),
+        .cmd_op_type            (cmd_op_type),
+        .cmd_dst_addr           (cmd_dst_addr),
+        .cmd_src_addr           (cmd_src_addr),
+        .cmd_rect_w             (cmd_rect_w),
+        .cmd_rect_h             (cmd_rect_h),
+        .cmd_color              (cmd_color),
+        .cmd_src_stride         (cmd_src_stride),
+        .cmd_dst_stride         (cmd_dst_stride),
+        .cmd_colorkey_en        (cmd_colorkey_en),
+        .cmd_colorkey_val       (cmd_colorkey_val),
+        .cmd_alpha_en           (cmd_alpha_en),
+        .cmd_global_alpha       (cmd_global_alpha),
+        .cmd_busy               (cmd_busy),
+        .engine_timeout         (engine_timeout),
+        .probe_q_cnt            (probe_q_cnt),
+        .probe_ar_pend          (probe_ar_pend),
+        .probe_sg_state         (probe_sg_state),
+        .m_axi_arid             (arid),
+        .m_axi_araddr           (araddr),
+        .m_axi_arlen            (arlen),
+        .m_axi_arsize           (arsize),
+        .m_axi_arburst          (arburst),
+        .m_axi_arlock           (arlock),
+        .m_axi_arvalid          (arvalid),
+        .m_axi_arready          (arready),
+        .m_axi_rid              (RID),
+        .m_axi_rdata            (rdata),
+        .m_axi_rresp            (rresp),
+        .m_axi_rlast            (rlast),
+        .m_axi_rvalid           (rvalid),
+        .m_axi_rready           (rready),
+        .m_axi_awid             (awid),
+        .m_axi_awaddr           (awaddr),
+        .m_axi_awlen            (awlen),
+        .m_axi_awsize           (awsize),
+        .m_axi_awburst          (awburst),
+        .m_axi_awlock           (awlock),
+        .m_axi_awvalid          (awvalid),
+        .m_axi_awready          (awready),
+        .m_axi_wid              (wid),
+        .m_axi_wdata            (wdata),
+        .m_axi_wstrb            (wstrb),
+        .m_axi_wlast            (wlast),
+        .m_axi_wvalid           (wvalid),
+        .m_axi_wready           (wready),
+        .m_axi_bid              (bid),
+        .m_axi_bvalid           (bvalid),
+        .m_axi_bready           (bready)
     );
 
     // =====================================================================
@@ -169,8 +289,18 @@ module tb_step3_bitblt_copy;
     wire b_hs  = bvalid  && bready;
 
     assign arready = arready_r;
+`ifdef BITBLT_OVERLAP_TEST
+    wire guard_pending;
+    wire guarded_awvalid,guarded_wvalid;
+    video_write_guard guard_inst(
+        .clk(clk),.rst_n(rst_n),.video_priority((stall_ctr%512)<64),
+        .s_awvalid(awvalid),.s_awready(awready),.m_awvalid(guarded_awvalid),.m_awready(awready_r),
+        .s_wvalid(wvalid),.s_wready(wready),.m_wvalid(guarded_wvalid),.m_wready(wready_r),
+        .bvalid(bvalid),.bready(bready),.pending(guard_pending));
+`else
     assign awready = awready_r;
     assign wready  = wready_r;
+`endif
     assign bvalid  = bvalid_r;
     assign rvalid  = rvalid_r;
     assign rlast   = rvalid_r && (rd_left == 8'd1);
@@ -335,6 +465,43 @@ module tb_step3_bitblt_copy;
     integer    v_profile, v_ga, v_ck_en;
     reg [31:0] v_ck_val;
     integer    n_alpha = 0;
+    integer    v_blend_op = 2;
+    integer    overlap_case = 0;
+
+    task stage_while_busy;
+        integer ticks;
+        reg [31:0] check;
+        begin
+            ticks=0;
+            while(!wr_active && ticks<2000) begin
+                @(negedge clk); ticks=ticks+1;
+            end
+            if(!wr_active || !cmd_busy) $fatal(1,"overlap stimulus missed active write");
+            case(overlap_case)
+                1: apb_write(16'h18,32'd2);
+                2: begin
+                    apb_write(16'h60,{src_mem[v_soff+3*v_ss+3],src_mem[v_soff+3*v_ss+2],
+                        src_mem[v_soff+3*v_ss+1],src_mem[v_soff+3*v_ss]});
+                    apb_write(16'h64,32'd1);
+                end
+                3: apb_write(16'h18,32'd1);
+                4: apb_write(16'h18,32'd3);
+                5: apb_write(16'h6C,32'd0);
+                6: begin apb_write(16'h60,32'h12345678); apb_write(16'h64,32'd0); end
+                default: $fatal(1,"invalid overlap case");
+            endcase
+            apb_write(16'h04,DST_BASE+32'd4096);
+            apb_write(16'h1C,SRC_BASE+32'd8192);
+            apb_write(16'h08,32'd8);
+            apb_write(16'h0C,32'd8);
+            apb_write(16'h30,32'd64);
+            apb_write(16'h48,32'd64);
+            apb_write(16'h10,32'hABCDEF12);
+            apb_read(16'h08,check);
+            if(check!==32'd8) $fatal(1,"next command register was not staged");
+            if(!cmd_busy) $fatal(1,"command ended before register overlap completed");
+        end
+    endtask
 
     localparam [63:0] FNV_OFF = 64'hcbf29ce484222325;
     localparam [63:0] FNV_PRM = 64'h00000100000001b3;
@@ -370,11 +537,15 @@ module tb_step3_bitblt_copy;
             apb_write(16'h48, v_ds);
             apb_write(16'h14, 32'd1);                           // START
 
+`ifdef BITBLT_OVERLAP_TEST
+            stage_while_busy();
+`endif
+
             apb_read(16'h00, status);
             if (status[2] || status[3])
                 $fatal(1, "vector %0d rejected, status=%h", vec_idx, status);
             guard = 0;
-            while (!status[1] && guard < 500000) begin
+            while (!status[1] && guard < COPY_POLL_LIMIT) begin
                 apb_read(16'h00, status);
                 guard = guard + 1;
             end
@@ -384,6 +555,12 @@ module tb_step3_bitblt_copy;
                     dut.u_stride_gen.rd_reserved, dut.u_stride_gen.wr_done_cnt,
                     dut.u_stride_gen.rd_pending, dut.u_stride_gen.rd_left,
                     dut.u_stride_gen.wr_left);
+                $display("WRITE WAIT: active=%b WVALID=%b read_queue=%0d staged_op=%0d running_op=%0d",
+                    wr_active,wvalid,probe_q_cnt,cmd_op_type,dut.u_stride_gen.r_op);
+`ifdef BITBLT_OVERLAP_TEST
+                $display("SHARED GUARD: pending=%b AWVALID/READY=%b/%b WVALID/READY=%b/%b",
+                    guard_pending,guarded_awvalid,awready_r,guarded_wvalid,wready_r);
+`endif
                 $fatal(1, "vector %0d: DONE timeout", vec_idx);
             end
             if (status[2] || status[3])
@@ -621,7 +798,7 @@ module tb_step3_bitblt_copy;
             end
 
             // ---- command ----
-            apb_write(16'h18, 32'd2);                    // OP_ALPHA
+            apb_write(16'h18, v_blend_op);
             apb_write(16'h68, 32'd1);                    // ALPHA_CTRL enable
             apb_write(16'h6C, v_ga);
             apb_write(16'h60, v_ck_val);
@@ -633,6 +810,10 @@ module tb_step3_bitblt_copy;
             apb_write(16'h30, v_ss);
             apb_write(16'h48, v_ds);
             apb_write(16'h14, 32'd1);                    // START
+
+`ifdef BITBLT_OVERLAP_TEST
+            stage_while_busy();
+`endif
 
             apb_read(16'h00, status);
             guard = 0;
@@ -678,6 +859,8 @@ module tb_step3_bitblt_copy;
                         for (k = 0; k < 4; k = k + 1) begin
                             exp_b = (k == 3) ? dst_snap[da+3]
                                              : fblend(src_mem[sa+k], dst_snap[da+k], ae);
+                            if(v_blend_op==3 && k!=3)
+                                exp_b = (int'(src_mem[sa+k])+int'(dst_snap[da+k])>255) ? 8'hFF : src_mem[sa+k]+dst_snap[da+k];
                             if (dst_mem[da+k] !== exp_b)
                                 $fatal(1, "alpha v%0d (p=%0d so=%0d do=%0d w=%0d h=%0d ss=%0d ds=%0d ga=%0d ck=%0d) byte %0d got %02h exp %02h",
                                        vec_idx, v_profile, v_soff, v_doff, v_w, v_h, v_ss, v_ds,
@@ -730,6 +913,22 @@ module tb_step3_bitblt_copy;
         repeat (5) @(negedge clk);
         rst_n = 1;
         repeat (5) @(negedge clk);
+
+`ifdef BITBLT_OVERLAP_TEST
+        v_op=1; v_soff=4; v_doff=12; v_w=127; v_h=7;
+        v_ss=528; v_ds=544; v_color=32'h12345678;
+        overlap_case=1; run_vector();
+        overlap_case=2; run_vector();
+        v_profile=3; v_ga=137; v_ck_en=1; v_ck_val=32'h00FF00FF;
+        for(overlap_case=3;overlap_case<=6;overlap_case=overlap_case+1) run_alpha_vector();
+        v_blend_op=3;
+        overlap_case=3; run_alpha_vector();
+        overlap_case=1; run_alpha_vector();
+        overlap_case=6; run_alpha_vector();
+        v_op=0; overlap_case=1; run_vector();
+        $display("PASS BitBlt OVERLAP: COPY/FILL/ALPHA/ADD survive next-command APB writes, exact pixels and AXI stalls");
+        $finish;
+`endif
 
 `ifdef BITBLT_LARGE_TEST
         // Previously the 64 KiB model limited the height sweep to 17 rows.

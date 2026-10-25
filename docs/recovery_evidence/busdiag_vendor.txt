@@ -1,0 +1,6 @@
+FAIL bucket job did not finish inside 5,000,000 cycles: state=4 bullet=0/1300 busy=1 fault=1 cycles=5000001 drop=0
+     wr_pend=0 aw=0/0 w=0/0 b=0/1 aq=0/0 wq=0/0 replies=0
+     competing bus reads granted: cpu=31123 bitblt=19640
+FATAL: tests/tb_bucket_coprocessor_axi.sv:556: bucket job starved on the bus
+       Time: 50000075000  Scope: tb_bucket_coprocessor_axi
+PASS expected starvation: vendor/1300

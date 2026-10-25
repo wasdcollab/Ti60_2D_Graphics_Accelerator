@@ -59,6 +59,7 @@ module bitblt_stride_gen #(
     input  wire [15:0] cmd_dst_stride,
     output wire        busy,
     output reg         cmd_done,
+    output reg         engine_abort,
 
     // ---- AXI4 read master (shared by both read streams) ----
     // Level, not pulse: the request is held until the master accepts it, exactly
@@ -166,7 +167,12 @@ module bitblt_stride_gen #(
     // beats and 263424 read beats, and the 18-bit ceiling is 262143.  At 1024x600
     // (153600) and 1280x720 (230400) the old width was enough.
     reg [18:0] rd_reserved;      // source read beats issued
-    reg [18:0] rd_arrived;       // source read beats delivered into the FIFO
+    // rd_arrived counts beats that have actually been delivered, and NOTHING
+    // reads it: flow control uses rd_reserved (issued) minus what has been
+    // written out, which is deliberately pessimistic.  Kept because it is the
+    // only place the true occupancy exists, should a credit scheme ever want it -
+    // but it is not the number the credit check uses today.
+    reg [18:0] rd_arrived;       // delivered into the FIFO (no reader)
     reg [18:0] dst_rd_reserved;  // background read beats issued
     reg [18:0] wr_done_cnt;      // write beats completed
 
@@ -279,6 +285,7 @@ module bitblt_stride_gen #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state                <= S_IDLE;
+            engine_abort         <= 1'b0;
             // rd_req / rd_is_dst / rd_addr / rd_len are driven by the staging
             // register through continuous assigns now, so they are not reset
             // here - rd_tx_pend is, further down.
@@ -362,6 +369,7 @@ module bitblt_stride_gen #(
             // -------------------------------------------------------------
             S_IDLE: begin
                 if (cmd_start) begin
+                    engine_abort <= 1'b0;
                     r_op       <= cmd_op_type;
                     r_w        <= cmd_rect_w;
                     r_h        <= cmd_rect_h;
@@ -413,6 +421,11 @@ module bitblt_stride_gen #(
             S_LOOP: begin
                 // watchdog: never leave the CPU polling a dead engine
                 if (wd_cnt == WATCHDOG_CYCLES[25:0]) begin
+                    engine_abort <= 1'b1;
+                    rd_tx_pend <= 1'b0;
+                    wr_inflight <= 1'b0;
+                    rd_out_src <= 3'd0;
+                    rd_out_dst <= 3'd0;
                     err_timeout <= 1'b1;
                     state       <= S_IDLE;
                     cmd_done    <= 1'b1;
@@ -464,6 +477,11 @@ module bitblt_stride_gen #(
                     // watchdog stays armed: a DDR response that never returns
                     // must still trip err_timeout instead of hanging forever.
                     if (wd_cnt == WATCHDOG_CYCLES[25:0]) begin
+                        engine_abort <= 1'b1;
+                        rd_tx_pend <= 1'b0;
+                        wr_inflight <= 1'b0;
+                        rd_out_src <= 3'd0;
+                        rd_out_dst <= 3'd0;
                         err_timeout  <= 1'b1;
                         last_row_wait <= 1'b0;
                         state         <= S_IDLE;

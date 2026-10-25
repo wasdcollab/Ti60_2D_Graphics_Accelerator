@@ -24,7 +24,7 @@ ENTRY(_start)
 
 MEMORY
 {
-    image (rwx) : ORIGIN = 0xF9000000, LENGTH = 0xFC00
+    image (rwx) : ORIGIN = 0xF9000000, LENGTH = 0xFD00
 }
 
 SECTIONS
@@ -60,8 +60,17 @@ SECTIONS
     } > image
 
     __image_end = .;
+    /* Reserved diagnostic DDR, after the two 96 x uint16 bucket ledgers. */
+    bt_count = 0x048C1200;
+    /* CPU-owned particle state, cleared by game_init before use. */
+    game_particles = 0x048C1300;
+    /* CPU-owned state, initialized by game_init / player_pick_mask_build. */
+    popups = 0x048C1480;
+    pick_mask = 0x048C14C0;
+    hud_sig = 0x048C67E4;
+    stage_rle = 0x048C6830;
 
-    PROVIDE(__stack_floor = 0xF900FC00);
+    PROVIDE(__stack_floor = 0xF900FD00);
     PROVIDE(_stack_top    = 0xF9010000);
 
     /DISCARD/ :

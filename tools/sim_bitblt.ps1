@@ -1,4 +1,4 @@
-﻿# sim_bitblt.ps1 -- build & run the BitBlt full-engine bench.
+# sim_bitblt.ps1 -- build & run the BitBlt full-engine bench.
 # Usage:  .\tools\sim_bitblt.ps1 -W 9 -H 9 -Op 1 -Lat 150 -Cmds 1
 #         .\tools\sim_bitblt.ps1 -W 1366 -H 8 -SrcDir tmp\v4
 param(
@@ -23,7 +23,7 @@ if (-not $Tag) { $Tag = "w${W}_h${H}_op${Op}_lat${Lat}" }
 New-Item -ItemType Directory -Force -Path "$p\tmp\sim" | Out-Null
 $out = "$p\tmp\sim\$Tag.vvp"
 $d = @("-DCMD_W=$W","-DCMD_H=$H","-DCMD_OP=$Op","-DTB_LAT=$Lat","-DTB_CMDS=$Cmds")
-if ($Alpha)  { $d + "-DTB_ALPHA" | Out-Null }
+if ($Alpha)  { $d += "-DTB_ALPHA" }
 if ($Vdma)   { $d += "-DTB_VDMA" }
 if ($Jitter) { $d += "-DTB_JITTER" }
 & $iv -B $lib -g2012 -I "$p\rtl\common" -I "$p\rtl\bitblt" $d -o $out $src $models 2>$null

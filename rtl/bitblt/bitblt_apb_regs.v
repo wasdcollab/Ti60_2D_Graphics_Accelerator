@@ -87,9 +87,13 @@ module bitblt_apb_regs #(parameter CLOCK_HZ = 100000000) (
     // question with an answer.
     //
     // Read at 0x74, packed as
-    //     [3:0]   rd_q_cnt   read master queue occupancy  (0..4)
+    //     [3:0]   rd_q_cnt   read master queue occupancy  (0..WQ, so 0..8)
     //     [4]     rd_ar_pend a request is staged on the AR channel
-    //     [11:8]  sg_state   stride_gen state (0 idle, 2 = S_LOOP)
+    //     [9:8]   sg_state   stride_gen state (0 idle, 2 = S_LOOP)
+    //
+    // [9:8], NOT [11:8]: the packing below is
+    // {20'd0, diag_sg_state, 4'd0, diag_rd_ar_pend, diag_rd_q_cnt}, so the two
+    // bits of state sit at 9:8 and this note used to name two bits too many.
     //
     // Healthy idle: 0x0000.  A queue count that stays non-zero while the engine
     // is idle is a stranded entry, and that alone can strand the engine forever
@@ -125,6 +129,52 @@ module bitblt_apb_regs #(parameter CLOCK_HZ = 100000000) (
     // 0 parks that column off screen - the playfield starts at x = 181.
     output reg  [23:0] laser_colx_lo,
     output reg  [23:0] laser_colx_hi,
+
+    // The player's beam and the cut/beam warning hairlines, forwarded to the
+    // scanout (video_beam.v).  Written at
+    //     0xB8  beam_x    [11:0] centre column
+    //     0xBC  beam_ctrl [10:0] height, [11] enable
+    //     0xC0 + 16k +  0  hair_x   [11:0] centre of slot k (0 = slot off)
+    //     0xC0 + 16k +  4  hair_out [23:0] colour of columns hx-2 and hx+1
+    //     0xC0 + 16k +  8  hair_lft [23:0] colour of column hx-1
+    //     0xC0 + 16k + 12  hair_mid [23:0] colour of column hx
+    // A colour of 0 draws nothing, which is how a slot that is not standing is
+    // taken off the screen.  Three slots, twelve words, k = 0..2.
+    output reg  [11:0] beam_x,
+    output reg  [11:0] beam_len,
+    output reg         beam_en,
+    output reg  [35:0] hair_x,
+    output reg  [71:0] hair_out,
+    output reg  [71:0] hair_lft,
+    output reg  [71:0] hair_mid,
+
+    // ---- B1: the bullet bucket table and the tile store --------------------
+    //     0xF0  bucket_base  [27:0] where the per-scanline bucket table lives
+    //     0xF4  tile_addr    [13:0] tile store write pointer
+    //     0xF8  tile_data    [7:0]  byte to write; the pointer advances by one
+    //     0xFC  pal_data     [31:0] palette entry {alpha, rgb}; pointer advances
+    // The two data registers auto-increment because the last four APB addresses
+    // are all that is left and the store needs three of them anyway.  Boot walks
+    // 14,192 bytes and then 256 palette entries through these two, once.
+    // 14 address bits.  It was 15 before the colour split and 13 after it, and
+    // it went back up one when the enemy bullet doubled its edge: 16 tiles at
+    // 26x26 with a 32-byte row stride are 13,312 of the 14,192 bytes in use.
+    output reg  [27:0] bucket_base,
+    output reg  [13:0] btile_addr,
+    output reg  [7:0]  btile_data,
+    output reg         btile_we,
+    // 32 bits since the scanout learned to alpha-blend the bullet curtain: the
+    // top byte is the entry's opacity, and the tile's byte is a shape ROLE that
+    // the scanout turns into an index with role + hue*32 - so this register is
+    // still the one place a per-colour alpha can live.
+    output reg  [31:0] bpal_data,
+    output reg  [7:0]  bpal_addr,
+    output reg         bpal_we,
+    // Separate write pointers, because the strobe costs a cycle.  Which address
+    // the store sees is NOT the same as where the firmware's pointer has got to:
+    // see the 0xF8 case below.
+    reg         [13:0] btile_ptr,
+    reg         [7:0]  bpal_ptr,
 
     // Video stream 3x3 color matrix control (0x7C, Phase 1 Task 03).
     // Packed as [3:0] mode, [15:8] intensity
@@ -298,10 +348,32 @@ module bitblt_apb_regs #(parameter CLOCK_HZ = 100000000) (
             weather_mask_y       <= 32'd0;
             laser_colx_lo        <= 24'd0;
             laser_colx_hi        <= 24'd0;
+            beam_x               <= 12'd0;
+            beam_len             <= 12'd0;
+            beam_en              <= 1'b0;
+            hair_x               <= 36'd0;
+            hair_out             <= 72'd0;
+            hair_lft             <= 72'd0;
+            hair_mid             <= 72'd0;
+            bucket_base          <= 28'd0;
+            btile_addr           <= 14'd0;
+            btile_data           <= 8'd0;
+            btile_we             <= 1'b0;
+            bpal_data            <= 24'd0;
+            bpal_addr            <= 8'd0;
+            bpal_we              <= 1'b0;
+            btile_ptr            <= 14'd0;
+            bpal_ptr             <= 8'd0;
             color_matrix_ctrl    <= 32'd0;
             bloom_ctrl           <= 32'd0;
             asset_addr           <= 14'd0;
         end else begin
+            // One-cycle strobes, cleared every clock and set only by the write
+            // that means them.  Without this the store would go on being written
+            // forever after the first byte: the register would latch high and
+            // the tile store would fill with copies of whatever came next.
+            btile_we <= 1'b0;
+            bpal_we  <= 1'b0;
             diag_reg <= {20'd0, diag_sg_state, 4'd0, diag_rd_ar_pend, diag_rd_q_cnt};
             if (cmd_start) snp_cyc <= 32'd0;
             else if (cmd_busy && !cmd_start) snp_cyc <= snp_next;
@@ -378,6 +450,58 @@ module bitblt_apb_regs #(parameter CLOCK_HZ = 100000000) (
                     8'hAC: weather_mask_y    <= apb_pwdata[31:0];
                     8'hB0: laser_colx_lo     <= apb_pwdata[23:0];
                     8'hB4: laser_colx_hi     <= apb_pwdata[23:0];
+                    8'hB8: beam_x            <= apb_pwdata[11:0];
+                    8'hBC: begin
+                        beam_len <= apb_pwdata[10:0];
+                        beam_en  <= apb_pwdata[11];
+                    end
+                    8'hC0: hair_x[11:0]      <= apb_pwdata[11:0];
+                    8'hC4: hair_out[23:0]    <= apb_pwdata[23:0];
+                    8'hC8: hair_lft[23:0]    <= apb_pwdata[23:0];
+                    8'hCC: hair_mid[23:0]    <= apb_pwdata[23:0];
+                    8'hD0: hair_x[23:12]     <= apb_pwdata[11:0];
+                    8'hD4: hair_out[47:24]   <= apb_pwdata[23:0];
+                    8'hD8: hair_lft[47:24]   <= apb_pwdata[23:0];
+                    8'hDC: hair_mid[47:24]   <= apb_pwdata[23:0];
+                    8'hE0: hair_x[35:24]     <= apb_pwdata[11:0];
+                    8'hE4: hair_out[71:48]   <= apb_pwdata[23:0];
+                    8'hE8: hair_lft[71:48]   <= apb_pwdata[23:0];
+                    8'hEC: hair_mid[71:48]   <= apb_pwdata[23:0];
+                    8'hF0: bucket_base       <= apb_pwdata[27:0];
+                    8'hF4: btile_ptr         <= apb_pwdata[13:0];
+                    // THE STORE SEES THE POINTER THE FIRMWARE MEANT, not the one
+                    // it will have after this write.
+                    //
+                    // btile_we, btile_data and the increment are all registers, so
+                    // they take effect together on the NEXT clock, while the data
+                    // the store sees is the old one.  Incrementing here and
+                    // letting the write land a cycle later therefore puts every
+                    // byte one cell past where it belongs: the whole store shifts
+                    // right by one byte, address 0 stays zero, every tile loses
+                    // its first column to transparency and the art comes out a
+                    // pixel sideways.  On the board that reads as a screenful of
+                    // torn bullet tiles - and only of bullet tiles, because the
+                    // beam and the laser columns do not come from this store.
+                    //
+                    // So the pointer is kept apart from the address the store is
+                    // given: latch the pre-increment pointer into btile_addr at
+                    // the same moment the strobe and the data are latched.
+                    8'hF8: begin
+                        btile_addr <= btile_ptr;
+                        btile_data <= apb_pwdata[7:0];
+                        btile_we   <= 1'b1;
+                        btile_ptr  <= btile_ptr + 14'd1;
+                    end
+                    8'hFC: begin
+                        bpal_addr <= bpal_ptr;
+                        // All 32 bits, alpha byte included.  Truncating to 24
+                        // would silently make every entry opaque, which is a
+                        // failure that looks exactly like "the alpha feature
+                        // does not work" rather than like a width bug.
+                        bpal_data <= apb_pwdata[31:0];
+                        bpal_we   <= 1'b1;
+                        bpal_ptr  <= bpal_ptr + 8'd1;
+                    end
                     8'h80: asset_addr        <= apb_pwdata[13:0];
                     8'h88: bloom_ctrl        <= apb_pwdata[31:0];
                     default: ;
@@ -436,6 +560,25 @@ module bitblt_apb_regs #(parameter CLOCK_HZ = 100000000) (
                 8'hAC: apb_prdata = weather_mask_y;
                 8'hB0: apb_prdata = {8'd0, laser_colx_lo};
                 8'hB4: apb_prdata = {8'd0, laser_colx_hi};
+                // Read the beam overlay back: "the firmware wrote it" and "the
+                // scanline logic has it" are two different claims, and only the
+                // second one explains a beam standing on the wrong column.
+                8'hB8: apb_prdata = {20'd0, beam_x};
+                8'hBC: apb_prdata = {20'd0, beam_en, beam_len[10:0]};
+                8'hC0: apb_prdata = {20'd0, hair_x[11:0]};
+                8'hC4: apb_prdata = hair_out[23:0];
+                8'hC8: apb_prdata = hair_lft[23:0];
+                8'hCC: apb_prdata = hair_mid[23:0];
+                8'hD0: apb_prdata = {20'd0, hair_x[23:12]};
+                8'hD4: apb_prdata = hair_out[47:24];
+                8'hD8: apb_prdata = hair_lft[47:24];
+                8'hDC: apb_prdata = hair_mid[47:24];
+                8'hE0: apb_prdata = {20'd0, hair_x[35:24]};
+                8'hE4: apb_prdata = hair_out[71:48];
+                8'hE8: apb_prdata = hair_lft[71:48];
+                8'hEC: apb_prdata = hair_mid[71:48];
+                8'hF0: apb_prdata = {4'd0, bucket_base};
+                8'hF4: apb_prdata = {18'd0, btile_ptr};
                 8'h84: apb_prdata = {24'd0, asset_data};  // asset ROM byte
                 8'h88: apb_prdata = bloom_ctrl;
                 8'h90: apb_prdata = snp_worst_cyc;

@@ -1,6 +1,19 @@
 `timescale 1ns/1ps
 // Autonomous right-half renderer. Each completed frame waits for its own
 // scan acknowledgement, independently of CPU progress on the left half.
+// NOT INSTANTIATED, AND ITS GEOMETRY IS FROM AN OLDER SCREEN.
+//
+// Nothing in the project instantiates this module: the name appears in its own
+// module declaration and nowhere else, so it does not reach the bitstream.
+//
+// If it is ever wired up, every constant in it has to be re-derived first - it
+// was written for the 1024x600 screen and still carries that geometry:
+//   * x bound 1024 and y bound 1200 (the screen is 1366x768),
+//   * a 512x600 clear rectangle (the screen is 1366x768),
+//   * row addresses as (y/2)*4096 (the framebuffer pitch is 8192).
+// Wired up unchanged, sprites would walk off screen, each line's bytes would
+// only be half covered, and 600 of the 768 rows would be cleared.
+
 module bitblt_demo_scheduler (
  input wire clk, rst_n, enable,
  input wire [27:0] active_base,

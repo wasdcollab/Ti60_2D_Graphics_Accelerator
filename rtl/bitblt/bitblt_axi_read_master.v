@@ -57,7 +57,7 @@ module bitblt_axi_read_master #(
     output reg          rd_done_is_dst,  // ... and which stream it belonged to
     output reg  [8:0]   rd_done_len,     // ... and how many beats it delivered
     output wire         rd_accept,   // 1 = a rd_req asserted this cycle is taken
-    output wire         rd_busy,     // 1 = no room for another request
+    output wire         rd_busy,
 
     // FIFO back-pressure, one flag per stream
     input  wire         fifo_full_src,
@@ -106,8 +106,15 @@ module bitblt_axi_read_master #(
     assign m_axi_arburst = 2'b01;   // INCR
     assign m_axi_arlock  = 2'b00;
 
-    localparam integer WQ  = MAX_OUTSTANDING;     // queue depth, must be 4
-    localparam [2:0]   QMAX = 4;
+    localparam integer WQ  = MAX_OUTSTANDING;     // queue depth, and the pointers are sized from it
+    localparam [2:0]   QMAX = WQ[2:0];
+    initial begin
+        if (WQ < 1 || WQ > 8) begin
+            $error("MAX_OUTSTANDING=%0d is out of range", WQ);
+            $error("  the queue pointers are 2 bits and the occupancy counter is 3");
+            $error("  so the depth has to be 1..8");
+        end
+    end
 
     // ---- outstanding-request queue -------------------------------------
     // A ring buffer, NOT a shift register.  A shift-register FIFO only works if
@@ -153,7 +160,7 @@ module bitblt_axi_read_master #(
     // whole purpose - keeping the controller fed - did not happen.
     wire staging_free = !ar_pend || m_axi_arready;
     assign rd_accept  = staging_free && !q_full && !r_last_fire;
-    assign rd_busy   = q_full || ar_pend;
+    assign rd_busy   = (q_cnt != 3'd0) || ar_pend;
 
     wire req_fire = rd_req && rd_accept;
 
@@ -190,6 +197,11 @@ module bitblt_axi_read_master #(
                 rd_done_is_dst <= head_is_dst;
                 rd_done_len    <= q_len[q_head];
                 q_head         <= q_head + 2'd1;
+                // req_fire can never be true here - rd_accept carries !r_last_fire - so
+                // this guard never fires and the subtraction always happens.  Kept
+                // because a bare decrement would read as if a simultaneous push and pop
+                // were impossible rather than arranged.  The arrangement is the
+                // !r_last_fire inside rd_accept; that one is load-bearing.
                 if (!req_fire)
                     q_cnt <= q_cnt - 3'd1;
             end

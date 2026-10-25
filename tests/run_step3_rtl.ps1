@@ -6,15 +6,15 @@ New-Item -ItemType Directory -Force -Path $simulationDir | Out-Null
 Push-Location $simulationDir
 try {
     # XSim rejects a BOM accepted by Efinity; normalize only the simulation copy.
-    $timingSource = [System.IO.File]::ReadAllText((Join-Path $projectRoot 'rtl/v_dma/video_timing_gen.v'))
+    $timingSource = [System.IO.File]::ReadAllText((Join-Path $projectRoot 'rtl/display_engine/1_timing/video_timing_gen.v'))
     [System.IO.File]::WriteAllText((Join-Path $simulationDir 'video_timing_gen_sim.v'), $timingSource, [System.Text.UTF8Encoding]::new($false))
     & D:/Anaconda/python.exe -E (Join-Path $PSScriptRoot 'right_demo_reference.py')
     if ($LASTEXITCODE -ne 0) { throw 'reference generation failed' }
     $cases = @(
         @{Name='i2c_gamepad'; Top='tb_i2c_gamepad'; Files=@('../../tests/tb_i2c_gamepad.sv','../../rtl/common/i2c_gamepad_top.v')},
-        @{Name='hud'; Files=@('../../tests/tb_step3_hud.sv','../../rtl/v_dma/video_dual_hud.v')},
-        @{Name='bitblt'; Files=@('../../tests/tb_step3_bitblt.sv','../../rtl/bitblt/bitblt_top.v','../../rtl/bitblt/bitblt_apb_regs.v','../../rtl/bitblt/bitblt_stride_gen.v','../../rtl/bitblt/bitblt_axi_master.v','../../rtl/bitblt/bitblt_axi_read_master.v','../../rtl/bitblt/bitblt_read_fifo.v','../../rtl/bitblt/bitblt_align_shifter.v','../../rtl/bitblt/bitblt_alpha_blend.v','../../rtl/bitblt/bitblt_asset_rom.v')},
-        @{Name='write_guard'; Files=@('../../tests/tb_step3_write_guard.sv','../../rtl/v_dma/video_write_guard.v')}
+        @{Name='hud'; Files=@('../../tests/tb_step3_hud.sv','../../rtl/display_engine/2_layer_generators/video_dual_hud.v')},
+        @{Name='bitblt'; Files=@('../../tests/tb_step3_bitblt.sv','../../rtl/bitblt/bitblt_top.v','../../rtl/apb/apb_command_dispatcher.v','../../rtl/bitblt/bitblt_stride_gen.v','../../rtl/bitblt/bitblt_axi_master.v','../../rtl/bitblt/bitblt_axi_read_master.v','../../rtl/bitblt/bitblt_read_fifo.v','../../rtl/bitblt/bitblt_align_shifter.v','../../rtl/bitblt/bitblt_alpha_blend.v','../../rtl/bitblt/bitblt_asset_rom.v')},
+        @{Name='write_guard'; Files=@('../../tests/tb_step3_write_guard.sv','../../rtl/dma/video_write_guard.v')}
     )
     foreach ($case in $cases) {
         & (Join-Path $VivadoBin 'xvlog.bat') -sv @($case.Files)
@@ -27,7 +27,11 @@ try {
         $simulationOutput | Tee-Object -FilePath "$($case.Name)_regression.log"
         # XSim can return zero even after $fatal. Require explicit test success.
         $joinedOutput = $simulationOutput -join "`n"
-        if ($simulationExit -ne 0 -or $joinedOutput -notmatch 'PASS .* RTL:' -or $joinedOutput -match '(?i)fatal:|ERROR:') {
+        # XSim spells its fatal exit FATAL_ERROR, so a pattern of `fatal:` never matched
+        # anything: the one condition meant to catch a crash was permanently false.  The
+        # `PASS .* RTL:` requirement below still carried the verdict, but a bench that
+        # crashed after printing PASS would have been read as a pass.
+        if ($simulationExit -ne 0 -or $joinedOutput -notmatch 'PASS .* RTL:' -or $joinedOutput -match '(?i)fatal|ERROR:') {
             throw "RTL simulation failed: $($case.Name)"
         }
     }

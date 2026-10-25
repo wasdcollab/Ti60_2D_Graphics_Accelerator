@@ -1,0 +1,2 @@
+FATAL: tests/tb_read_drain_busy.sv:35: false idle with 1 outstanding read(s)
+       Time: 70000  Scope: tb_read_drain_busy

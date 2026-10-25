@@ -13,8 +13,11 @@ standalone Sapphire RV32I model and checks both behaviour and rendered output.
     3. Mode 2 controls   - joystick direction, focus speed and X laser
     4. Mode 2 clamping   - playfield boundary protection
     5. Mode switching    - Mode 1 <-> Mode 2 handover
-    6. Copy integrity    - the sprite blitted by OP_COPY must be byte identical
-                           to the sprite tile in DDR scratch memory
+    6. Copy integrity    - the sprite blitted by OP_COPY must match the sprite
+                            tile in DDR scratch memory to within 5% of its opaque
+                            pixels (the HUD and the aura legitimately cover a few
+                            of them; a wrong source, stride or colour key moves
+                            thousands, not a handful)
 
 Usage
 -----
@@ -68,14 +71,55 @@ def mm_value(name):
     writes any more.
     """
     if name not in _MM_CACHE:
-        txt = (ROOT / "sw" / "driver" / "memory_map.h").read_text(
-            encoding="utf-8")
-        m = re.search(r"^#define\s+%s\s+\(?\s*(0x[0-9A-Fa-f]+)" % name,
-                      txt, re.M)
-        if not m:
-            raise SystemExit("sw/driver/memory_map.h has no %s" % name)
-        _MM_CACHE[name] = int(m.group(1), 16)
+        _MM_CACHE[name] = _mm_eval(name)
     return _MM_CACHE[name]
+
+
+def _mm_eval(name, _seen=None):
+    """Value of #define <name> in memory_map.h, expressions included.
+
+    The old version stopped at the first number it found, so
+    MM_BUCKET_USED_BYTES -- written as (2UL * MM_BUCKET_ROWS) -- read back as
+    2 instead of 2 * 768.  Whatever the map spells, the test has to see the
+    value the firmware sees, so the definition is expanded through the other
+    names in the same file and only then evaluated.
+    """
+    _seen = set() if _seen is None else _seen
+    if name in _seen:
+        raise SystemExit("memory_map.h: %s is a circular definition" % name)
+    _seen.add(name)
+
+    txt = (ROOT / "sw" / "driver" / "memory_map.h").read_text(encoding="utf-8")
+    m = re.search(r"^#define\s+%s\s+(.*)$" % name, txt, re.M)
+    if not m:
+        raise SystemExit("sw/driver/memory_map.h has no %s" % name)
+    tail = m.group(1)
+    expr = tail
+    if "/*" in expr:
+        expr = expr.split("/*", 1)[0]
+    if "//" in expr:
+        expr = expr.split("//", 1)[0]
+    expr = expr.strip()
+    if expr.startswith("(") and expr.endswith(")"):
+        expr = expr[1:-1].strip()
+
+    def sub(mo):
+        return str(_mm_eval(mo.group(1), _seen))
+
+    expanded = re.sub(r"\b(MM_[A-Z_0-9]+)\b", sub, expr)
+    expanded = re.sub(r"(?<=\d)[UL]+\b", "", expanded)
+    # Only numbers and arithmetic can survive the two substitutions above.
+    hexlit = re.fullmatch(r"\s*(0[xX][0-9A-Fa-f]+)[uUlL]*\s*", expanded)
+    if hexlit:
+        return int(hexlit.group(1), 16)
+    try:
+        if not re.fullmatch(r"[\d\s+*/()\-]+", expanded):
+            raise ValueError("not a plain arithmetic expression: %r" % expanded)
+        return int(eval(expanded))
+    except Exception as exc:
+        raise SystemExit(
+            "sw/driver/memory_map.h: cannot read %s = %r (%s)"
+            % (name, tail.strip(), exc))
 
 # Booting the real firmware costs about 77 M simulated steps - the three
 # 640x600 stage plates and the parallax tile are pre-decoded into DDR on a core
@@ -120,8 +164,15 @@ ALPHA_KEY = 0x00FF00FF
 
 # DDR scratch map -- must mirror sw/driver/memory_map.h
 ENEMY_BASE, ENEMY_COUNT, ENEMY_STRIDE = 0x01605000, 32, 16
-PBULLET_BASE, PBULLET_COUNT = 0x01620400, 128
-EBULLET_BASE, EBULLET_COUNT = 0x01605400, 192
+# Read from the firmware's own memory map, not from literals.  These two were
+# literals, and when the pools were widened the literals were updated while
+# sw/driver/memory_map.h was - for a while - left behind at the old counts:
+# every scenario here then cleared and counted 512 slots of a pool the
+# firmware only ever walked 128 (or 192) of, and nothing said so, because the
+# numbers the scenarios used were their own.  mm_value() is the same fix the
+# addresses above already use for exactly this reason.
+PBULLET_BASE, PBULLET_COUNT = mm_value("MM_PBULLET_BASE"), mm_value("MM_PBULLET_COUNT")
+EBULLET_BASE, EBULLET_COUNT = mm_value("MM_EBULLET_BASE"), mm_value("MM_EBULLET_COUNT")
 ITEM_BASE, ITEM_COUNT = 0x01605A00, 16
 PLAYER_SPRITE, PLAYER_STRIDE = 0x01605C00, 128
 
@@ -130,6 +181,7 @@ TLM_MAGIC_VAL = 0x544C4D32
 TLM = {
     'magic': 0, 'frames': 1, 'player_x': 2, 'player_y': 3, 'lives': 4,
     'damage_rows': 55,
+    'sprites': 57, 'bucket_drops': 58,
     'score': 5, 'weapon': 6, 'atk': 7, 'fire_cd': 8, 'kills': 9,
     'enemies': 10, 'pbullets': 11, 'ebullets': 12, 'items': 13, 'taken': 14,
     'boss_st': 15, 'boss_hp': 16, 'boss_pat': 17, 'pat_chg': 18,
@@ -200,10 +252,12 @@ def wait_for_boot(vm, budget=200_000_000):
     ~77 million steps, so the budget is deliberately generous.
     """
     spent = 0
-    while not vm.published and spent < budget:
+    # Boot first publishes two blank buffers while clearing scanout memory.
+    # Only the third pair is the rendered menu, after asset decoding.
+    while len(vm.right_published) < 3 and spent < budget:
         vm.step()
         spent += 1
-    assert vm.published, "the firmware never published a boot menu frame"
+    assert len(vm.right_published) >= 3, "the firmware never published a boot menu frame"
     for _ in range(TICK):
         vm.step()
 
@@ -256,8 +310,9 @@ def load_code_from_source(source_path):
             name, _, value = line.partition(" ")
             if value.strip():
                 _FW_SYMS[name.strip()] = int(value.strip(), 16)
-    _FW_FINGERPRINT = "%s-%s" % (source_path.stem,
-                                 hashlib.md5(source_path.read_bytes()).hexdigest()[:12])
+    rom = ROOT / "rtl/bitblt/asset_rom.hex"
+    _FW_FINGERPRINT = "%s-menu-v3-%s" % (source_path.stem,
+        hashlib.sha256(source_path.read_bytes() + rom.read_bytes()).hexdigest()[:12])
     _FW_SOURCE = str(source_path)
     print("  firmware: %s (%d bytes, ends at %#x, bss %r)"
           % (source_path.name, nbytes, RAM_BASE + len(words) * 4, _FW_BSS))
@@ -433,11 +488,17 @@ def check_alpha_blit(vm):
     assert keyed >= 4, "the sprite must contain colour-keyed pixels, found %d" % keyed
     assert clear > 0 and semi > 0 and opaque > 0, \
         "the sprite does not exercise the full alpha range: %d/%d/%d" % (clear, semi, opaque)
-    # The per-pixel comparison above used the LIVE background snapshot, so a
-    # constant-background (pre-blended) implementation could not have matched.
-    # A striped backdrop guarantees the aura area is never a single colour.
-    assert len(background) >= 2, \
-        "the aura was blended over a single flat colour"
+    # The per-pixel comparison above used the LIVE background snapshot, and the
+    # sprite's own alpha varies pixel by pixel, so a pre-blended constant could
+    # not have matched it - with one background colour the expected value still
+    # varies, with the alpha.
+    #
+    # This used to ALSO require the backdrop under the aura to be more than one
+    # colour, on the grounds that a striped backdrop guaranteed it.  That is not
+    # what the check is for, and B1 made it false anyway: the bullet curtain
+    # moved out of the framebuffer, so what sits under the aura is now one flat
+    # plate colour instead of a field of bullets.  The requirement was removed
+    # rather than the backdrop dressed up to satisfy it.
     return clear, semi, opaque, keyed, len(background)
 
 
@@ -455,10 +516,29 @@ def run_until_alpha(vm, budget=8_000_000):
     return vm.blit_alpha_calls > start
 
 
+_TLM_WORD0 = (TLM_BASE - SCRATCH_BASE) // 4
+
+
+def wait_telemetry(vm, key, value, budget):
+    """Wait for the same telemetry value on native and pure Python cores."""
+    index = _TLM_WORD0 + TLM[key]
+    if hasattr(vm, "run_until_word_ne"):
+        return vm.run_until_word_ne(index, value, budget)
+    spent = 0
+    while spent < budget and vm.scratch32[index] != value:
+        vm.step()
+        spent += 1
+    return spent
+
+
 def tlm(vm, key):
-    """Read one telemetry word the firmware publishes every game frame."""
-    off = TLM_BASE - SCRATCH_BASE + 4 * TLM[key]
-    return int.from_bytes(vm.scratch[off:off + 4], "little")
+    """Read one telemetry word the firmware publishes every game frame.
+
+    Uses the word view of DDR scratch.  This runs millions of times per
+    scenario inside step-wait loops, and the old form allocated a bytes
+    object (vm.scratch[off:off+4]) on every single call.
+    """
+    return vm.scratch32[_TLM_WORD0 + TLM[key]]
 
 
 def player_pos(vm):
@@ -466,9 +546,12 @@ def player_pos(vm):
 
 
 def pool_active(vm, base, count, stride, flag_off):
-    """Count active records in a DDR pool (flags byte at flag_off)."""
-    off = base - SCRATCH_BASE + flag_off
-    return sum(vm.scratch[off + i * stride] != 0 for i in range(count))
+    """Count active records in a DDR pool (flags byte at flag_off).
+
+    The walk lives in the C++ core: from Python this cost ~1.4 us per element
+    and the pool is rescanned inside per-frame wait loops.
+    """
+    return vm.count_nonzero(base - SCRATCH_BASE + flag_off, count, stride)
 
 
 def check_player_sprite(vm, px, py):
@@ -503,8 +586,11 @@ def check_player_sprite(vm, px, py):
 
 # The boot-menu backdrop (1024x600, tiled out to the 1280x720 scan) doubles as the HUD:
 # panels, and every label printed on them, are baked into this one surface.
-VISUAL_BACKGROUND = 0x03800000   # 683x384 half-size source plate
-BG_EXPANDED = 0x03800000         # the painted plate (the whole surface)
+# Both names are the firmware's own MM_VISUAL_BACKGROUND: the plate is decoded
+# (and later repainted) at that address, and a literal here is how the HUD check
+# ended up reading 0x03800000 - MM_CARD_BG - instead, 256 scanlines away.
+VISUAL_BACKGROUND = mm_value("MM_VISUAL_BACKGROUND")
+BG_EXPANDED = VISUAL_BACKGROUND  # the painted plate (the whole surface)
 VISUAL_BG_STRIDE = SCREEN_STRIDE   # the plate decodes at SCREEN_STRIDE
 
 
@@ -512,12 +598,15 @@ EBULLET_SOCKET = 0x00080814          # the dark frame every enemy shot sits in
 
 
 def check_ebullet_socket(vm):
-    """Every enemy bullet must be drawn inside the dark socket, not bare.
+    """What the renderer put in the BUCKET for an injected enemy shot.
 
-    A pale 7x7 tile with no outline disappeared into the white parallax snow
-    the moment the two overlapped, which is exactly the confusion the player
-    cannot afford.  The renderer draws a 9x9 socket one pixel outside the tile
-    first, so the ring around a bullet has to be made of that colour.
+    This used to claim it proved every bullet is drawn inside its dark socket.
+    It does not.  It clears the pool, injects one shot at (350,420), steps a
+    couple of frames and looks for that shot in the bucket table - which the
+    firmware fills as an ordinary DDR write, so what is being checked is that
+    the shot reached the table the scanout reads.  The 9x9 socket itself is
+    drawn by video_bullet_overlay from the tile store and nothing here checks
+    it.  A docstring that overstates is how that gap stayed open.
     """
     clear_pool(vm, EBULLET_BASE, EBULLET_COUNT, 8, 6)
     # (350, 420) is inside the playfield, clear of the stage banner that is
@@ -529,22 +618,23 @@ def check_ebullet_socket(vm):
     # picture: look at both and take the best.
     assert wait_frames(vm, 4), "the game stopped producing frames"
 
-    best, seen = 0, []
-    for base in FRAME_BASES:
-        fb = vm.fb[base]
-        ring = [fb[(420 + dy) * SCREEN_PITCH + 350 + dx]
-                for dy in (-1, 7) for dx in range(-1, 8)]
-        ring += [fb[(420 + dy) * SCREEN_PITCH + 350 + dx]
-                 for dy in range(0, 7) for dx in (-1, 7)]
-        hits = sum(1 for v in ring if v == EBULLET_SOCKET)
-        best = max(best, hits)
-        seen.append((hex(base), hits, " ".join(hex(v) for v in sorted(set(ring)))))
-    assert best >= 16, (
-        "the enemy bullet is drawn bare against the snow: %s"
-        % "; ".join("%s: %d/32 ring pixels in socket colour, saw %s" % s
-                    for s in seen))
-    print("  [PASS] enemy bullet sits in its dark socket (%d/32 ring pixels)"
-          % best)
+    # B1: the shot is composited by the scanout now, so the framebuffer holds
+    # none of its pixels - the old form of this check (32 pixels of the dark
+    # socket ring, read out of the framebuffer) has nothing left to look at.
+    # What it was really asking is whether the bullet the test injected got
+    # drawn, in the right place, with the right tile - and that is a question
+    # the bucket answers directly, because the bucket is where the hardware
+    # reads it from.
+    seen = []
+    best = 0
+    for buf in (0, 1):
+        hits = _bucket_covers(vm, 350, 420, colour=3, buffer=buf)
+        best = max(best, len(hits))
+        seen.append((buf, hits))
+    assert best > 0, (
+        "the enemy bullet injected at (350,420) in colour 3 is in no bucket: %s"
+        % seen)
+    print("  [PASS] enemy bullet is standing in the scanout's bucket: %s" % seen)
 
 
 BACKGROUND_PLANE = 0x01D00000      # MM_STAGE_BG: three 1366x768 plates
@@ -588,19 +678,13 @@ def check_backdrop_visible(vm, min_match=0.35):
 
 
 def check_hud_panels(vm):
-    """Both HUD gutters must be painted, and the HUD must be INSIDE them.
+    """What the two gutters and the playfield band are, in the framebuffer.
 
-    The old version compared the gutters pixel-by-pixel against the backdrop
-    bitmap.  The backdrop is drawn now (a flat panel with two accent columns),
-    so a pixel comparison has nothing to compare against - what actually
-    matters is two things a screenshot cannot fake:
-
-      1. the gutters are not left black or garbage; and
-      2. the playfield band carries no HUD at all, which is the whole point of
-         the 1366x768-native layout.
-
-    Gutter colour is sampled from the plate instead of hard-coded, so a palette
-    change cannot silently invalidate the check.
+    This used to claim the HUD itself was checked.  It is not: the checks are
+    (1) each gutter is painted over its whole height - a flat panel satisfies
+    that - and (2) the playfield band carries no gutter-panel colour.  Where the
+    HUD boxes actually are is checked by tools/check_hud_layout.py against the
+    HUD_BOXES table in main.c, at build time, not here.
     """
     fb = vm.fb[vm.right_request]
     src = vm.scratch
@@ -659,14 +743,29 @@ def steer(vm, tx, ty, trigger='x', steps=TICK // 4):
         vm.step()
 
 
-def chase_nearest_enemy(vm, budget_steps):
+def chase_nearest_enemy(vm, budget_steps=None, frames=None):
     """Crude autopilot: aim at the lowest minion still above the craft and fire.
 
-    The budget is spent in real steps - steering in slices of a quarter frame
-    keeps the stick responsive without re-reading the pools every instruction.
+    Steering is issued in slices of a quarter frame, which keeps the stick
+    responsive without re-reading the pools every instruction.
+
+    STEPS OR FRAMES, and which one a caller asks for is a real decision.  A
+    step budget buys the same scene only while a frame costs a fixed number of
+    steps, and it does not: on one and the same build the field is 25,000 steps
+    a frame while it is idle and 77,653 once the autopilot has been firing for
+    a while, so 32,000,000 steps is 415 frames on one revision and rather more
+    or fewer on the next.  A caller that has to LAND somewhere - "chase until
+    the bar is full" - asks for frames; one that only wants to poke the stick
+    for a moment can keep asking for steps.
     """
     spent = 0
-    while spent < budget_steps:
+    rounds = 0
+    while True:
+        if frames is not None:
+            if rounds >= frames:
+                break
+        elif spent >= budget_steps:
+            break
         best = None
         py = tlm(vm, 'player_y')
         for i in range(ENEMY_COUNT):
@@ -690,6 +789,9 @@ def chase_nearest_enemy(vm, budget_steps):
             flight = max(2, (py - best[1]) // 22)
             steer(vm, best[0] + 12 + best[2] * flight, 520, 'x', TICK // 4)
             spent += TICK // 4
+        if frames is not None:
+            wait_frames(vm, 1, budget=8_000_000)
+            rounds += 1
 
 
 def hold(vm, *names, frames=8):
@@ -698,13 +800,26 @@ def hold(vm, *names, frames=8):
     Inside a demo the pad is read once per main-loop iteration, and one
     iteration is a display frame plus the render time, so a single-frame press
     can fall entirely between two samples.
+
+    FRAMES, NOT STEPS.  This used to be TICK * frames on the grounds that TICK
+    - 25,000 steps - is a display frame.  That stopped being true when the
+    pools grew and again when the frame got cheaper: on an idle field a frame
+    is now about 60,000 steps, and in the busy state the spell-card scenario
+    runs in it is over 100,000 (measured: 96,164 after the autopilot has been
+    firing for a while).  A 100,000-step hold is then barely ONE iteration, and
+    a press shorter than the gap between two pad samples is a press the
+    firmware never sees - which is how that scenario failed, twenty rounds of
+    it, without a single one being sampled.  The spell card itself was fine:
+    driven by real frames, the same press spends it on the first try.  Counting
+    frames makes the hold mean the same thing whatever a frame costs.
+
+    Same repair the stick scenario's step budget needed, for the same reason.
     """
     vm.btn = raw_btn(*names)
-    for _ in range(TICK * frames):
-        vm.step()
+    for _ in range(frames):
+        wait_frames(vm, 1, budget=8_000_000)
     vm.btn = raw_btn()
-    for _ in range(TICK * 2):
-        vm.step()
+    wait_frames(vm, 2, budget=8_000_000)
 
 
 def snapshot_path():
@@ -784,7 +899,7 @@ def run_mode1_benchmark(code, output_dir=None):
     while len(vm.published) < 1 and vm.steps < 8_000_000:
         vm.step()
 
-    assert len(vm.published) >= 1, "Mode 1 failed to publish a CPU frame"
+    assert len(vm.published) >= 1, "the machine never published a frame"
     assert vm.starts >= 650, "expected >= 650 BitBlt commands, got %d" % vm.starts
     assert vm.blit_copy_calls >= 1, "the firmware never exercised OP_COPY"
     print("  [PASS] published %d CPU frame(s) in %d steps" % (len(vm.published), vm.steps))
@@ -826,7 +941,7 @@ def run_mode2_deadzone(code, output_dir=None):
             break
 
     ne, nb = tlm(vm, 'enemies'), tlm(vm, 'ebullets')
-    assert ne >= 1, "no minions appeared in the opening wave"
+    assert ne >= 2, "the opening wave never put two minions on screen at once (%d)" % ne
     assert nb > 0, "minions never fired a bullet"
     assert tlm(vm, 'boss_st') == 0, "the boss must not appear before the kill quota"
     print("  [PASS] %d minions on screen, %d enemy bullets in flight, boss still away"
@@ -1143,10 +1258,56 @@ def run_stage_progression(code, output_dir=None):
     assert kills >= WAVE_QUOTA, \
         "autopilot only killed %d minions, the quota is %d" % (kills, WAVE_QUOTA)
     print("  -> %d minions destroyed, score %d" % (kills, tlm(vm, 'score')))
+    # ---- 1b. the dialogue card, graded while it is actually up ----------
+    # The card comes up the moment the wave quota is met AND the field is clear,
+    # which is exactly where the farming loop above stops.  Everything that used
+    # to run between here and the boss wait - the pickup hunt, the caps - costs
+    # seconds of simulated time, and by the time the old code looked for
+    # `boss_st == 4` the card had been and gone.  Measured: the state walked
+    # 1 (ENTER) -> 5 (FREEZE) -> 2 (FIGHT) and neither of the two graded blocks
+    # ever executed once, while the scenario still printed PASS.  Grade it here,
+    # where it is really on screen.
+    spent = 0
+    while tlm(vm, 'boss_st') != 4 and spent < 40_000_000:
+        chase_nearest_enemy(vm, TICK)
+        spent += TICK
+    assert tlm(vm, 'boss_st') == 4, (
+        "the quota was met and the field was clear, but the boss settled on state"
+        " %d without the dialogue card ever coming up, so the occlusion box and"
+        " the page advance were not graded" % tlm(vm, 'boss_st'))
+    print("  -> dialogue card up (state 4) after %d extra steps" % spent)
+
+    # The boss's arrival card is framebuffer pixels like the pause card, and the
+    # snow layer is composited above the framebuffer, so the card is only clean
+    # because the firmware hands the scanout its rectangle to leave alone
+    # (0x8C / 0xAC).  800x176 centred in the playfield: DIALOG_* in main.c.
+    dialog_box = (283, 1082, 296, 471)
+    box_x = vm.params.get(0x8C, 0)
+    box_y = vm.params.get(0xAC, 0)
+    assert box_x >> 31, "a dialogue is on screen but no occlusion box is published"
+    now_box = (box_x & 0x7FF, (box_x >> 11) & 0x7FF,
+               box_y & 0x7FF, (box_y >> 11) & 0x7FF)
+    assert now_box == dialog_box, \
+        "dialogue occlusion box is %s, the card is %s" % (now_box, dialog_box)
+    print("  -> dialogue occlusion box x %d..%d y %d..%d follows the card"
+          % dialog_box)
+
+    # Story V3 pauses gameplay for three pages before the boss fights.  Exercise
+    # the real centre-button skip path so the old regression still reaches attack
+    # patterns without waiting for the automatic page timeouts.
+    for expected in (2, 3, 0):
+        vm.btn = raw_btn()
+        for _ in range(TICK * 2):
+            vm.step()
+        assert press_until(vm, ('ok',),
+                           lambda e=expected: tlm(vm, 'dialog') == e,
+                           budget=30_000_000), "dialog page did not advance"
+    print("  -> three dialogue pages skipped with the centre button")
 
     # ---- 2. collect a power-up ----------------------------------------
     atk0, w0, cd0, taken0 = (tlm(vm, 'atk'), tlm(vm, 'weapon'),
                              tlm(vm, 'fire_cd'), tlm(vm, 'taken'))
+    score0 = tlm(vm, 'score')
     spent = 0
     while tlm(vm, 'taken') <= taken0 and spent < 60_000_000:
         item = None
@@ -1171,8 +1332,19 @@ def run_stage_progression(code, output_dir=None):
                tlm(vm, 'fire_cd') != cd0)
     print("  -> %d power-ups taken; stats atk=%d weapon=%d fire_cd=%d%s"
           % (tlm(vm, 'taken'), tlm(vm, 'atk'), tlm(vm, 'weapon'), tlm(vm, 'fire_cd'),
-             "" if changed else " (score-only drops so far)"))
+             "" if changed else " (score-only drop)"))
     assert tlm(vm, 'score') > 0, "no score was awarded"
+    # `changed` used to be computed for the print only.  Picking up an item that
+    # moved nothing at all - no attack, no weapon level, no fire rate, no score -
+    # still passed, because the assertions around it looked at `taken` and at
+    # `score > 0`, and the score had been accumulating from kills since the first
+    # wave.  A pickup has to make SOMETHING move, and the score is now measured
+    # from the moment before the pickup rather than from zero.
+    assert changed or tlm(vm, 'score') > score0, (
+        "a power-up was collected (taken %d -> %d) but no stat and no score moved:"
+        " atk %d, weapon %d, fire_cd %d, score %d (was %d)"
+        % (taken0, tlm(vm, 'taken'), tlm(vm, 'atk'), tlm(vm, 'weapon'),
+           tlm(vm, 'fire_cd'), tlm(vm, 'score'), score0))
 
     # ---- 2b. take the caps before the boss ----------------------------
     # The boss fight is the long pole, and at the starting attack power it eats
@@ -1188,6 +1360,10 @@ def run_stage_progression(code, output_dir=None):
           % (tlm(vm, 'atk'), tlm(vm, 'weapon_lv'), tlm(vm, 'fire_cd')))
 
     # ---- 3. the boss must arrive, move and cycle random patterns -------
+    # The dialogue card itself was graded back at the top of this scenario, right
+    # after the farming loop; see the comment there for why it cannot be graded
+    # from here.  What is left here is the wait for the boss, which the page-skip
+    # presses have already pushed into BOSS_ENTER.
     spent = 0
     while tlm(vm, 'boss_st') == 0 and spent < 40_000_000:
         chase_nearest_enemy(vm, TICK * 8)
@@ -1195,57 +1371,42 @@ def run_stage_progression(code, output_dir=None):
     assert tlm(vm, 'boss_st') != 0, "the boss never appeared after the quota"
     print("  -> boss entered (hp %d)" % tlm(vm, 'boss_hp'))
 
-    # ---- 3b. the dialogue card publishes the occlusion box --------------
-    # The boss's arrival card is framebuffer pixels like the pause card, and the
-    # snow layer is composited above the framebuffer, so the card is only clean
-    # because the firmware hands the scanout its rectangle to leave alone
-    # (0x8C / 0xAC).  800x176 centred in the playfield: DIALOG_* in main.c.
-    if tlm(vm, 'boss_st') == 4:
-        dialog_box = (283, 1082, 296, 471)
-        box_x = vm.params.get(0x8C, 0)
-        box_y = vm.params.get(0xAC, 0)
-        assert box_x >> 31, "a dialogue is on screen but no occlusion box is published"
-        now_box = (box_x & 0x7FF, (box_x >> 11) & 0x7FF,
-                   box_y & 0x7FF, (box_y >> 11) & 0x7FF)
-        assert now_box == dialog_box, \
-            "dialogue occlusion box is %s, the card is %s" % (now_box, dialog_box)
-        print("  -> dialogue occlusion box x %d..%d y %d..%d follows the card"
-              % dialog_box)
-
-    # Story V3 pauses gameplay for three pages before the boss fights. Exercise
-    # the real centre-button skip path so the old regression still reaches
-    # attack patterns without waiting for the automatic page timeouts.
-    if tlm(vm, 'boss_st') == 4:
-        for expected in (2, 3, 0):
-            vm.btn = raw_btn()
-            for _ in range(TICK * 2):
-                vm.step()
-            # 30M, not 5M: one display frame costs about 2 TICK steps now (the
-            # frame renders the whole 1366x768 plate), and a page advance needs
-            # a press edge plus dialog_released, i.e. several frames plus the
-            # release gap.
-            assert press_until(vm, ('ok',),
-                               lambda e=expected: tlm(vm, 'dialog') == e,
-                               budget=30_000_000), "dialog page did not advance"
-
     # Do NOT hold fire once the fight starts.  With the caps taken below, the
     # craft kills a 400 hp boss in about five seconds, which is two pattern
     # changes - and the next assertion wants five.  What is graded here is the
     # boss's pattern book, not the kill, so the craft only has to survive.
-    seen = set()
-    spent = 0
+    #
+    # SAMPLE UNCONDITIONALLY, and that word is the whole fix.  This loop used to
+    # be `while tlm(vm,'pat_chg') < 5:` - i.e. it only collected a pattern while
+    # the counter was still short of five.  pattern_changes counts up for the
+    # whole RUN (main.c:1796, cleared in game_init() and never at a boss), so by
+    # the time the boss reached the fight the counter had already passed five,
+    # the loop body never executed, `seen` came back empty, and the assertion
+    # below reported "the boss only ever used one pattern: set()" - which reads
+    # like a broken boss and was really a broken sampler.  The boss was fine:
+    # summons was six.
+    #
     # Budget in FRAMES, not in the old step count: one steer() call is one
     # TICK, and one display frame costs about 2 TICK now (the frame renders the
     # whole 1366x768 plate and its HUD).  The boss changes pattern roughly every
-    # 120 frames, so five changes need ~600 frames = ~30 TICK of steering; the
-    # old 40M budget only bought 80.
-    while tlm(vm, 'pat_chg') < 5 and spent < 200_000_000:
+    # 120 frames, so five changes need ~600 frames of steering; the old 40M
+    # budget only bought 80, and 900 leaves room for the entry sequence.
+    seen = set()
+    spent = 0
+    f0 = tlm(vm, 'frames')
+    while (tlm(vm, 'pat_chg') < 5 or len(seen) < 2) and \
+            tlm(vm, 'frames') - f0 < 900:
         steer(vm, SPAWN_X, SPAWN_Y, None, TICK)
         seen.add(tlm(vm, 'boss_pat'))
         spent += TICK
-    assert tlm(vm, 'pat_chg') >= 5, "boss patterns never changed"
+    frames_seen = tlm(vm, 'frames') - f0
+    assert tlm(vm, 'pat_chg') >= 5, (
+        "boss patterns never changed: %d changes after %d frames (%d steps), "
+        "patterns seen %r" % (tlm(vm, 'pat_chg'), frames_seen, spent, sorted(seen)))
     assert tlm(vm, 'summons') >= 1, "the boss never summoned minions"
-    assert len(seen) >= 2, "the boss only ever used one pattern: %r" % (seen,)
+    assert len(seen) >= 2, (
+        "the boss only ever dealt one pattern in %d frames: %r"
+        % (frames_seen, sorted(seen)))
     print("  [PASS] %d pattern changes, patterns seen %r, %d summons, %d enemy bullets"
           % (tlm(vm, 'pat_chg'), sorted(seen), tlm(vm, 'summons'), tlm(vm, 'ebullets')))
     if output_dir:
@@ -1282,10 +1443,10 @@ def run_settings_menu(code, output_dir=None):
         value actually moves grades the toggle, not the sampling phase.
         """
         vm.btn = raw_btn(key)
-        spent = 0
-        while tlm(vm, field) != value and spent < budget:
-            vm.step()
-            spent += 1
+        # The wait is a step-until-telemetry-moves loop with nothing else in the
+        # body, so it runs inside the core: from Python this cost ~270 ns per
+        # instruction and the settings scenario alone spent 88 million of them.
+        spent = wait_telemetry(vm, field, value, budget)
         vm.btn = raw_btn()
         for _ in range(TICK):
             vm.step()
@@ -1306,7 +1467,7 @@ def run_settings_menu(code, output_dir=None):
     # is only pixels in the framebuffer - keeps clean lettering only because the
     # firmware hands the scanline logic the rectangle to leave alone.
     # 0x8C is {enable, x1[10:0], x0[10:0]}; 0xAC is {10'd0, y1[10:0], y0[10:0]}.
-    card_w, card_h = 512, 352
+    card_w, card_h = 512, 392
     card_x, card_y = (1366 - card_w) // 2, (768 - card_h) // 2
     box_x = vm.params.get(0x8C, 0)
     box_y = vm.params.get(0xAC, 0)
@@ -1353,6 +1514,29 @@ def run_settings_menu(code, output_dir=None):
     press_until('x', 'infrespawn', 1)
     assert tlm(vm, 'infrespawn') == 1, "INF RESPAWN did not switch back on"
     print("  -> INF RESPAWN toggles: on")
+
+    press_until('y', 'settings', 6)
+    for enabled in (0, 1):
+        vm.btn = raw_btn('x')
+        for _ in range(20_000_000):
+            vm.step()
+            if vm.params.get(0x88, 0) & 1 == enabled:
+                break
+        else:
+            raise AssertionError("GLOW FX did not reach %d" % enabled)
+        vm.btn = raw_btn()
+        goal = len(vm.right_published) + 2
+        for _ in range(20_000_000):
+            vm.step()
+            if len(vm.right_published) >= goal:
+                break
+        else:
+            raise AssertionError("pause renderer stopped while releasing GLOW FX button")
+    press_until('a', 'settings', 0)
+    print("  -> GLOW FX toggles: off / on through APB")
+    if output_dir:
+        save_frame(vm, vm.right_request, Path(output_dir) / "test9_pause_glow.bmp",
+                   Path(output_dir) / "test9_pause_glow.png")
 
     # ---- 4. RESUME goes back to the game --------------------------------
     press_until('a', 'settings', 1)
@@ -1421,6 +1605,7 @@ PAT_CUT, PAT_LOCKON, PAT_BURST, PAT_VOLLEY = 10, 11, 12, 13
 PAT_FAN = 0
 EF_HELD = 0x04                       # laid out and holding station
 CUT_PREVIEW, CUT_FIRE, CUT_HALF = 45, 18, 6
+CUT_SLOTS = 3                        # warning-hairline slots, mirrors main.c
 BURST_SHOTS = 24                     # 16 in the ring plus 8 more, staggered
 VOLLEY_SHOTS = 13                    # +-6 aim steps around the bearing
 LOCKON_TOTAL = 80                    # 60 frames of layout, 20 of holding
@@ -1448,12 +1633,15 @@ HOT_COLOURS = (0xFFFFFF, 0xFFE8A0, 0xFF9038, 0xC04828,
 LASER_X = tuple(GAME_LEFT + (GAME_RIGHT - GAME_LEFT) * (2 * k + 1) // 8
                 for k in range(4))
 
-# The bar's geometry, mirrored from memory_map.h (MM_LASER_BAR_*): one 16x480
-# tile per brightness band, three bands, stride 64.
+# The bar's geometry, mirrored from memory_map.h (MM_LASER_BAR_*): one 16x768
+# tile per brightness band, three bands, stride 64.  Height and stride are read
+# from the map rather than copied, the 480 that used to be here being a piece of
+# the 600-line screen.
 MM_LASER_BAR = mm_value("MM_LASER_BAR")
-MM_LASER_BAR_W = 16
-MM_LASER_BAR_H = 480
-MM_LASER_BAR_BYTES = 64 * 480
+MM_LASER_BAR_W = mm_value("MM_LASER_BAR_W")
+MM_LASER_BAR_H = mm_value("MM_LASER_BAR_H")
+MM_LASER_BAR_STRIDE = mm_value("MM_LASER_BAR_STRIDE")
+MM_LASER_BAR_BYTES = mm_value("MM_LASER_BAR_BYTES")
 LASER_COLOURS = (0xE03050, 0xFF6080, 0xFFC0D0, 0xFFFFFF)
 
 # The composed impact-burst frames (main.c burst_frames_build) and the cap on
@@ -1595,15 +1783,29 @@ def wait_frames(vm, n=3, budget=8_000_000):
     the pass, before the scanout flip).  Waiting for a publish keeps every
     caller that samples the frame or the telemetry afterwards looking at the
     state the firmware has actually shown.  """
-    start = tlm(vm, 'frames')
+    sc = vm.scratch32
+    foff = _TLM_WORD0 + TLM['frames']
+    step = vm.step
+    start = sc[foff]
+    target = start + n
     r0 = vm.right_request
     spent = 0
     while spent < budget:
-        if tlm(vm, 'frames') >= start + n and vm.right_request != r0:
-            return True
-        vm.step()
+        step()
         spent += 1
-    return tlm(vm, 'frames') >= start + n
+        # Check only at a NEW publication edge. A render with zero logic
+        # ticks may flip first; a later update must not make that old flip
+        # satisfy this wait while the next picture is still being drawn.
+        if vm.right_request != r0:
+            r0 = vm.right_request
+            if sc[foff] >= target:
+                return True
+    # Timed out.  Returning sc[foff] >= target here was true in exactly the
+    # case that matters - the frame counter ran on while the scanout never
+    # flipped a page - so every caller that reads this as the picture being
+    # ready got a green light it had not earned.  Every other waiter in this
+    # file returns False on timeout and lets the caller assert.
+    return False
 
 
 def start_game(vm, hold=()):
@@ -1782,7 +1984,7 @@ def run_fan_bullet_pool(code, output_dir=None):
         # one: TICK steps used to be about a frame, and the renderer has since
         # grown enough that it no longer is - which quietly made this scenario
         # miss the peak and report 57 bullets where the pool really holds 73.
-        wait_frames(vm, 1)
+        assert wait_frames(vm, 1)
         n = tlm(vm, 'pbullets')
         peak = max(peak, n)
         left, right = fan_x_split(vm, tlm(vm, 'player_x'))
@@ -1794,7 +1996,14 @@ def run_fan_bullet_pool(code, output_dir=None):
     assert peak > 64, (
         "the barrage never used more than %d slots in flight - the fan is "
         "still capped by a 64-slot pool" % peak)
-    if worst is not None:
+    # The balance check is the point of this scenario, so it must not be
+    # skipped in silence: 140 frames with no frame reaching 24 shots on the two
+    # arms together used to leave `worst` as None, run no assertion at all, and
+    # still print PASS with "worst split 0 left / 0 right".
+    assert worst is not None, (
+        "no frame ever put 24 shots on the two arms together, so the balance"
+        " check never ran (peak %d)" % peak)
+    if True:
         assert worst[3] * 2 >= worst[2], (
             "the fan is lopsided: %d shots left of the craft against %d right "
             "(frame %d) - the pool is starving one arm again"
@@ -1840,12 +2049,19 @@ def run_stick_noise(code, output_dir=None):
     print("  [PASS] 40 frames of +-24 count noise: craft still at %r" % (start,))
 
     vm.joy = (128 << 8) | 220
-    # The axis needs two consecutive gamepad_read()s to confirm, and the pad
-    # is sampled once per display pass (about 2 TICK of steps): give the push
-    # four passes so confirmation, movement and the next telemetry write all
-    # happen inside the window whatever the pass phase is.
-    for _ in range(TICK * 8):
-        vm.step()
+    # The axis needs two consecutive gamepad_read()s to confirm, and the pad is
+    # sampled once per display pass - give the push four passes so
+    # confirmation, movement and the next telemetry write all happen inside the
+    # window whatever the pass phase is.
+    #
+    # A pass is NOT 2 TICK any more.  TICK is 25,000 steps and it was chosen
+    # when that was a display frame; with both bullet pools at 512 slots a
+    # frame costs about 80,000 steps (measured: 79,613), so 8 TICK is three
+    # passes' worth of steps and the push was still being confirmed when the
+    # loop ended.  Frames, not a step guess: wait for eight whole frames, plus
+    # one so the telemetry written at the end of the last one is readable.
+    for _ in range(9):
+        wait_frames(vm, 1, budget=8_000_000)
     moved = player_pos(vm)
     assert moved[0] > start[0], \
         "a deliberate push no longer moves the craft: %r" % (moved,)
@@ -1879,7 +2095,16 @@ def run_spell_card(code, output_dir=None):
             break
         top_up_minions(vm, want=2, drop=140)
         before = tlm(vm, 'kills')
-        chase_nearest_enemy(vm, 12_000_000)
+        # 120 FRAMES, and the count of frames is the point.  This used to be a
+        # step budget, and a step budget does not survive a change to what a
+        # frame costs: 12M steps was ~150 frames on the revision that picked
+        # it, 32M steps was ~415 on the next one, and on the one after that
+        # 415 frames of autopilot left 86 shots in the air - whose own cull
+        # rate (two or three a frame) is the same order as the sixteen the
+        # card throws, so the ring assertion below graded the cull rate rather
+        # than the card.  Frames put the scenario back where it was written:
+        # a handful of shots in flight when the card is played.
+        chase_nearest_enemy(vm, frames=120)
         kills += max(0, tlm(vm, 'kills') - before)
     assert tlm(vm, 'bomb') >= SPELL_MAX_CHARGE, \
         "the bar never filled: %d/%d after %d kill(s)" % (
@@ -1891,21 +2116,75 @@ def run_spell_card(code, output_dir=None):
     # away: telemetry is written once per display frame, so the shots were
     # swept away again before the counter caught up and the assertion failed
     # for a card that had done its job.
+    score_before_card = tlm(vm, 'score')
+    pb_before_card = tlm(vm, 'pbullets')
+    live_before = sum(1 for m in range(EBULLET_COUNT)
+                      if vm.scratch[_pool_offset(EBULLET_BASE, m, 8, 6)] != 0)
     for k in range(12):                     # a ring of shots to sweep away
         inject_ebullet(vm, GAME_LEFT + 80 + k * 32, 320, 0, 0, color=3)
-    live = sum(1 for i in range(EBULLET_COUNT)
-               if vm.scratch[_pool_offset(EBULLET_BASE, i, 8, 6)] != 0)
-    assert live >= 12, "the enemy shots were not injected (%d live)" % live
+    # inject_ebullet() asserts that each slot took, so counting the pool after
+    # the injection only proves that the pool is not empty - and it is not, the
+    # stage has been spawning all along (31 live when this was written).  What
+    # is worth pinning is the DELTA: the ring this scenario added.
+    live_after = sum(1 for m in range(EBULLET_COUNT)
+                    if vm.scratch[_pool_offset(EBULLET_BASE, m, 8, 6)] != 0)
+    assert live_after >= live_before + 12, "the ring added %d shots, expected 12" % (live_after - live_before)
 
     # hold(), not press(): the card is spent on the FIRST pass that samples
     # the centre button, and a short press can open and close between two
     # samples of a busy frame.  Holding across several passes guarantees the
     # edge is seen and the field is swept before the check below.
-    hold(vm, 'ok', frames=8)
+    #
+    # But a FIXED number of passes does not guarantee anything: a single game
+    # pass can run longer than eight display frames when the frame loop is
+    # catching up on logic steps, and then the whole hold lands inside one pass
+    # and is never sampled at all.  Measured: inserting 48,000 inert steps into
+    # boot - touching nothing else - flips this assertion, which is how the
+    # hold/frames=8 version was found to be phase-luck rather than a judge.
+    # press_until() exists for exactly this; hold in short bursts and stop as
+    # soon as the charge is actually gone, so the button is seen whenever the
+    # pass happens to sample it.
+    # Twenty rounds, not eight.  Each round is hold(frames=4) plus the two
+    # settle frames, so eight rounds is 48 display frames - and once the pools
+    # are 512 slots a single game pass can run well past eight frames, which is
+    # the same phase-luck the comment above describes.  The loop still stops
+    # the moment the charge is gone, so the extra rounds cost nothing when the
+    # button is seen on the first one.
+    # Press the button and read the pool on the FIRST frame the charge is gone.
+    #
+    # hold(frames=4) used to do the pressing, and the reading happened after it
+    # plus two settle frames.  Six frames is fine on a quiet field and wrong on
+    # this one: a maxed fan leaves 70-odd shots in the air, and they leave the
+    # field at two or three a frame, which is the same order as the sixteen the
+    # card throws - the scenario read 71 -> 71 and 87 -> 84 for cards that had
+    # worked perfectly (checked directly against the pool: 86 shots before the
+    # press, 94 immediately after).  One frame of window makes the ring
+    # unmistakable, and polling per frame also removes the phase luck the old
+    # fixed-rounds loop was fighting.
+    vm.btn = raw_btn('ok')
+    pb_before_card = tlm(vm, 'pbullets')
+    pb_after_card = None
+    for _ in range(80):
+        wait_frames(vm, 1, budget=8_000_000)
+        if tlm(vm, 'bomb') < SPELL_MAX_CHARGE:
+            pb_after_card = tlm(vm, 'pbullets')
+            break
+    vm.btn = raw_btn()
+    assert pb_after_card is not None, "the centre button never spent the card"
     assert wait_frames(vm, 2), "the game stopped producing frames"
     left = tlm(vm, 'ebullets')
     assert left <= 2, \
         "the spell card left %d enemy shots on the field" % left
+    # The docstring promises two things and only the first was graded: the swept
+    # shots have to be CONVERTED INTO SCORE, and the card has to throw a ring of
+    # the craft's own shots.  A card that silently erased the field and did
+    # neither would have passed every assertion above.
+    assert tlm(vm, 'score') > score_before_card, (
+        "the card swept the field but the score did not move (%d -> %d)"
+        % (score_before_card, tlm(vm, 'score')))
+    assert pb_after_card > pb_before_card, (
+        "the card threw no ring of the craft's own shots (%d -> %d in flight)"
+        % (pb_before_card, pb_after_card))
     assert tlm(vm, 'bomb') < SPELL_MAX_CHARGE, \
         "the card did not spend its charge"
     print("  [PASS] 12 shots swept away, charge spent: %d left on the field, "
@@ -1981,11 +2260,11 @@ PARTICLE_MOTE = 2
 
 def _live_motes(vm):
     """Count the rising glow motes the hit sweep is supposed to leave behind."""
-    base = sym_addr('game_particles') - RAM_BASE
+    base = sym_addr('game_particles')
     n = 0
     for i in range(MAX_PARTICLES):
         off = base + i * 8
-        if vm.ram[off + 6] and vm.ram[off + 7] == PARTICLE_MOTE:
+        if vm.load(off + 6, 1) and vm.load(off + 7, 1) == PARTICLE_MOTE:
             n += 1
     return n
 
@@ -2146,7 +2425,7 @@ def run_hit_sweep(code, output_dir=None):
     # while `right_request` flips a step earlier, so the frame the hit was
     # detected on can still be the buffer from before the sweep - which is
     # exactly how the first version of this check read zero ring pixels.
-    wait_frames(vm, 1)
+    assert wait_frames(vm, 1)
     ring_timer = peek(vm, 'hit_ring_timer', 1)
     assert ring_timer > 0, "the shockwave expired before it could be checked"
     r = 14 + (HIT_RING_FRAMES - ring_timer) * 10
@@ -2161,7 +2440,7 @@ def run_hit_sweep(code, output_dir=None):
     # and let a few frames run with it sitting there.
     hits0 = tlm(vm, 'hits')
     inject_ebullet(vm, px + 2, py + 2)
-    wait_frames(vm, 4)
+    assert wait_frames(vm, 4)
     assert tlm(vm, 'hits') == hits0, \
         "a second hit landed through the invulnerability window (%d -> %d)" % (
             hits0, tlm(vm, 'hits'))
@@ -2173,7 +2452,7 @@ def run_hit_sweep(code, output_dir=None):
     # invisible, which is the older bug this gate was written to prevent.
     shown = hidden = 0
     for _ in range(24):
-        wait_frames(vm, 1)
+        assert wait_frames(vm, 1)
         if _craft_visible(vm, px, py):
             shown += 1
         else:
@@ -2196,7 +2475,7 @@ def run_hit_sweep(code, output_dir=None):
     clear_pool(vm, EBULLET_BASE, EBULLET_COUNT, 8, 6)
     clear_pool(vm, ENEMY_BASE, ENEMY_COUNT, ENEMY_STRIDE, 13)
     poke(vm, sym_addr('invuln'), 0, 1)  # drop the cover: the next shot must land
-    wait_frames(vm, 1)
+    assert wait_frames(vm, 1)
     score0, hits0 = tlm(vm, 'score'), tlm(vm, 'hits')
     inject_ebullet(vm, px + 2, py + 2)
     spent = 0
@@ -2219,7 +2498,7 @@ def run_hit_sweep(code, output_dir=None):
     # and graded: it has to ramp IN, crest once, and then disperse.
     levels = []
     for _ in range(140):
-        wait_frames(vm, 1)
+        assert wait_frames(vm, 1)
         mode, intensity = _flash_level(vm)
         if mode != COLOR_MATRIX_FLASH:
             break
@@ -2375,7 +2654,7 @@ def run_stage_backdrop_progression(code, output_dir=None):
             seen.append(bg)
             print("  -> backdrop %d active (stage %d) after %d simulated steps"
                   % (bg, tlm(vm, 'stage'), vm.steps - started))
-            wait_frames(vm, 2)
+            assert wait_frames(vm, 2)
             check_backdrop_visible(vm)
         las = tlm(vm, 'laser')
         if las > 0 and not laser_on:
@@ -2393,7 +2672,7 @@ def run_stage_backdrop_progression(code, output_dir=None):
     assert tlm(vm, 'stage_bg') == 1, \
         "the second backdrop never became active (sequence %r)" % (seen,)
     poke(vm, sym_addr("stage_bg_active"), 2)
-    wait_frames(vm, 3)
+    assert wait_frames(vm, 3)
     assert tlm(vm, 'stage_bg') == 2, \
         "stage 3 could not be switched to (stage_bg = %d)" % tlm(vm, 'stage_bg')
     seen.append(2)
@@ -2471,7 +2750,7 @@ def run_impact_fx(code, output_dir=None):
     vm.btn = raw_btn('x')                      # hold fire
     frames = 0
     while tlm(vm, 'kills') == kills0 and frames < 300:
-        wait_frames(vm, 1)
+        assert wait_frames(vm, 1)
         frames += 1
     assert tlm(vm, 'kills') > kills0, \
         "the parked minion was never destroyed (%d frames of fire)" % frames
@@ -2488,9 +2767,9 @@ def run_impact_fx(code, output_dir=None):
     per_frame = df / dn
     print("  -> kill at (%d,%d) after %d frames; %.1f BitBlt fills/frame "
           "while the effect is live" % (ex, ey, frames, per_frame))
-    assert per_frame >= 20, (
-        "the impact effect is not being drawn: %.1f fills/frame, and a live "
-        "five-layer burst issues about 48" % per_frame)
+    # A fill count alone no longer proves this: the five layers are one
+    # composed frame per age now, so the burst costs ONE copy command per frame.
+    # The real verification is done below via hot pixels and the shockwave annulus.
 
     fb = vm.fb[vm.right_request]
     hot = 0
@@ -2515,7 +2794,7 @@ def run_impact_fx(code, output_dir=None):
                     n += 1
         if n > hot:
             hot = n
-        wait_frames(vm, 1)
+        assert wait_frames(vm, 1)
     print("  -> peak %d pixels of layer colour around the kill" % hot)
     assert hot >= 4, "no burst layer colour appeared around the kill"
 
@@ -2543,7 +2822,7 @@ def run_impact_fx(code, output_dir=None):
                     r += 1
         if r > ring:
             ring = r
-        wait_frames(vm, 1)
+        assert wait_frames(vm, 1)
     print("  -> peak %d of them on the 30..50 pixel shockwave ring" % ring)
     # 8, not 20.  The ring is drawn as 16 dots on a 16-direction table plus an
     # ember ring, and burst_paint() then stamps the licensed 64x64 explosion
@@ -2593,7 +2872,7 @@ def run_hud_follows_state(code, output_dir=None):
     bullets = []
     for name, addr, values, box in (
             ("lives",   "lives",  (3, 1),      (0, 145, 170, 205)),
-            ("weapon",  "weapon", (1, 3),      (1190, 92, 1360, 150)),
+            ("weapon",  "weapon", (1, 3),      (1190, 15, 1362, 55)),
             ("score",   "score",  (123456, 7), (0, 236, 178, 290))):
         a = sym_addr(addr)
         poke(vm, a, values[0], 1 if addr != "score" else 4)
@@ -2619,7 +2898,7 @@ def run_hud_follows_state(code, output_dir=None):
     assert wait_frames(vm, 2, budget=60_000_000), \
         "the CPU render path never finished a frame"
     cpu = snap()
-    n = changed(hw, cpu, (1190, 422, 1362, 468))
+    n = changed(hw, cpu, (1190, 205, 1362, 245))
     print("  -> backend  FPGA -> CPU changed %d pixels" % n)
     assert n > 0, (
         "the backend token did not follow hw_accel: 'FPGA' kept its last two "
@@ -2852,9 +3131,8 @@ def wait_published(vm, budget=8_000_000):
 
 def _count_held(vm):
     """Enemy shots that are on station, waiting for 6.2 to release them."""
-    off = EBULLET_BASE - SCRATCH_BASE
-    return sum(1 for i in range(EBULLET_COUNT)
-               if vm.scratch[off + i * 8 + 6] & EF_HELD)
+    return sum(bool(vm.scratch[EBULLET_BASE - SCRATCH_BASE + 6 + i * 8] & EF_HELD)
+               for i in range(EBULLET_COUNT))
 
 
 def _count_active_ebullets(vm):
@@ -2863,19 +3141,103 @@ def _count_active_ebullets(vm):
     Telemetry carries the same number, but only for the frame the firmware
     has already published, which is one behind anything a scenario just did.
     """
-    off = EBULLET_BASE - SCRATCH_BASE
-    return sum(1 for i in range(EBULLET_COUNT)
-               if vm.scratch[off + i * 8 + 6] & 0x01)
+    return sum(bool(vm.scratch[EBULLET_BASE - SCRATCH_BASE + 6 + i * 8] & 1)
+               for i in range(EBULLET_COUNT))
 
 
 def _count_moving(vm):
-    off = EBULLET_BASE - SCRATCH_BASE
-    n = 0
-    for i in range(EBULLET_COUNT):
-        p = off + i * 8
-        if (vm.scratch[p + 6] & 0x01) and (vm.scratch[p + 4] or vm.scratch[p + 5]):
-            n += 1
-    return n
+    start = EBULLET_BASE - SCRATCH_BASE
+    return sum(bool(vm.scratch[start + i * 8 + 6] & 1) and
+               bool(vm.scratch[start + i * 8 + 4] or vm.scratch[start + i * 8 + 5])
+               for i in range(EBULLET_COUNT))
+
+
+# B1: where the bullet curtain lives now.  The firmware appends one entry per
+# (bullet, GROUP of scanlines it covers) to a per-group bucket in DDR, in draw
+# order; the scanout composites from it and the framebuffer never sees a bullet.
+# A scenario that used to look for bullet pixels has to look here instead - which
+# is the same place the hardware looks.
+MM_BUCKET_TABLE = mm_value("MM_BUCKET_TABLE")
+MM_BUCKET_STRIDE = mm_value("MM_BUCKET_STRIDE")
+MM_BUCKET_ROWS = mm_value("MM_BUCKET_ROWS")
+MM_BUCKET_SLOTS = mm_value("MM_BUCKET_SLOTS")
+MM_BUCKET_GROUP_ROWS = mm_value("MM_BUCKET_GROUP_ROWS")
+# Rows every slot's tile has in the scanout's store.  bullet_store_build() pads
+# the orb run out to this many so the scanout can reject an out-of-range tile row
+# with one constant comparison - see video_bullet_overlay.v's trow guard.
+TILE_ROWS = 26
+
+
+def _bucket_row(vm, row, buffer=None):
+    """The live entries of one scanline: [(bx, tile_row, slot, width, hue)].
+
+    The table's row unit is a GROUP of MM_BUCKET_GROUP_ROWS scanlines, so this
+    reads the group's bucket and reconstructs the tile row the entry left
+    implicit:
+
+        tile_row = stored trow_base + (row mod MM_BUCKET_GROUP_ROWS)
+
+    Entries that reconstruct outside [0, 26) are dropped, which is exactly what
+    the scanout's trow guard does - they would address the neighbouring tile.
+    So what this returns is what the scanout would actually draw.
+
+    Empty cells read back as zero, and a zero width can never match a pixel, so
+    "nonzero width" is exactly "live entry" - the scanout uses the same rule.
+
+    hue is [31:29]: the colour page the bullet named for itself (bucket_put in
+    main.c).  An enemy shot's colour used to be folded into its slot --
+    (colour << 4) | heading -- and since the colour split the slot is just the
+    heading, 0..15, with the page in its own field.  The slot field is [22:17]
+    now - seven bits, not eight - because trow_base needed a sixth bit to carry
+    the negative values a group boundary produces.
+    """
+    if buffer is None:
+        buffer = 0 if vm.right_request <= 0x00C00000 else 1
+    off = (MM_BUCKET_TABLE - SCRATCH_BASE
+           + buffer * MM_BUCKET_STRIDE * MM_BUCKET_ROWS
+           + (row // MM_BUCKET_GROUP_ROWS) * MM_BUCKET_STRIDE)
+    dy = row % MM_BUCKET_GROUP_ROWS
+    out = []
+    for k in range(MM_BUCKET_SLOTS):
+        p = off + k * 4
+        v = int.from_bytes(vm.scratch[p:p + 4], "little")
+        if (v >> 24) & 31:
+            trow = ((v >> 11) & 0x3F) - 8 + dy
+            if 0 <= trow < TILE_ROWS:
+                out.append((v & 0x7FF, trow, (v >> 17) & 0x7F,
+                            (v >> 24) & 31, (v >> 29) & 7))
+    return out
+
+
+def _bucket_covers(vm, x, y, colour=None, buffer=None):
+    """Entries on scanline y whose span contains x, optionally of one colour."""
+    hits = []
+    for bx, trow, slot, w, hue in _bucket_row(vm, y, buffer):
+        if bx <= x < bx + w:
+            if colour is None or hue == (colour & 7):
+                hits.append((bx, trow, slot, w, hue))
+    return hits
+
+
+def _hair_slots(vm):
+    """[(x, outer, left, centre)] for the three cut/beam warning hairlines.
+
+    The scanout draws them now (rtl/v_dma/video_beam.v, APB 0xC0 + 16k): a
+    one-pixel column costs a DRAM row activation to write four bytes, and three
+    slots of them ran to 4,608 rows in a frame, so the engine issues nothing for
+    them and there is nothing in the picture to count.  What the firmware
+    controls - and therefore what a scenario grades - is where each line stands
+    and which colour it carries, which is the same place the boss's laser columns
+    are read back from.
+    """
+    out = []
+    for k in range(CUT_SLOTS):
+        b = 0xC0 + 16 * k
+        out.append((vm.params.get(b, 0) & 0xFFF,
+                    vm.params.get(b + 4, 0) & 0xFFFFFF,
+                    vm.params.get(b + 8, 0) & 0xFFFFFF,
+                    vm.params.get(b + 12, 0) & 0xFFFFFF))
+    return out
 
 
 def _boss_arena(vm, pattern, wave=0):
@@ -2934,13 +3296,21 @@ def run_stage2_skills(code, output_dir=None):
     _boss_arena(vm, PAT_CUT)
     px, py = player_pos(vm)
     assert wait_frames(vm, 2), "the game stopped producing frames"
-    fb = vm.fb[vm.right_request]
-    hair = sum(1 for y in range(110, 570, 13)
-               if (fb[y * SCREEN_PITCH + px - 1] & 0xFFFFFF) in CUT_PREVIEW_COLOURS)
-    print("  -> 6.1 preview: %d of 36 sample rows carry the hairline" % hair)
-    assert hair >= 10, (
-        "the cut's preview is not on screen: %d of 36 rows sampled at the "
-        "craft's own column" % hair)
+    # The hairline is a scanout column now, not framebuffer pixels - see
+    # _hair_slots().  The judgement is unchanged: a slot is standing, it is
+    # standing in the craft's own column, and it carries one of the preview's
+    # two colours.
+    live = [s for s in _hair_slots(vm) if s[0]]
+    print("  -> 6.1 preview: %d slot(s) standing, %s"
+          % (len(live), [(s[0], hex(s[2]), hex(s[3])) for s in live]))
+    assert live, "the cut's preview is not on screen: no hairline slot is standing"
+    assert any(abs(s[0] - px) <= 2 for s in live), (
+        "the preview stands at %s but the craft it promises to cut is at x=%d"
+        % ([s[0] for s in live], px))
+    assert any(s[2] in CUT_PREVIEW_COLOURS or s[3] in CUT_PREVIEW_COLOURS
+               for s in live), (
+        "the standing preview carries none of the preview's colours: %s"
+        % [(hex(s[2]), hex(s[3])) for s in live])
 
     spent = 0
     while peek(vm, 'cut_phase', 1) == 1 and spent < 30_000_000:
@@ -3152,6 +3522,7 @@ def run_boss_opener(code, output_dir=None):
     poke(vm, sym_addr('boss_state'), 1, 1)       # BOSS_ENTER
     assert wait_frames(vm, 2), "the boss entrance never produced a frame"
     assert tlm(vm, 'boss_st') == BOSS_FREEZE,         "the entrance did not hold the field (boss_st=%d)" % tlm(vm, 'boss_st')
+    assert wait_published(vm), "the entrance frame was never published"
     ent_cards = backdrop_scores(vm)
     ent_best = max(ent_cards, key=ent_cards.get)
     assert ent_best == "CARD_BG", (
@@ -3401,6 +3772,365 @@ def run_boss_opener(code, output_dir=None):
     return vm
 
 
+
+
+# ----------------------------------------------------------------------
+# the pressure stage (Task 11/12)
+# ----------------------------------------------------------------------
+# B+X on the boot menu drops straight into a boss fight with the bar pinned
+# at full and a 192-shot storm on the field.  These four mirror main.c.
+STRESS_STORM_TARGET = int(re.search(
+    r"#define\s+STRESS_STORM_TARGET\s+(\d+)",
+    (ROOT / "sw/app/main.c").read_text(encoding="utf-8"))[1])
+STRESS_CARD_PERIOD = 180
+BOSS_LASER_FRAMES = 90
+BOSS_LASER_COLS = 4
+STRESS_BG_BASE = mm_value("MM_STRESS_BG")   # the stage's own volcano
+
+
+def _laser_columns(vm):
+    """The four column centres the scanout was last told to draw.
+
+    APB 0xB0/0xB4, two 12-bit centres a word.  video_laser.v draws these
+    columns at scanout, so there is nothing in the framebuffer to sample -
+    where the firmware aimed them is the observable.
+    """
+    lo = vm.params.get(0xB0, 0)
+    hi = vm.params.get(0xB4, 0)
+    return (lo & 0xFFF, (lo >> 12) & 0xFFF, hi & 0xFFF, (hi >> 12) & 0xFFF)
+
+
+def _laser_enabled(vm):
+    """(enable, band) out of the weather control word (APB 0x78)."""
+    w = vm.params.get(0x78, 0)
+    return (1 if (w & (1 << 18)) else 0, (w >> 19) & 0x3)
+
+
+def _opener_columns():
+    """BOSS_LASER_X(k), mirrored from the macro in main.c."""
+    return tuple(GAME_LEFT + (GAME_RIGHT - GAME_LEFT) * (2 * k + 1) // 8
+                 for k in range(BOSS_LASER_COLS))
+
+
+def _enter_pressure_stage(vm):
+    """Hold B and press X on the boot menu -> SCREEN_STRESS_STAGE.
+
+    It is an edge on X with B still held, which menu_enter() cannot express:
+    that helper only ever presses one button at a time.
+    """
+    vm.joy = (128 << 8) | 128
+    wait_for_boot(vm)
+    vm.btn = raw_btn('b', 'x')
+    for _ in range(TICK * 4):
+        vm.step()
+    vm.btn = raw_btn()
+    for _ in range(TICK * 2):
+        vm.step()
+
+
+def run_stress_lab(code, output_dir=None):
+    """The pressure stage has to carry the BOSS lasers too.
+
+    The stage behind B+X is a boss fight with no run-up: the bar is pinned at
+    full - which is what keeps a death from clearing the barrage - and the
+    field is never held.  That pin is exactly what used to hide every laser
+    the boss has:
+
+      * boss_opener() is the only thing that raises the four laser columns,
+        and it is reached from the entrance hold or from one of the two
+        health marks; this stage starts in BOSS_FIGHT at full health, so
+        none of those ever happened and boss_laser stayed 0 for the whole
+        run;
+      * the pattern draw at wave 1 is the SPIRAL family plus PAT_RAIN, and
+        neither PAT_CUT nor PAT_BEAM is in it, so the cut and the three
+        staggered beams were unreachable as well.
+
+    Everything below is graded on the registers the scanout draws from - the
+    weather control word's enable bit, the four column centres, the three
+    hairline slots - because none of those layers ever touch the framebuffer.
+    """
+    print("\n" + "=" * 65)
+    print(" [TEST 26] Pressure stage: the BOSS lasers reach it")
+    print("=" * 65)
+    vm = new_vm(code)
+    _enter_pressure_stage(vm)
+    wave = peek(vm, 'wave', 2)
+    assert wave == 1, "B+X did not land in the pressure stage (wave=%d)" % wave
+    assert tlm(vm, 'boss_st') == BOSS_FIGHT, (
+        "the pressure stage did not open on a fight (boss_st=%d)"
+        % tlm(vm, 'boss_st'))
+    print("  -> B+X landed in the pressure stage: wave 1, boss at station")
+
+    # ---- 1. the stage opens with the opener --------------------------
+    # stage_strip_render() publishes the control word and the four centres
+    # before the world update runs, so the opener arms them a frame late:
+    # ---- 1. the four opener columns stay in the campaign ------------
+    # They belong to the entrance hold and to the two health marks, and
+    # this stage crosses neither (the bar is pinned at full).  The lasers
+    # it does fire are pattern ones - PAT_CUT and PAT_BEAM - and they are
+    # graded further down.
+    assert wait_frames(vm, 2), "the game stopped producing frames"
+    laser_seen = 0
+    for _ in range(60):
+        assert wait_frames(vm, 1), "the game stopped producing frames"
+        if peek(vm, 'boss_laser', 1):
+            laser_seen += 1
+    print("  -> 60 frames in: boss_laser > 0 on %d of them" % laser_seen)
+    assert laser_seen == 0, (
+        "the pressure stage raised the opener's columns on %d frames: "
+        "that set piece belongs to the campaign" % laser_seen)
+
+    # ---- 1b. and the stage keeps its own sky -------------------------
+    # In the campaign the opener drags the card's backdrop in behind it
+    # (boss_card_active, set by the entrance hold and by the two health
+    # marks).  This stage's plate is the volcano it was built around,
+    # so its opener must leave that flag alone.
+    mine = plate_match(vm, STRESS_BG_BASE)
+    card = plate_match(vm, MM_CARD_BG)
+    print("  -> the playfield matches the stage plate %.1f%% and the "
+          "card sky %.1f%%" % (100 * mine, 100 * card))
+    assert mine >= 0.6, (
+        "the opener swapped the pressure stage backdrop: only %.1f%% "
+        "of the playfield is MM_STRESS_BG" % (100 * mine))
+    assert mine > card, (
+        "the playfield looks more like the card sky (%.1f%%) than the "
+        "stage own plate (%.1f%%)" % (100 * card, 100 * mine))
+
+    # ---- 2. the rules the stage was built around still hold ----------
+    # Pinned bar, no hold, no field clearing: that is what makes the barrage
+    # continuous.
+    for _ in range(24):
+        assert wait_frames(vm, 1), "the game stopped producing frames"
+        assert peek(vm, 'boss_hp', 2) == peek(vm, 'boss_hp_max', 2), (
+            "the pressure stage bar is not pinned any more (%d of %d)"
+            % (peek(vm, 'boss_hp', 2), peek(vm, 'boss_hp_max', 2)))
+        assert tlm(vm, 'boss_st') == BOSS_FIGHT, (
+            "the pressure stage held the field: boss_st=%d" % tlm(vm, 'boss_st'))
+    active = _count_active_ebullets(vm)
+    print("  -> %d shots in the air, bar pinned at %d, no hold for 24 frames"
+          % (active, peek(vm, 'boss_hp_max', 2)))
+    assert active >= STRESS_STORM_TARGET * 3 // 4, (
+        "the storm is not on the field: %d of %d shots"
+        % (active, STRESS_STORM_TARGET))
+
+    # ---- 5. both laser skills are in the stage's draw ----------------
+    seen = set()
+    for _ in range(60):
+        poke(vm, sym_addr('boss_pat_timer'), 0, 1)
+        assert wait_frames(vm, 1), "the game stopped producing frames"
+        seen.add(tlm(vm, 'boss_pat'))
+    print("  -> 60 draws dealt %s" % sorted(seen))
+    assert PAT_CUT in seen and PAT_BEAM in seen, (
+        "the stage cannot deal both laser skills (drew %s): wave 1's book "
+        "has neither PAT_CUT nor PAT_BEAM in it" % sorted(seen))
+
+    # ---- 6. the cut, aimed at the craft ------------------------------
+    # Cleared first, so this is the pattern's own preview and not one the 60
+    # draws above left standing.
+    poke(vm, sym_addr('cut_phase'), 0, 1)
+    poke(vm, sym_addr('beam_phase'), 0, CUT_SLOTS)
+    poke(vm, sym_addr('beam_timer'), 0, CUT_SLOTS)
+    poke(vm, sym_addr('boss_pattern'), PAT_CUT, 1)
+    poke(vm, sym_addr('boss_pat_timer'), 127, 1)
+    poke(vm, sym_addr('boss_fire_timer'), 0, 1)
+    assert wait_frames(vm, 2), "the game stopped producing frames"
+    px, _py = player_pos(vm)
+    live = [s for s in _hair_slots(vm) if s[0]]
+    print("  -> the cut preview: %s (craft at x=%d)"
+          % ([(s[0], hex(s[2]), hex(s[3])) for s in live], px))
+    assert live, ("the cut preview hairline never stood up in the pressure "
+                  "stage")
+    assert any(abs(s[0] - px) <= 2 for s in live), (
+        "the preview stands at %s but the craft it promises to cut is at x=%d"
+        % ([s[0] for s in live], px))
+    assert any(s[2] in CUT_PREVIEW_COLOURS or s[3] in CUT_PREVIEW_COLOURS
+               for s in live), (
+        "the standing preview carries none of the preview colours: %s"
+        % [(hex(s[2]), hex(s[3])) for s in live])
+
+    spent = 0
+    while peek(vm, 'cut_phase', 1) == 1 and spent < 30_000_000:
+        vm.step()
+        spent += 1
+    assert peek(vm, 'cut_phase', 1) == 2, (
+        "the preview never turned into a beam (phase=%d)"
+        % peek(vm, 'cut_phase', 1))
+    assert wait_published(vm), "the frame carrying the beam was never published"
+    assert _laser_enabled(vm)[0], (
+        "the cut fired but the scanout columns were never enabled")
+    beam_cols = [c for c in _laser_columns(vm) if c]
+    assert any(abs(c - px) <= 2 for c in beam_cols), (
+        "the beam is at %s but the craft it is aimed at is at x=%d"
+        % (beam_cols, px))
+    print("  -> the cut fired %d steps later, beam at %s" % (spent, beam_cols))
+
+    # ---- 7. the three staggered beams --------------------------------
+    for k in range(CUT_SLOTS):
+        poke(vm, sym_addr('beam_phase') + k, 0, 1)
+    poke(vm, sym_addr('boss_pattern'), PAT_BEAM, 1)
+    poke(vm, sym_addr('boss_pat_timer'), 127, 1)
+    poke(vm, sym_addr('boss_fire_timer'), 0, 1)
+    assert wait_frames(vm, 2), "the game stopped producing frames"
+    lanes = sorted(s[0] for s in _hair_slots(vm) if s[0])
+    assert len(lanes) >= CUT_SLOTS, (
+        "the three staggered beams put %d columns on screen: %s"
+        % (len(lanes), lanes))
+    gaps = [lanes[k + 1] - lanes[k] for k in range(len(lanes) - 1)]
+    assert max(gaps) <= 80, (
+        "the beams are not the craft lane and its neighbours: gaps %s" % gaps)
+    print("  -> the three beams stand at %s" % lanes)
+
+    print("  [PASS] columns, cut and beams are all reachable in the pressure "
+          "stage")
+    if output_dir:
+        save_frame(vm, vm.right_request,
+                   Path(output_dir) / "test26_stresslab.bmp",
+                   Path(output_dir) / "test26_stresslab.png")
+    return vm
+
+# ----------------------------------------------------------------------
+# the lasers: one book per stage, and the registers when a run ends
+# ----------------------------------------------------------------------
+
+def run_laser_books(code, output_dir=None):
+    """Every campaign stage has to be able to deal both laser skills.
+
+    Stage 1's table has always carried PAT_CUT and PAT_BEAM.  Stage 2's did
+    not - it was RAIN and the spiral family, three patterns in all - so that
+    boss could never show a laser at all, and a player who reached stage 2
+    fought a boss whose only attacks were bullets.  This grades the report
+    directly: each stage, its own book, both skills reachable.
+
+    It reads the pattern the world is holding (telemetry's boss_pat) rather
+    than the table in main.c, so the shipped tables are what is graded.
+    """
+    print("\n" + "=" * 65)
+    print(" [TEST 27] Every campaign stage can deal both laser skills")
+    print("=" * 65)
+    last = None
+    for wave in (0, 1, 2):
+        vm = new_vm(code)
+        start_game(vm)
+        vm.joy = (128 << 8) | 128
+        _boss_arena(vm, PAT_FAN, wave=wave)
+        seen = {}
+        for _ in range(120):
+            poke(vm, sym_addr('boss_pat_timer'), 0, 1)
+            assert wait_frames(vm, 1), "the game stopped producing frames"
+            p = tlm(vm, 'boss_pat')
+            seen[p] = seen.get(p, 0) + 1
+        last = vm
+        cut = seen.get(PAT_CUT, 0)
+        beam = seen.get(PAT_BEAM, 0)
+        print("  -> stage %d (wave %d): 120 draws, %d distinct, CUT x%d BEAM x%d"
+              % (wave + 1, wave, len(seen), cut, beam))
+        assert cut and beam, (
+            "stage %d cannot deal both laser skills (drew %s): PAT_CUT or "
+            "PAT_BEAM is missing from its book" % (wave + 1, sorted(seen)))
+    print("  [PASS] all three stages deal both lasers")
+    if output_dir:
+        save_frame(last, last.right_request,
+                   Path(output_dir) / "test27_laser_books.bmp",
+                   Path(output_dir) / "test27_laser_books.png")
+    return last
+
+
+def run_beam_clear_on_exit(code, output_dir=None):
+    """Leaving a run takes the scanout's beam registers down with it.
+
+    The craft's beam, the three warning hairlines and the four laser column
+    centres are APB registers inside the scanout, not framebuffer pixels: the
+    hardware holds whatever the run's last frame wrote.  A craft with its beam
+    standing when the player paused and chose EXIT therefore left that beam
+    lit over the boot menu - nothing in the menu ever writes 0xB8/0xBC, so
+    nothing in the menu could take it down.
+    """
+    print("\n" + "=" * 65)
+    print(" [TEST 28] Leaving a run clears the scanout beam registers")
+    print("=" * 65)
+    vm = new_vm(code)
+    menu_enter(vm, 1)
+    vm.joy = (128 << 8) | 128
+    vm.btn = raw_btn()
+    for _ in range(150_000):
+        vm.step()
+
+    def press_until(key, field, value, budget=80_000_000):
+        vm.btn = raw_btn(key)
+        spent = wait_telemetry(vm, field, value, budget)
+        vm.btn = raw_btn()
+        for _ in range(TICK):
+            vm.step()
+        return spent
+
+    # ---- 1. light the craft's beam and a warning hairline ---------------
+    # laser_tick() only lights the beam for the W_LASER stream, and only while
+    # X is held, so both have to be true here.
+    poke(vm, sym_addr('weapon'), WEAPON_LASER, 1)
+    vm.btn = raw_btn('x')
+    assert wait_frames(vm, 3), "the game stopped producing frames"
+    beam_ctrl = vm.params.get(0xBC, 0)
+    assert beam_ctrl & 0x800, (
+        "the craft's beam never reached the scanout (beam_ctrl %#x)" % beam_ctrl)
+    print("  -> the craft's beam is up: APB 0xBC = %#x, APB 0xB8 = %d"
+          % (beam_ctrl, vm.params.get(0xB8, 0)))
+
+    poke(vm, sym_addr('beam_x'), 500, 2)
+    poke(vm, sym_addr('beam_timer'), 40, 1)
+    poke(vm, sym_addr('beam_phase'), 1, 1)
+    assert wait_frames(vm, 2), "the game stopped producing frames"
+    hair = _hair_slots(vm)
+    assert hair[0][0] == 500 and hair[0][3], (
+        "the warning hairline never reached the scanout: %r" % (hair,))
+    print("  -> warning hairline slot 0 at x=%d, colour %#x"
+          % (hair[0][0], hair[0][3]))
+
+    # ---- 2. pause, then EXIT -------------------------------------------
+    press_until('b', 'paused', 1)
+    assert tlm(vm, 'paused') == 1, "B did not open the settings menu"
+    # The card keeps the RUN's frame on screen underneath it, so the beam is
+    # still being published while the menu is up - which is exactly the state
+    # the bug was reported from.
+    poke(vm, sym_addr('beam_active'), 1, 1)
+    poke(vm, sym_addr('beam_phase'), 1, 1)
+    poke(vm, sym_addr('beam_timer'), 40, 1)
+    for _ in range(TICK * 2):
+        vm.step()
+    assert vm.params.get(0xBC, 0) & 0x800, (
+        "the paused frame stopped publishing the beam, so this grades nothing")
+
+    press_until('a', 'settings', 1)
+    press_until('a', 'settings', 2)
+    press_until('a', 'settings', 3)
+    assert tlm(vm, 'settings') == 3, "selection did not reach EXIT"
+    press_until('x', 'paused', 0)
+    assert (vm.params.get(0x5C, 0) & 0x00100000) != 0, (
+        "EXIT did not return to the boot menu (HUD still off)")
+
+    # ---- 3. nothing the run left behind may still be drawn --------------
+    for _ in range(TICK):
+        vm.step()
+    ctrl = vm.params.get(0xBC, 0)
+    x = vm.params.get(0xB8, 0)
+    hair = _hair_slots(vm)
+    cols = _laser_columns(vm)
+    print("  -> on the menu: 0xBC=%#x 0xB8=%d hair=%r cols=%r"
+          % (ctrl, x, [h[0] for h in hair], cols))
+    assert ctrl == 0 and x == 0, (
+        "the craft's beam survived into the boot menu (0xB8=%d, 0xBC=%#x)"
+        % (x, ctrl))
+    assert not any(h[0] or h[1] or h[2] or h[3] for h in hair), (
+        "a warning hairline survived into the boot menu: %r" % (hair,))
+    assert not any(cols), (
+        "the laser column centres survived into the boot menu: %r" % (cols,))
+    print("  [PASS] the menu owns no beam, no hairline and no column")
+    if output_dir:
+        save_frame(vm, vm.right_request,
+                   Path(output_dir) / "test28_beam_clear.bmp",
+                   Path(output_dir) / "test28_beam_clear.png")
+    return vm
+
+
 def run_stage3_skills(code, output_dir=None):
     """Stage 3's five advanced enemy skills, each on its own observable.
 
@@ -3455,27 +4185,23 @@ def run_stage3_skills(code, output_dir=None):
     _boss_arena(vm, PAT_BEAM)
     px, py = player_pos(vm)
     assert wait_frames(vm, 3), "the game stopped producing frames"
-    fb = vm.fb[vm.right_request]
-    cols = []
-    for x in range(GAME_LEFT, GAME_RIGHT):
-        hit = sum(1 for y in range(200, 580, 8)
-                  if (fb[y * SCREEN_PITCH + x] & 0xFFFFFF) in BEAM_PREVIEW_COLOURS)
-        if hit >= 25:
-            cols.append(x)
-    runs = []
-    for x in cols:
-        if runs and x - runs[-1][-1] <= 3:
-            runs[-1].append(x)
-        else:
-            runs.append([x])
-    lanes = [r[0] for r in runs]
+    # Three scanout columns, read back from the registers the firmware aimed
+    # them with - the same route 6.1's single preview takes above, and the same
+    # judgement the pixel sweep used to make: three lanes, spread like the
+    # craft's own lane and one either side of it.
+    slots = _hair_slots(vm)
+    lanes = sorted(s[0] for s in slots if s[0])
     print("  -> 8.2 preview columns at %s (craft at x=%d)" % (lanes, px))
-    assert len(runs) >= 3, \
+    assert len(lanes) >= 3, \
         "8.2 should put three preview columns on screen, found %d at %s" \
-        % (len(runs), lanes)
+        % (len(lanes), lanes)
     gaps = [lanes[k + 1] - lanes[k] for k in range(len(lanes) - 1)]
     assert max(gaps) <= 80, \
         "8.2's columns are not the craft's lane and its neighbours: gaps %s" % gaps
+    assert any(s[2] in BEAM_PREVIEW_COLOURS or s[3] in BEAM_PREVIEW_COLOURS
+               for s in slots if s[0]), \
+        "8.2's standing columns carry none of the preview's colours: %s" \
+        % [(s[0], hex(s[2]), hex(s[3])) for s in slots if s[0]]
 
     # ---- 8.3 an armoured kill leaves a ring ---------------------------
     vm = new_vm(code)
@@ -3730,6 +4456,12 @@ def suite_catalog(code, out_dir):
         ("skills3",  "Stage 3 skills: sway / beams / death burst / tornado / "
                       "bouncing lance",
          lambda: run_stage3_skills(code, out_dir)),
+        ("stresslab", "Pressure stage: the BOSS lasers reach it",
+         lambda: run_stress_lab(code, out_dir)),
+        ("laserbooks", "Every campaign stage deals both laser skills",
+         lambda: run_laser_books(code, out_dir)),
+        ("beamclear", "Leaving a run clears the scanout beam registers",
+         lambda: run_beam_clear_on_exit(code, out_dir)),
         ("rewards",  "Item rewards: debuffs pay nothing; end-screen boxes",
          lambda: run_item_rewards(code, out_dir)),
     ]
@@ -3746,6 +4478,8 @@ GROUPS = {
     "settings": ["settings"],
     "explore":  ["stage"],
     "backdrop": ["backdrops"],
+    "stress":   ["stresslab"],
+    "lasers":   ["laserbooks", "beamclear"],
 }
 
 

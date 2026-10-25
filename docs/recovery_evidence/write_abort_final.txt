@@ -1,0 +1,2 @@
+PASS write abort: AW/W stalls stay stable, padding completes, next burst recovers
+tests/tb_recovery_write_abort.sv:66: $finish called at 790000 (1ps)

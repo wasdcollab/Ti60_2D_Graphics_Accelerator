@@ -49,6 +49,12 @@ void board_set_hud_disable(uint32_t disable);
 #define GPU2D_BTN_BIT_X     3
 #define GPU2D_BTN_BIT_Y     0
 #define GPU2D_BTN_CENTER    4      /* joystick centre press (module reg 0x20) */
-#define GPU2D_BTN_ONLINE    15
+/* The online bit is APB 0x54 bit 16, not bit 15: bitblt_apb_regs.v packs that
+ * register as {15'd0, gamepad_online, 11'd0, gamepad_buttons}, so the buttons
+ * occupy [4:0] and online sits above them.  It read 15 here and in the
+ * workbench's raw_btn() helper.  Nothing reads state->online today (gamepad.c
+ * is the only writer), which is exactly why the wrong bit cost nothing - and
+ * why it would cost a lot the first day somebody used it. */
+#define GPU2D_BTN_ONLINE    16
 
 #endif // GAMEPAD_H

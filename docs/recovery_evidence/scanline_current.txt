@@ -1,0 +1,5 @@
+PASS scanline: 49504 pixels, 1024 overlapping entries, 27 kinds, masks
+tests/tb_bullet_scanline.sv:111: $finish called at 825320000 (1ps)
+rtl/common/simple_dual_port_ram.v:18: warning: Unsized expression (('sd1)<<(ADDR_WIDTH)) expanded beyond and was clipped to 65568 bits. Try using sized operands.
+PASS prefetch: 4096 entries, two pages, 64 bursts, abort/drain, CDC tags
+tests/tb_scanline_prefetch.sv:107: $finish called at 80724000 (1ps)

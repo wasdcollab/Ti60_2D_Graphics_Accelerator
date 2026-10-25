@@ -1,0 +1,20 @@
+  firmware: firmware.bin (64252 bytes, ends at 0xf900fafc, bss (4177591028, 4177591536))
+=================================================================
+   TI60 2D WORKBENCH - 1 SCENARIO(S)
+=================================================================
+
+=================================================================
+ [TEST 7] Hardware Alpha: blend against the LIVE background
+=================================================================
+  boot snapshot: boot_firmware-menu-v3-e5d1b626d90d.pkl (81.9 MB, boot step skipped)
+  [PASS] 16 alpha blends, 261568 bytes written, 144 colour-keyed pixels skipped
+         sprite alpha range: 899 clear / 3184 partial / 4 opaque;
+         blended over 3 distinct background pixels, GLOBAL_ALPHA values [118, 126, 174]
+  -> Frame exported: test7_mode2_alpha.png
+  [OK]   Hardware Alpha blending  (57.7s)
+
+=================================================================
+ VERIFICATION SUMMARY: 1/1 TESTS PASSED in 57.7s
+=================================================================
+ [ALL VERIFICATION CHECKS COMPLETED SUCCESSFULLY]
+

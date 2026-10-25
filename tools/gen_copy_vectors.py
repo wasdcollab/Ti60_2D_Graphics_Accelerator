@@ -95,7 +95,12 @@ def check(vs):
             hi = so + (h - 1) * ss + 4 * w + 16
             if hi > MEMSZ:
                 raise AssertionError("vector %d: source reaches %d > %d" % (i, hi, MEMSZ))
-        hi = do + (h - 1) * ds + 4 * w
+        # The destination gets the same +16 as the source: the bench hands the
+        # engine one extra beat at the head and one at the tail, so a vector
+        # that ends exactly on MEMSZ still writes past the model.  This file
+        # said so in its own comment and only added the 16 on the source side,
+        # which is the half that would not have failed first.
+        hi = do + (h - 1) * ds + 4 * w + 16
         if hi > MEMSZ:
             raise AssertionError("vector %d: destination reaches %d > %d" % (i, hi, MEMSZ))
     return vs

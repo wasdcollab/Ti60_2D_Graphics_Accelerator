@@ -1,14 +1,21 @@
 /**
  * @file gpu2d.h
  * @brief 2D Graphics Accelerator (BitBlt) Driver Header for Sapphire RISC-V SoC
- * @version 3.0
- * @date 2026-09-15
+ * @version 4.0
+ * @date 2026-10-09
+ *
+ * Triad Architecture Role: "Pure 2D GPU Engine Driver" (rtl/bitblt/)
+ * Dedicated MMIO interface for 2D hardware rasterization (FILL, COPY, ALPHA, ADD).
+ *
+ * NOTE: Display engine and streaming layer controls (weather, lasers, beam,
+ * bloom filter, color matrix) have been cleanly decoupled into "display.h".
  */
 
 #ifndef GPU2D_H
 #define GPU2D_H
 
 #include <stdint.h>
+#include "display.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,6 +23,13 @@ extern "C" {
 
 /* Base address of the BitBlt APB3 peripheral (SoC APB slave 0) */
 #define GPU2D_BASE_ADDR         0xF8100000UL
+#define GPU2D_REG_BUCKET_ACCEL  (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x120))
+#define GPU2D_REG_BUCKET_CFG    (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x124))
+#define GPU2D_REG_BUCKET_INFO   (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x128))
+#define GPU2D_REG_BUCKET_CYCLES (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x12C))
+#define GPU2D_REG_BUCKET_DEBUG  (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x138))
+#define GPU2D_REG_HEARTBEAT     (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x130))
+extern uint32_t gpu2d_stalled;
 
 /* APB3 register offsets */
 #define GPU2D_REG_STATUS        (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x00))
@@ -35,6 +49,7 @@ extern "C" {
 #define GPU2D_REG_CPU_FRAMES    (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x38))
 #define GPU2D_REG_FPGA_FRAMES   (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x3C))
 #define GPU2D_REG_RIGHT_NEXT    (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x40))
+#define GPU2D_REG_FRAME_NEXT    (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x134))
 #define GPU2D_REG_DIAGNOSTICS   (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x44))
 #define GPU2D_REG_DST_STRIDE    (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x48))
 #define GPU2D_REG_COLORKEY      (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x60))
@@ -123,6 +138,82 @@ extern "C" {
  */
 #define GPU2D_REG_LASER_COLX_LO   (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xB0))
 #define GPU2D_REG_LASER_COLX_HI   (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xB4))
+
+/**
+ * @brief Player beam and cut/beam warning hairlines (A3, rtl/v_dma/video_beam.v).
+ *
+ * These were the last two shapes in the picture that were one DRAM row
+ * activation per scanline of something with no information in it: the craft's
+ * beam is a 16-wide sheet that repeats every 16 rows, and a warning hairline is
+ * one solid colour from top to bottom.  A one-pixel column opens a DRAM row and
+ * writes four bytes; three slots of hairlines is 4,608 of them in a frame,
+ * which is a third of what a saturated pressure stage spends.
+ *
+ * The scanout draws both now, so neither owns a framebuffer pixel: nothing to
+ * erase next frame and no damage-ledger entry to pay for.  What the hardware
+ * cannot know is where they stand and what colour they are, so:
+ *
+ *     0xB8  beam_x      [11:0] centre column of the craft's beam
+ *     0xBC  beam_ctrl   [10:0] height, [11] enable
+ *
+ * The height is the CRAFT'S TOP EDGE, not its centre.  The craft is drawn into
+ * the framebuffer and this layer is composited above the framebuffer, so
+ * anything this beam covers, it hides - and it used to run all the way down to
+ * player_y, i.e. through the top half of the sprite it was fired from.  The
+ * firmware now publishes player_y - PLAYER_HALF_H, so the beam's exclusive end
+ * (video_beam.v tests y < height) lands on the craft's first row and the
+ * artwork keeps the pixels it owns.  The field is 11 bits and the screen is
+ * 768 rows, so nothing about the encoding changed.
+ *
+ *     0xC0 + 16k +  0   hair_x   [11:0] centre column of slot k (0 = off)
+ *     0xC0 + 16k +  4   hair_out [23:0] colour of columns hx-2 and hx+1
+ *     0xC0 + 16k +  8   hair_lft [23:0] colour of column hx-1
+ *     0xC0 + 16k + 12   hair_mid [23:0] colour of column hx
+ *
+ * k = 0..2.  A colour of 0 draws nothing, which is how a slot that is not
+ * standing is taken off the screen - so all three slots are written every
+ * frame, including the dead ones, for the same reason the laser columns are.
+ *
+ * The beam is opaque and sits above the laser columns; both are latched by the
+ * scanout on the same frame edge as the weather control word.
+ */
+#define GPU2D_REG_BEAM_X          (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xB8))
+#define GPU2D_REG_BEAM_CTRL       (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xBC))
+/**
+ * @brief B1: the bullet bucket table and the scanout's tile store.
+ *
+ * The scene's bullets are no longer blitted into the framebuffer.  The firmware
+ * appends one entry per (bullet, scanline it covers) to a per-scanline bucket in
+ * DDR, and the scanout composites them on the way past.  The framebuffer never
+ * sees a bullet, so the backdrop repair has nothing to put back - which is the
+ * expensive half of the old cost.
+ *
+ *     0xF0  bucket_base  [27:0]  MM_BUCKET_TABLE
+ *     0xF4  tile_addr    [13:0]  tile store write pointer (16 KB: one byte a
+ *                                 pixel, and the enemy tile is 26x26 now)
+ *     0xF8  tile_data    [7:0]   byte; the pointer advances by one
+ *     0xFC  pal_data     [31:0]  palette entry {alpha, rgb}; advances too
+ *
+ * The tile store holds one byte per pixel: a shape ROLE, 0 = transparent.  The
+ * scanout forms the palette index itself as role + hue*32, which is why one
+ * tile now serves all eight colours.
+ * The engine's tiles use 159 colours for the enemy set and 40 for the player
+ * set, so a 256-entry palette covers both.  At the framebuffer's own packing
+ * those tiles are 110.5 KB - more than the whole free block RAM budget; indexed
+ * they are 30.3 KB, which fits the 32 KB a power-of-two depth costs.
+ */
+#define GPU2D_REG_BUCKET_BASE     (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xF0))
+#define GPU2D_REG_BTILE_ADDR      (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xF4))
+#define GPU2D_REG_BTILE_DATA      (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xF8))
+#define GPU2D_REG_BPAL_DATA       (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xFC))
+
+/* Slot 0 of the hair group, i.e. the offset GPU2D_REG_HAIR(k, f) is built on
+ * (0xC0 + 16k + 4f).  It used to read 0xB0, which is LASER_COLX_LO: a useful
+ * base for nothing.  Nothing reads this name today, and it is a plain offset
+ * rather than the pointer macro its neighbours are - never dereference it. */
+#define GPU2D_REG_HAIR_BASE       0xC0u
+#define GPU2D_REG_HAIR(k, f)      \
+    (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xC0u + 16u * (uint32_t)(k) + 4u * (uint32_t)(f)))
 
 #define GPU2D_REG_COLOR_MATRIX    (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x7C))
 #define GPU2D_REG_BLOOM_CTRL      (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x88))
@@ -254,6 +345,7 @@ void gpu2d_add(uint32_t dst_addr, uint32_t src_addr, uint32_t w, uint32_t h,
                uint32_t src_stride, uint32_t dst_stride);
 void gpu2d_set_color_matrix(uint8_t mode, uint8_t intensity);
 void gpu2d_set_bloom(uint8_t enable, uint8_t threshold, uint8_t intensity);
+void gpu2d_set_bloom_style(uint8_t style);
 void gpu2d_wait_vsync(void);
 void gpu2d_swap_buffers(uint32_t left_buf, uint32_t right_buf);
 void gpu2d_get_fps(uint8_t *out_cpu_fps, uint8_t *out_fpga_fps);

@@ -91,6 +91,16 @@ module ti60_top #(
     // UART
     output wire                               system_uart_0_io_txd,
     input  wire                               system_uart_0_io_rxd,
+    input wire system_spi_0_io_data_0_IN,
+    input wire system_spi_0_io_data_1_IN,
+    output wire system_spi_0_io_data_0_OUT, system_spi_0_io_data_0_OE,
+    output wire system_spi_0_io_data_1_OUT, system_spi_0_io_data_1_OE,
+    output wire system_spi_0_io_sclk_write, system_spi_0_io_ss,
+
+    // MAX98357A standard-I2S output; pins are defined in ti60_top.peri.xml.
+    output wire                               audio_i2s_bclk,
+    output wire                               audio_i2s_lrclk,
+    output wire                               audio_i2s_din,
 
     // Hard JTAG
     input  wire                               jtag_inst1_CAPTURE,
@@ -167,6 +177,7 @@ module ti60_top #(
     wire                      m_axi_bready;
 
     wire video_read_priority;
+    wire debug_write_pending;
     wire ddr_awvalid, ddr_awready, ddr_wvalid, ddr_wready;
     video_write_guard u_video_write_guard (
         .clk(core_clk), .rst_n(ddr_rstn), .video_priority(video_read_priority),
@@ -174,7 +185,7 @@ module ti60_top #(
         .m_awvalid(ddr_awvalid), .m_awready(ddr_awready),
         .s_wvalid(m_axi_wvalid), .s_wready(m_axi_wready),
         .m_wvalid(ddr_wvalid), .m_wready(ddr_wready),
-        .bvalid(m_axi_bvalid), .bready(m_axi_bready)
+        .bvalid(m_axi_bvalid), .bready(m_axi_bready),.pending(debug_write_pending)
     );
 
     wire [AXI_ID_WIDTH-1:0]   m_axi_arid;
@@ -255,7 +266,59 @@ module ti60_top #(
     wire [2:0] bb_arsize; wire [1:0] bb_arburst, bb_arlock; wire bb_arvalid, bb_arready;
     wire [3:0] bb_rid; wire [127:0] bb_rdata; wire [1:0] bb_rresp; wire bb_rlast, bb_rvalid, bb_rready;
 
+    // Slave 2 Direct Connection to BitBlt
+
     // Axi_Mux 3-to-1 Arbiter (VDMA read, Sapphire CPU, BitBlt write)
+    localparam integer BUCKET_SLOTS = 1024;
+    localparam integer POOL_SLOTS = 128;
+    wire  cfg_bucket_start;
+    wire  cfg_bucket_clear;
+    wire  cfg_bucket_buffer;
+    wire [13:0] cfg_bucket_eb_count;
+    wire [9:0] cfg_bucket_pb_count;
+    wire [31:0] cfg_bucket_player;
+    wire  cfg_bucket_motion;
+    wire  cfg_bucket_busy;
+    wire  cfg_bucket_done;
+    wire [15:0] cfg_bucket_drop;
+    wire  cfg_bucket_fault;
+    wire [31:0] cfg_bucket_cycles;
+    wire [31:0] raw_bucket_debug,cfg_bucket_debug;
+    wire [1:0] debug_r_channel;
+    wire [15:0] cfg_bucket_live;
+    wire [15:0] cfg_bucket_cand;
+    wire [3:0] bc_arid;
+    wire [28-1:0] bc_araddr;
+    wire [7:0] bc_arlen;
+    wire [2:0] bc_arsize;
+    wire [1:0] bc_arburst;
+    wire [1:0] bc_arlock;
+    wire  bc_arvalid;
+    wire  bc_arready;
+    wire [3:0] bc_rid;
+    wire [128-1:0] bc_rdata;
+    wire [1:0] bc_rresp;
+    wire  bc_rlast;
+    wire  bc_rvalid;
+    wire  bc_rready;
+    wire [3:0] bc_awid;
+    wire [28-1:0] bc_awaddr;
+    wire [7:0] bc_awlen;
+    wire [2:0] bc_awsize;
+    wire [1:0] bc_awburst;
+    wire [1:0] bc_awlock;
+    wire  bc_awvalid;
+    wire  bc_awready;
+    wire [3:0] bc_wid;
+    wire [128-1:0] bc_wdata;
+    wire [15:0] bc_wstrb;
+    wire  bc_wlast;
+    wire  bc_wvalid;
+    wire  bc_wready;
+    wire [3:0] bc_bid;
+    wire [1:0] bc_bresp;
+    wire  bc_bvalid;
+    wire  bc_bready;
     Axi_Mux #(
         .SLAVE_ID_WIDTH(4),
         .AXI_DATA_WIDTH(128),
@@ -415,12 +478,43 @@ module ti60_top #(
         // stops once its FIFO reaches 960 words (video_dma_read.v:292), so it
         // hands the bus back instead of holding it forever.
         .Cfg_Arb_Type   (1'b1), // Hard priority: scanout first, then SoC/BitBlt
-        .Cfg_Cnl_Mask   (3'b111), // Enable Video DMA, SoC, and BitBlt
+        .Cfg_Cnl_Mask   (4'b1111),
+        .I_S3_AW_ID(bc_awid),
+        .I_S3_AW_ADDR({4'd0,bc_awaddr}),
+        .I_S3_AW_LEN(bc_awlen),
+        .I_S3_AW_SIZE(bc_awsize),
+        .I_S3_AW_BURST(bc_awburst),
+        .I_S3_AW_LOCK(bc_awlock),
+        .I_S3_AW_VALID(bc_awvalid),
+        .I_S3_W_ID(bc_wid),
+        .I_S3_W_DATA(bc_wdata),
+        .I_S3_W_STRB(bc_wstrb),
+        .I_S3_W_LAST(bc_wlast),
+        .I_S3_W_VALID(bc_wvalid),
+        .I_S3_B_READY(bc_bready),
+        .I_S3_AR_ID(bc_arid),
+        .I_S3_AR_ADDR({4'd0,bc_araddr}),
+        .I_S3_AR_LEN(bc_arlen),
+        .I_S3_AR_SIZE(bc_arsize),
+        .I_S3_AR_BURST(bc_arburst),
+        .I_S3_AR_LOCK(bc_arlock),
+        .I_S3_AR_VALID(bc_arvalid),
+        .I_S3_R_READY(bc_rready),
+        .O_S3_AW_READY(bc_awready),
+        .O_S3_W_READY(bc_wready),
+        .O_S3_B_ID(bc_bid),
+        .O_S3_B_VALID(bc_bvalid),
+        .O_S3_AR_READY(bc_arready),
+        .O_S3_R_ID(bc_rid),
+        .O_S3_R_DATA(bc_rdata),
+        .O_S3_R_LAST(bc_rlast),
+        .O_S3_R_RESP(bc_rresp),
+        .O_S3_R_VALID(bc_rvalid),
         .O_AW_Cnl_Num   (),
         .O_W_Cnl_Num    (),
         .O_B_Cnl_Num    (),
         .O_AR_Cnl_Num   (),
-        .O_R_Cnl_Num    ()
+        .O_R_Cnl_Num    (debug_r_channel)
     );
 
     assign soc_b_id[7:4] = 4'd0;
@@ -514,7 +608,7 @@ module ti60_top #(
         .s_axi_wready       (ddr_wready),
 
         .s_axi_bid          (m_axi_bid),
-        .s_axi_bresp        (),
+        .s_axi_bresp        (bc_bresp),
         .s_axi_bvalid       (m_axi_bvalid),
         .s_axi_bready       (m_axi_bready),
 
@@ -549,17 +643,17 @@ module ti60_top #(
     );
 
     // Video Signals & VSync Synchronizer for Sapphire SoC
-    wire [7:0] video_r, video_g, video_b;
-    wire       video_hs, video_vs, video_de;
+    wire [7:0] final_r, final_g, final_b;
+    wire       final_hs, final_vs, final_de;
 
-    // 2-stage synchronizer: cross video_vs from hdmi_tx_slow_clk (85.71 MHz) to core_clk (100 MHz)
+    // 2-stage synchronizer: cross final_vs from hdmi_tx_slow_clk (85.71 MHz) to core_clk (100 MHz)
     reg vsync_sync1, vsync_sync2;
     always @(posedge core_clk or negedge ddr_rstn) begin
         if (!ddr_rstn) begin
             vsync_sync1 <= 1'b0;
             vsync_sync2 <= 1'b0;
         end else begin
-            vsync_sync1 <= video_vs;
+            vsync_sync1 <= final_vs;
             vsync_sync2 <= vsync_sync1;
         end
     end
@@ -595,7 +689,7 @@ module ti60_top #(
         .io_ddrA_w_payload_strb             (soc_w_strb),
         .io_ddrA_w_payload_data             (soc_w_data),
 
-        .io_ddrA_b_payload_resp             (),
+        .io_ddrA_b_payload_resp             (bc_bresp),
         .io_ddrA_b_payload_id               (soc_b_id),
         .io_ddrA_b_ready                    (soc_b_ready),
         .io_ddrA_b_valid                    (soc_b_valid),
@@ -669,8 +763,6 @@ module ti60_top #(
     wire       sw0_pulse, sw2_pulse;
     wire [6:0] i2c_slave_addr;
     wire       force_hud_disable;
-    wire [31:0] blit_color_matrix_ctrl;
-    wire [31:0] blit_bloom_ctrl;
 
     i2c_gamepad_top #(
         .CLK_FREQ_HZ (100_000_000),
@@ -697,81 +789,105 @@ module ti60_top #(
         .gamepad_online (pad_online)
     );
 
-    // Video DMA Read Engine (reads Framebuffer from DDR3, dynamic base address)
+    // =========================================================================
+    // Triad Architecture (三权分立架构)
+    // 1. Central Military Command (rtl/apb/apb_command_dispatcher.v)
+    // 2. Pure 2D Graphics Engine (rtl/bitblt/bitblt_top.v)
+    // 3. Pure Data Water Supply Plant (rtl/dma/dma_top.v)
+    // 4. Pure Streaming Art Workshop (rtl/display_engine/display_engine_top.v)
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // Interconnect: APB Dispatcher -> BitBlt (Pure 2D Command Bus)
+    // -------------------------------------------------------------------------
+    wire        disp_cmd_start;
+    wire [1:0]  disp_cmd_op_type;
+    wire [27:0] disp_cmd_dst_addr;
+    wire [27:0] disp_cmd_src_addr;
+    wire [10:0] disp_cmd_rect_w;
+    wire [10:0] disp_cmd_rect_h;
+    wire [31:0] disp_cmd_color;
+    wire [15:0] disp_cmd_src_stride;
+    wire [15:0] disp_cmd_dst_stride;
+    wire        disp_cmd_colorkey_en;
+    wire [31:0] disp_cmd_colorkey_val;
+    wire        disp_cmd_alpha_en;
+    wire [7:0]  disp_cmd_global_alpha;
+    wire        disp_cmd_busy;
+    wire        disp_engine_timeout;
+    wire [3:0]  disp_probe_q_cnt;
+    wire        disp_probe_ar_pend;
+    wire [1:0]  disp_probe_sg_state;
+
+    // -------------------------------------------------------------------------
+    // Interconnect: APB Dispatcher -> Display Engine & DMA (Display Config Bus)
+    // -------------------------------------------------------------------------
     wire [27:0] vdma_next_base;
     wire [27:0] vdma_active_base;
-    wire [27:0] vdma_right_next_base, vdma_right_active_base;
-    wire [7:0] cpu_fps_bcd, fpga_fps_bcd;
+    wire [27:0] vdma_right_next_base;
+    wire [27:0] vdma_right_active_base;
+    wire [7:0]  cpu_fps_bcd;
+    wire [7:0]  fpga_fps_bcd;
     wire [31:0] scan_diagnostics;
     wire        vdma_vsync_flag;
-    wire [31:0] blit_weather_ctrl;
-    wire [31:0] blit_weather_mask_x;
-    wire [31:0] blit_weather_mask_y;
-    wire [23:0] blit_laser_colx_lo;
-    wire [23:0] blit_laser_colx_hi;
-    // Live BitBlt engine probe.  Sourced inside bitblt_top (read master queue
-    // depth / AR pending / stride_gen state) and published on APB 0x74 so the
-    // firmware can see WHERE the engine is stuck, not just THAT it is stuck.
 
-    video_dma_read #(
-        .FRAME_BASE_ADDR (28'h0080_0000),
-        .H_ACT           (1366),
-        .V_ACT           (768)
-    ) u_video_dma (
-        .axi_clk        (core_clk),
-        .axi_rst_n      (ddr_rstn),
-        .cal_done       (cal_done),
+    wire [31:0] cfg_weather_ctrl;
+    wire [31:0] cfg_weather_mask_x;
+    wire [31:0] cfg_weather_mask_y;
+    wire [47:0] cfg_laser_colx;
+    wire [11:0] cfg_beam_x;
+    wire [11:0] cfg_beam_len;
+    wire        cfg_beam_en;
+    wire [35:0] cfg_hair_x;
+    wire [71:0] cfg_hair_out;
+    wire [71:0] cfg_hair_lft;
+    wire [71:0] cfg_hair_mid;
 
-        // AXI4 Read Master
-        .m_axi_arid     (vdma_arid),
-        .m_axi_araddr   (vdma_araddr),
-        .m_axi_arlen    (vdma_arlen),
-        .m_axi_arsize   (vdma_arsize),
-        .m_axi_arburst  (vdma_arburst),
-        .m_axi_arlock   (vdma_arlock),
-        .m_axi_arvalid  (vdma_arvalid),
-        .m_axi_arready  (vdma_arready),
+    wire [27:0] cfg_bucket_base;
+    wire [14:0] cfg_btile_addr;
+    wire [7:0]  cfg_btile_data;
+    wire        cfg_btile_we;
+    wire [31:0] cfg_bpal_data;
+    wire [7:0]  cfg_bpal_addr;
+    wire        cfg_bpal_we;
 
-        .m_axi_rid      (vdma_rid),
-        .m_axi_rdata    (vdma_rdata),
-        .m_axi_rresp    (vdma_rresp),
-        .m_axi_rlast    (vdma_rlast),
-        .m_axi_rvalid   (vdma_rvalid),
-        .m_axi_rready   (vdma_rready),
-
-        // Pixel Clock Domain
-        .pixel_clk      (hdmi_tx_slow_clk),
-        .pixel_rst_n    (hdmi_tx_locked),
-
-        // Double-buffer control
-        .next_frame_base_addr (vdma_next_base),
-        .active_frame_base_addr (vdma_active_base),
-        .next_right_base_addr (vdma_right_next_base),
-        .scan_diagnostics (scan_diagnostics),
-        .video_read_priority (video_read_priority),
-        .active_right_base_addr (vdma_right_active_base),
-        .cpu_fps_bcd (cpu_fps_bcd), .fpga_fps_bcd (fpga_fps_bcd),
-        .hud_enable     (~force_hud_disable),
-        .weather_ctrl   (blit_weather_ctrl),
-        .weather_mask_x (blit_weather_mask_x),
-        .weather_mask_y (blit_weather_mask_y),
-        .laser_colx     ({blit_laser_colx_hi, blit_laser_colx_lo}),
-        .vsync_flag           (vdma_vsync_flag),
-
-        // Video Output
-        .red_out        (video_r),
-        .green_out      (video_g),
-        .blue_out       (video_b),
-        .hsync_out      (video_hs),
-        .vsync_out      (video_vs),
-        .de_out         (video_de)
+    wire [31:0] cfg_color_matrix_ctrl;
+    wire [31:0] cfg_bloom_ctrl;
+    wire [31:0] cfg_audio_ctrl;
+    wire        cfg_audio_event_strobe;
+    wire        pcm_enabled, pcm_clear, pcm_write;
+    wire [7:0]  pcm_data;
+    wire [31:0] pcm_status, pcm_underflows, pcm_played;
+    wire signed [15:0] pcm_sample;
+    wire flash_start, flash_busy;
+    wire [7:0] flash_tx, flash_rx;
+    assign system_spi_0_io_data_0_OE = 1'b1;
+    assign system_spi_0_io_data_1_OE = 1'b0;
+    assign system_spi_0_io_data_1_OUT = 1'b0;
+    bgm_flash_spi u_bgm_flash_spi (
+        .clk(core_clk), .rst_n(ddr_rstn), .start(flash_start),
+        .cs_n(system_spi_0_io_ss), .tx_data(flash_tx),
+        .miso(system_spi_0_io_data_1_IN), .sclk(system_spi_0_io_sclk_write),
+        .mosi(system_spi_0_io_data_0_OUT), .busy(flash_busy), .rx_data(flash_rx)
     );
 
-    // =========================================================================
-    // BitBlt 2D Hardware Accelerator
-    // =========================================================================
+    // -------------------------------------------------------------------------
+    // Interconnect: Display Engine <-> DMA (Streaming & Timing Bus)
+    // -------------------------------------------------------------------------
+    wire [11:0]       disp_h_cnt;
+    wire [10:0]       disp_v_cnt;
+    wire              disp_t_de;
+    wire              disp_t_frame_start;
+    wire              disp_t_frame_clear;
+    wire [31:0]       vdma_fb_pixel;
+    wire [32*POOL_SLOTS-1:0] vdma_bucket_row;
+    wire [$clog2(BUCKET_SLOTS)-1:0] vdma_entry_addr;
+    wire vdma_entry_group;
+    wire [31:0] vdma_entry_data;
+    wire [11:0] vdma_pool_drop;
+    wire              vdma_bucket_ready;
 
-    // APB Bus wires (SoC APB Slave 0 <-> BitBlt)
+    // APB Bus wires (SoC APB Slave 0 <-> Dispatcher)
     wire [15:0] apb0_paddr;
     wire        apb0_psel;
     wire        apb0_penable;
@@ -781,177 +897,429 @@ module ti60_top #(
     wire        apb0_pready;
     wire        apb0_pslverr;
 
-    // BitBlt engine v3: 64-beat (1 KiB) AXI bursts, a 256-beat source read
-    // elasticity FIFO and a 192-beat destination-background FIFO (OP_ALPHA
-    // reads the live background back before blending).  Both depths stay above
-    // 2*MAX_BURST_BEATS + 4, which is what keeps the credit accounting in
-    // bitblt_stride_gen deadlock free.  Set MAX_BURST_BEATS back to 16 if the
-    // DDR3 controller ever rejects the longer INCR bursts - no other change is
-    // required.
+    // =========================================================================
+    // 1. Central Command Dispatcher (rtl/apb/)
+    // =========================================================================
+    apb_command_dispatcher #(
+        .CLOCK_HZ (100_000_000)
+    ) u_apb_command_dispatcher (
+        .clk                    (core_clk),
+        .rst_n                  (ddr_rstn),
+        .cal_done               (cal_done),
+
+        // APB3 Slave Interface
+        .apb_paddr              (apb0_paddr),
+        .apb_psel               (apb0_psel),
+        .apb_penable            (apb0_penable),
+        .apb_pwrite             (apb0_pwrite),
+        .apb_pwdata             (apb0_pwdata),
+        .apb_prdata             (apb0_prdata),
+        .apb_pready             (apb0_pready),
+        .apb_pslverr            (apb0_pslverr),
+
+        // Pure 2D BitBlt Command Bus
+        .cmd_start              (disp_cmd_start),
+        .cmd_op_type            (disp_cmd_op_type),
+        .cmd_dst_addr           (disp_cmd_dst_addr),
+        .cmd_src_addr           (disp_cmd_src_addr),
+        .cmd_rect_w             (disp_cmd_rect_w),
+        .cmd_rect_h             (disp_cmd_rect_h),
+        .cmd_color              (disp_cmd_color),
+        .cmd_src_stride         (disp_cmd_src_stride),
+        .cmd_dst_stride         (disp_cmd_dst_stride),
+        .cmd_colorkey_en        (disp_cmd_colorkey_en),
+        .cmd_colorkey_val       (disp_cmd_colorkey_val),
+        .cmd_alpha_en           (disp_cmd_alpha_en),
+        .cmd_global_alpha       (disp_cmd_global_alpha),
+        .cmd_busy               (disp_cmd_busy),
+        .engine_timeout         (disp_engine_timeout),
+
+        // BitBlt Engine Live Probe
+        .diag_rd_q_cnt          (disp_probe_q_cnt),
+        .diag_rd_ar_pend        (disp_probe_ar_pend),
+        .diag_sg_state          (disp_probe_sg_state),
+
+        // Double-Buffer Control & Frame Telemetry
+        .vdma_next_base         (vdma_next_base),
+        .vdma_right_next_base   (vdma_right_next_base),
+        .vdma_active_base       (vdma_active_base),
+        .vdma_right_active_base (vdma_right_active_base),
+        .cpu_fps_bcd            (cpu_fps_bcd),
+        .fpga_fps_bcd           (fpga_fps_bcd),
+        .scan_diagnostics       (scan_diagnostics),
+        .vsync_flag             (vdma_vsync_flag),
+
+        // Gamepad & Board Keys Interface
+        .gamepad_joy_x          (pad_joy_x),
+        .gamepad_joy_y          (pad_joy_y),
+        .gamepad_buttons        (pad_buttons),
+        .gamepad_online         (pad_online),
+        .key_sw0_level          (sw0_pressed),
+        .key_sw2_level          (sw2_pressed),
+        .key_sw0_pulse          (sw0_pulse),
+        .key_sw2_pulse          (sw2_pulse),
+        .i2c_slave_addr         (i2c_slave_addr),
+        .force_hud_disable      (force_hud_disable),
+
+        // Pure Display / Effect Configuration Bus
+        .weather_ctrl           (cfg_weather_ctrl),
+        .weather_mask_x         (cfg_weather_mask_x),
+        .weather_mask_y         (cfg_weather_mask_y),
+        .laser_colx_lo          (),
+        .laser_colx_hi          (),
+        .laser_colx             (cfg_laser_colx),
+        .beam_x                 (cfg_beam_x),
+        .beam_len               (cfg_beam_len),
+        .beam_en                (cfg_beam_en),
+        .hair_x                 (cfg_hair_x),
+        .hair_out               (cfg_hair_out),
+        .hair_lft               (cfg_hair_lft),
+        .hair_mid               (cfg_hair_mid),
+
+        // Bullet Bucket Table & Tile Store Write Port
+        .bucket_base            (cfg_bucket_base),
+        .btile_addr             (cfg_btile_addr),
+        .btile_data             (cfg_btile_data),
+        .btile_we               (cfg_btile_we),
+        .bpal_data              (cfg_bpal_data),
+        .bpal_addr              (cfg_bpal_addr),
+        .bpal_we                (cfg_bpal_we),
+
+        // Video Post-Processing Controls
+        .color_matrix_ctrl      (cfg_color_matrix_ctrl),
+        .bloom_ctrl             (cfg_bloom_ctrl),
+
+        // Game-audio control and one-shot events
+        .audio_ctrl             (cfg_audio_ctrl),
+        .audio_event_strobe     (cfg_audio_event_strobe),
+        .pcm_enabled(pcm_enabled), .pcm_clear(pcm_clear),
+        .pcm_write(pcm_write), .pcm_data(pcm_data),
+        .pcm_status(pcm_status), .pcm_underflows(pcm_underflows),
+        .pcm_played(pcm_played),
+        .flash_start(flash_start), .flash_cs_n(system_spi_0_io_ss),
+        .flash_tx(flash_tx), .flash_busy(flash_busy), .flash_rx(flash_rx),
+        .bucket_start(cfg_bucket_start),.bucket_clear_req(cfg_bucket_clear),
+        .bucket_motion_en(cfg_bucket_motion),.bucket_buffer_sel(cfg_bucket_buffer),
+        .bucket_pb_count(cfg_bucket_pb_count),.bucket_eb_count(cfg_bucket_eb_count),
+        .bucket_player_xy(cfg_bucket_player),.bucket_busy(cfg_bucket_busy),
+        .bucket_done(cfg_bucket_done),.bucket_fault(cfg_bucket_fault),
+        .bucket_drop_count(cfg_bucket_drop),.bucket_pool_drop(vdma_pool_drop),
+        .bucket_cycles(cfg_bucket_cycles),.bucket_eb_live(cfg_bucket_live),
+        .bucket_debug(cfg_bucket_debug),
+        .bucket_eb_cand(cfg_bucket_cand),.hb_we(),.hb_val()
+    );
+
+    dma_bucket_coprocessor #(.EB_CAPACITY(10240),.BURST_READ_LEN(16),
+        .SINGLE_GROUP_REG(0),.TABLE_SLOTS(BUCKET_SLOTS)) u_bucket_coprocessor (
+        .clk(core_clk),
+        .rst_n(ddr_rstn),
+        .start(cfg_bucket_start),
+        .clear_ledger(cfg_bucket_clear),
+        .buffer_sel(cfg_bucket_buffer),
+        .eb_count(cfg_bucket_eb_count),
+        .pb_count(cfg_bucket_pb_count),
+        .player_xy(cfg_bucket_player),
+        .motion_en(cfg_bucket_motion),
+        .bound_x(32'h03DC00B6),
+        .bound_y(32'h02FF0001),
+        .busy(cfg_bucket_busy),
+        .done(cfg_bucket_done),
+        .drop_count(cfg_bucket_drop),
+        .fault(cfg_bucket_fault),
+        .cycles(cfg_bucket_cycles),
+        .debug_snapshot(raw_bucket_debug),
+        .eb_live(cfg_bucket_live),
+        .eb_kill(),
+        .eb_free(),
+        .eb_cand(cfg_bucket_cand),
+        .m_axi_arid(bc_arid),
+        .m_axi_araddr(bc_araddr),
+        .m_axi_arlen(bc_arlen),
+        .m_axi_arsize(bc_arsize),
+        .m_axi_arburst(bc_arburst),
+        .m_axi_arlock(bc_arlock),
+        .m_axi_arvalid(bc_arvalid),
+        .m_axi_arready(bc_arready),
+        .m_axi_rid(bc_rid),
+        .m_axi_rdata(bc_rdata),
+        .m_axi_rresp(bc_rresp),
+        .m_axi_rlast(bc_rlast),
+        .m_axi_rvalid(bc_rvalid),
+        .m_axi_rready(bc_rready),
+        .m_axi_awid(bc_awid),
+        .m_axi_awaddr(bc_awaddr),
+        .m_axi_awlen(bc_awlen),
+        .m_axi_awsize(bc_awsize),
+        .m_axi_awburst(bc_awburst),
+        .m_axi_awlock(bc_awlock),
+        .m_axi_awvalid(bc_awvalid),
+        .m_axi_awready(bc_awready),
+        .m_axi_wid(bc_wid),
+        .m_axi_wdata(bc_wdata),
+        .m_axi_wstrb(bc_wstrb),
+        .m_axi_wlast(bc_wlast),
+        .m_axi_wvalid(bc_wvalid),
+        .m_axi_wready(bc_wready),
+        .m_axi_bid(bc_bid),
+        .m_axi_bresp(bc_bresp),
+        .m_axi_bvalid(bc_bvalid),
+        .m_axi_bready(bc_bready)
+    );
+    // 100 MHz core-domain audio, independent of DDR/BitBlt/video bandwidth.
+    wire        audio_sample_tick;
+    wire signed [15:0] audio_left, audio_right;
+    bgm_pcm_fifo u_bgm_pcm_fifo (
+        .clk(core_clk), .rst_n(ddr_rstn), .sample_tick(audio_sample_tick),
+        .enabled(pcm_enabled), .clear(pcm_clear),
+        .write_strobe(pcm_write), .write_data(pcm_data),
+        .sample(pcm_sample), .status(pcm_status),
+        .underflows(pcm_underflows), .played(pcm_played)
+    );
+    game_audio_synth #(.PCM_BGM(2)) u_game_audio_synth (
+        .clk          (core_clk),
+        .rst_n        (ddr_rstn),
+        .sample_tick  (audio_sample_tick),
+        .enabled      (cfg_audio_ctrl[8]),
+        .bgm_enabled  (cfg_audio_ctrl[9]),
+        .volume       (cfg_audio_ctrl[14:12]),
+        .event_strobe (cfg_audio_event_strobe),
+        .event_code   (cfg_audio_ctrl[3:0]),
+        .stream_sample(pcm_sample),
+        .sample_left  (audio_left),
+        .sample_right (audio_right)
+    );
+    i2s_tx #(.BCLK_HALF_DIV(16)) u_i2s_tx (
+        .clk          (core_clk),
+        .rst_n        (ddr_rstn),
+        .sample_left  (audio_left),
+        .sample_right (audio_right),
+        .sample_tick  (audio_sample_tick),
+        .i2s_bclk     (audio_i2s_bclk),
+        .i2s_lrclk    (audio_i2s_lrclk),
+        .i2s_din      (audio_i2s_din)
+    );
+
+    // =========================================================================
+    // 2. Pure 2D Graphics Engine (rtl/bitblt/)
+    // =========================================================================
     bitblt_top #(
-        // ---- burst sizing, and why it is 192 and not 64 -----------------
-        //
-        // The engine issues one AXI burst at a time (see the note above), so
-        // its throughput is
-        //
-        //     (burst bytes) / (AR->RLAST round trip through Axi_Mux + DDR3)
-        //
-        // and the round trip is a couple of hundred core clocks whatever the
-        // burst length is.  A full-screen COPY is 768 rows x 342 write beats,
-        // and the game redraws two surfaces of that size every frame, so at a
-        // 1 KiB burst that is ~8200 round trips - tens of milliseconds, and the
-        // reason the board sat at 30 FPS with the frame loop waiting on nothing
-        // but the scanout handshake.
-        //
-        // Widening the burst is the one lever that costs nothing anywhere else:
-        // the AXI traffic is identical, Axi_Mux sees one request instead of
-        // three, and NO extra request is ever outstanding.  It is deliberately
-        // preferred over letting several bursts be in flight, which was tried,
-        // passed the RTL regression on the idealised bench and HUNG THE BOARD -
-        // the bench models an AXI slave that accepts requests back to back,
-        // while the real Axi_Mux is a channel-arbitrating mux with its own
-        // AR-to-R bookkeeping.
-        //
-        // 192 keeps the credit invariant the generator was written around,
-        // DST_FIFO_DEPTH > 2*MAX_BURST_BEATS + 4, inside the 512-deep FIFOs
-        // below (2*192+4 = 388), and 192 beats is 3 KiB - AXI allows up to 256.
-        // ---- BURST EXPERIMENT 2026-09-25 --------------------------------
-        // 64 -> 192 beats and 192 -> 448 deep FIFOs.
-        // tb_bitblt_cost measured, at three read latencies:
-        //   full-screen COPY  64 beats 579081/2216457/4059657 cyc
-        //                   192 beats 579081/1039881/1500681 cyc  (2.7x)
-        //   bursts for one full-screen COPY   4608 -> 2304
-        // and the outstanding count went 2 -> 3, i.e. this does NOT add
-        // concurrency - it removes round trips.  The credit rule needs
-        // DEPTH > 2*MAX_BURST_BEATS + 4 = 388, hence 448.
         .MAX_BURST_BEATS (192),
         .READ_FIFO_DEPTH (448),
         .READ_FIFO_AW    (9),
         .DST_FIFO_DEPTH  (448),
         .DST_FIFO_AW     (9)
     ) u_bitblt (
-        .clk            (core_clk),
-        .rst_n          (ddr_rstn),
+        .clk                    (core_clk),
+        .rst_n                  (ddr_rstn),
 
-        // APB Slave
-        .apb_paddr      (apb0_paddr),
-        .apb_psel       (apb0_psel),
-        .apb_penable    (apb0_penable),
-        .apb_pwrite     (apb0_pwrite),
-        .apb_pwdata     (apb0_pwdata),
-        .apb_prdata     (apb0_prdata),
-        .apb_pready     (apb0_pready),
-        .apb_pslverr    (apb0_pslverr),
+        // Pure 2D Command Bus (Driven by u_apb_command_dispatcher)
+        .cmd_start              (disp_cmd_start),
+        .cmd_op_type            (disp_cmd_op_type),
+        .cmd_dst_addr           (disp_cmd_dst_addr),
+        .cmd_src_addr           (disp_cmd_src_addr),
+        .cmd_rect_w             (disp_cmd_rect_w),
+        .cmd_rect_h             (disp_cmd_rect_h),
+        .cmd_color              (disp_cmd_color),
+        .cmd_src_stride         (disp_cmd_src_stride),
+        .cmd_dst_stride         (disp_cmd_dst_stride),
+        .cmd_colorkey_en        (disp_cmd_colorkey_en),
+        .cmd_colorkey_val       (disp_cmd_colorkey_val),
+        .cmd_alpha_en           (disp_cmd_alpha_en),
+        .cmd_global_alpha       (disp_cmd_global_alpha),
+        .cmd_busy               (disp_cmd_busy),
+        .engine_timeout         (disp_engine_timeout),
 
-        // AXI4 Read Master
-        .m_axi_arid     (bb_arid),
-        .m_axi_araddr   (bb_araddr),
-        .m_axi_arlen    (bb_arlen),
-        .m_axi_arsize   (bb_arsize),
-        .m_axi_arburst  (bb_arburst),
-        .m_axi_arlock   (bb_arlock),
-        .m_axi_arvalid  (bb_arvalid),
-        .m_axi_arready  (bb_arready),
-        .m_axi_rid      (bb_rid),
-        .m_axi_rdata    (bb_rdata),
-        .m_axi_rresp    (bb_rresp),
-        .m_axi_rlast    (bb_rlast),
-        .m_axi_rvalid   (bb_rvalid),
-        .m_axi_rready   (bb_rready),
+        // Live Engine Diagnostic Probe
+        .probe_q_cnt            (disp_probe_q_cnt),
+        .probe_ar_pend          (disp_probe_ar_pend),
+        .probe_sg_state         (disp_probe_sg_state),
 
-        // AXI4 Write Master
-        .m_axi_awid     (bb_awid),
-        .m_axi_awaddr   (bb_awaddr),
-        .m_axi_awlen    (bb_awlen),
-        .m_axi_awsize   (bb_awsize),
-        .m_axi_awburst  (bb_awburst),
-        .m_axi_awlock   (bb_awlock),
-        .m_axi_awvalid  (bb_awvalid),
-        .m_axi_awready  (bb_awready),
-        .m_axi_wid      (bb_wid),
-        .m_axi_wdata    (bb_wdata),
-        .m_axi_wstrb    (bb_wstrb),
-        .m_axi_wlast    (bb_wlast),
-        .m_axi_wvalid   (bb_wvalid),
-        .m_axi_wready   (bb_wready),
-        .m_axi_bid      (bb_bid),
-        .m_axi_bvalid   (bb_bvalid),
-        .m_axi_bready   (bb_bready),
+        // AXI4 Read Master (to Axi_Mux S2)
+        .m_axi_arid             (bb_arid),
+        .m_axi_araddr           (bb_araddr),
+        .m_axi_arlen            (bb_arlen),
+        .m_axi_arsize           (bb_arsize),
+        .m_axi_arburst          (bb_arburst),
+        .m_axi_arlock           (bb_arlock),
+        .m_axi_arvalid          (bb_arvalid),
+        .m_axi_arready          (bb_arready),
+        .m_axi_rid              (bb_rid),
+        .m_axi_rdata            (bb_rdata),
+        .m_axi_rresp            (bb_rresp),
+        .m_axi_rlast            (bb_rlast),
+        .m_axi_rvalid           (bb_rvalid),
+        .m_axi_rready           (bb_rready),
+
+        // AXI4 Write Master (to Axi_Mux S2)
+        .m_axi_awid             (bb_awid),
+        .m_axi_awaddr           (bb_awaddr),
+        .m_axi_awlen            (bb_awlen),
+        .m_axi_awsize           (bb_awsize),
+        .m_axi_awburst          (bb_awburst),
+        .m_axi_awlock           (bb_awlock),
+        .m_axi_awvalid          (bb_awvalid),
+        .m_axi_awready          (bb_awready),
+        .m_axi_wid              (bb_wid),
+        .m_axi_wdata            (bb_wdata),
+        .m_axi_wstrb            (bb_wstrb),
+        .m_axi_wlast            (bb_wlast),
+        .m_axi_wvalid           (bb_wvalid),
+        .m_axi_wready           (bb_wready),
+        .m_axi_bid              (bb_bid),
+        .m_axi_bvalid           (bb_bvalid),
+        .m_axi_bready           (bb_bready)
+    );
+
+    // =========================================================================
+    // 3. Pure Data Extraction Engine (rtl/dma/)
+    // =========================================================================
+    dma_top #(
+        .FRAME_BASE_ADDR        (28'h0080_0000),
+        .H_ACT                  (1366),
+        .H_TOTAL                (1456),
+        .V_ACT                  (768),
+        .V_TOTAL                (782),
+        .AXI_ADDR_WIDTH         (28),
+        .AXI_DATA_WIDTH         (128),
+        .BUCKET_SLOTS           (BUCKET_SLOTS),
+        .POOL_SLOTS             (POOL_SLOTS),
+        .SCANLINE_EN            (1),
+        // Scanlines per bucket entry.  Must match MM_BUCKET_GROUP_ROWS in
+        // sw/driver/memory_map.h and BUCKET_GROUP_ROWS in
+        // rtl/display_engine/2_layer_generators/video_bullet_overlay.v.
+        .BUCKET_GROUP_ROWS      (8),
+        .BUCKET_GROUP_SHIFT     (3)
+    ) u_dma (
+        .axi_clk                (core_clk),
+        .axi_rst_n              (ddr_rstn),
+        .cal_done               (cal_done),
+
+        // AXI4 Read Master Interface (to Axi_Mux S0)
+        .m_axi_arid             (vdma_arid),
+        .m_axi_araddr           (vdma_araddr),
+        .m_axi_arlen            (vdma_arlen),
+        .m_axi_arsize           (vdma_arsize),
+        .m_axi_arburst          (vdma_arburst),
+        .m_axi_arlock           (vdma_arlock),
+        .m_axi_arvalid          (vdma_arvalid),
+        .m_axi_arready          (vdma_arready),
+        .m_axi_rid              (vdma_rid),
+        .m_axi_rdata            (vdma_rdata),
+        .m_axi_rresp            (vdma_rresp),
+        .m_axi_rlast            (vdma_rlast),
+        .m_axi_rvalid           (vdma_rvalid),
+        .m_axi_rready           (vdma_rready),
+
+        // Pixel Clock Domain
+        .pixel_clk              (hdmi_tx_slow_clk),
+        .pixel_rst_n            (hdmi_tx_locked),
+
+        // Timing inputs from u_display_engine
+        .h_cnt                  (disp_h_cnt),
+        .v_cnt                  (disp_v_cnt),
+        .t_de                   (disp_t_de),
+        .t_frame_start          (disp_t_frame_start),
+        .t_frame_clear          (disp_t_frame_clear),
 
         // Double-buffer control
-        .vdma_next_base (vdma_next_base),
-        .vdma_active_base (vdma_active_base),
-        .vdma_right_next_base (vdma_right_next_base),
-        .scan_diagnostics (scan_diagnostics),
-        .vdma_right_active_base (vdma_right_active_base),
-        .cpu_fps_bcd (cpu_fps_bcd), .fpga_fps_bcd (fpga_fps_bcd),
-        .vsync_flag     (vdma_vsync_flag),
+        .next_frame_base_addr   (vdma_next_base),
+        .active_frame_base_addr (vdma_active_base),
+        .next_right_base_addr   (vdma_right_next_base),
+        .active_right_base_addr (vdma_right_active_base),
+        .vsync_flag             (vdma_vsync_flag),
+        .video_read_priority    (video_read_priority),
+        .scan_diagnostics       (scan_diagnostics),
 
-        // Gamepad & Board Keys
-        .gamepad_joy_x     (pad_joy_x),
-        .gamepad_joy_y     (pad_joy_y),
-        .gamepad_buttons   (pad_buttons),
-        .gamepad_online    (pad_online),
-        .key_sw0_level     (sw0_pressed),
-        .key_sw2_level     (sw2_pressed),
-        .key_sw0_pulse     (sw0_pulse),
-        .key_sw2_pulse     (sw2_pulse),
-        .i2c_slave_addr    (i2c_slave_addr),
-        .force_hud_disable (force_hud_disable),
-        .weather_ctrl       (blit_weather_ctrl),
-        .weather_mask_x     (blit_weather_mask_x),
-        .weather_mask_y     (blit_weather_mask_y),
-        .laser_colx_lo      (blit_laser_colx_lo),
-        .laser_colx_hi      (blit_laser_colx_hi),
-        .color_matrix_ctrl  (blit_color_matrix_ctrl),
-        .bloom_ctrl         (blit_bloom_ctrl)
+        // Bullet bucket prefetch
+        .bucket_base            (cfg_bucket_base),
+        .bucket_row             (vdma_bucket_row),
+        .bucket_ready           (vdma_bucket_ready),
+        .bucket_pool_drop       (vdma_pool_drop),
+        .bucket_entry_addr      (vdma_entry_addr),
+        .bucket_entry_group     (vdma_entry_group),
+        .bucket_entry_data      (vdma_entry_data),
+
+        // Pure baseboard pixel stream
+        .fb_pixel               (vdma_fb_pixel)
     );
 
     // =========================================================================
-    // Video Processing Chain:
-    // u_video_dma -> u_bloom_filter -> u_color_matrix -> u_dvi_encoder
+    // 4. Pure Streaming Display Engine (rtl/display_engine/)
     // =========================================================================
+    display_engine_top #(
+        .H_ACT                  (1366),
+        .H_FP                   (8),
+        .H_SYNC                 (56),
+        .H_BP                   (26),
+        .H_TOTAL                (1456),
+        .V_ACT                  (768),
+        .V_FP                   (2),
+        .V_SYNC                 (3),
+        .V_BP                   (9),
+        .V_TOTAL                (782),
+        .POOL_SLOTS             (POOL_SLOTS),
+        .BUCKET_SLOTS           (BUCKET_SLOTS),
+        .SCANLINE_EN            (1)
+    ) u_display_engine (
+        .pixel_clk              (hdmi_tx_slow_clk),
+        .pixel_rst_n            (hdmi_tx_locked),
 
-    wire [7:0] bloom_r, bloom_g, bloom_b;
-    wire       bloom_hs, bloom_vs, bloom_de;
+        // Timing Reference Outputs
+        .h_cnt                  (disp_h_cnt),
+        .v_cnt                  (disp_v_cnt),
+        .t_de                   (disp_t_de),
+        .t_frame_start          (disp_t_frame_start),
+        .t_frame_clear          (disp_t_frame_clear),
 
-    video_bloom_filter u_bloom_filter (
-        .pixel_clk   (hdmi_tx_slow_clk),
-        .pixel_rst_n (hdmi_tx_locked),
-        .de_in       (video_de),
-        .hsync_in    (video_hs),
-        .vsync_in    (video_vs),
-        .r_in        (video_r),
-        .g_in        (video_g),
-        .b_in        (video_b),
-        .ctrl        (blit_bloom_ctrl),
-        .de_out      (bloom_de),
-        .hsync_out   (bloom_hs),
-        .vsync_out   (bloom_vs),
-        .r_out       (bloom_r),
-        .g_out       (bloom_g),
-        .b_out       (bloom_b)
-    );
+        // Baseboard pixel input
+        .fb_pixel               (vdma_fb_pixel),
 
-    wire [7:0] final_r, final_g, final_b;
-    wire       final_hs, final_vs, final_de;
+        // Bullet bucket prefetch data
+        .bucket_row             (vdma_bucket_row),
+        .bucket_ready           (vdma_bucket_ready),
+        .bucket_entry_addr      (vdma_entry_addr),
+        .bucket_entry_group     (vdma_entry_group),
+        .bucket_entry_data      (vdma_entry_data),
 
-    video_color_matrix u_color_matrix (
-        .pixel_clk   (hdmi_tx_slow_clk),
-        .pixel_rst_n (hdmi_tx_locked),
-        .de_in       (bloom_de),
-        .hsync_in    (bloom_hs),
-        .vsync_in    (bloom_vs),
-        .r_in        (bloom_r),
-        .g_in        (bloom_g),
-        .b_in        (bloom_b),
-        .ctrl        (blit_color_matrix_ctrl),
-        .de_out      (final_de),
-        .hsync_out   (final_hs),
-        .vsync_out   (final_vs),
-        .r_out       (final_r),
-        .g_out       (final_g),
-        .b_out       (final_b)
+        // Boot-time Tile Store & Palette Write Port (from APB Dispatcher)
+        .cfg_clk                (core_clk),
+        .cfg_rst_n              (ddr_rstn),
+        .btile_we               (cfg_btile_we),
+        .btile_addr             (cfg_btile_addr),
+        .btile_data             (cfg_btile_data),
+        .bpal_we                (cfg_bpal_we),
+        .bpal_addr              (cfg_bpal_addr),
+        .bpal_data              (cfg_bpal_data),
+
+        // Control Inputs (from APB Dispatcher)
+        .weather_ctrl           (cfg_weather_ctrl),
+        .weather_mask_x         (cfg_weather_mask_x),
+        .weather_mask_y         (cfg_weather_mask_y),
+        .laser_colx             (cfg_laser_colx),
+        .beam_x                 (cfg_beam_x),
+        .beam_len               (cfg_beam_len),
+        .beam_en                (cfg_beam_en),
+        .hair_x                 (cfg_hair_x),
+        .hair_out               (cfg_hair_out),
+        .hair_lft               (cfg_hair_lft),
+        .hair_mid               (cfg_hair_mid),
+
+        // HUD & FPS Telemetry
+        .hud_enable             (~force_hud_disable),
+        .cpu_fps_bcd            (cpu_fps_bcd),
+        .fpga_fps_bcd           (fpga_fps_bcd),
+
+        // Post-Processing Filter Controls
+        .bloom_ctrl             (cfg_bloom_ctrl),
+        .color_matrix_ctrl      (cfg_color_matrix_ctrl),
+
+        // Final Video Output Stream
+        .video_r                (final_r),
+        .video_g                (final_g),
+        .video_b                (final_b),
+        .video_hs               (final_hs),
+        .video_vs               (final_vs),
+        .video_de               (final_de)
     );
 
     // DVI Encoder (8-bit RGB + sync -> 10-bit TMDS words)
@@ -978,5 +1346,18 @@ module ti60_top #(
     assign tmds_data0_o = ~tmds_data0;
     assign tmds_data1_o = ~tmds_data1;
     assign tmds_data2_o = ~tmds_data2;
+
+    reg [9:0] fault_bus_context;
+    reg fault_context_valid;
+    assign cfg_bucket_debug={raw_bucket_debug[31:10],fault_bus_context};
+    always @(posedge core_clk or negedge ddr_rstn) begin
+        if(!ddr_rstn) begin fault_bus_context<=0;fault_context_valid<=0;end
+        else if(cfg_bucket_clear) begin fault_bus_context<=0;fault_context_valid<=0;end
+        else if(!fault_context_valid && raw_bucket_debug[31:29]!=0) begin
+            fault_bus_context<={debug_r_channel,disp_probe_q_cnt[2:0],bb_rready,
+                m_axi_rready,debug_write_pending,video_read_priority,m_axi_rvalid};
+            fault_context_valid<=1;
+        end
+    end
 
 endmodule

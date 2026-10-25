@@ -1,0 +1,424 @@
+{
+  "date": "2026-10-10",
+  "metric": "Executed RV32 instructions and CPU 32-bit stores to bucket tables; not board cycles or FPS",
+  "baseline_sha256": "343a17b230bcbd60fc03e721ca876563d1e57a18096d7e2694b6ab028d119eb0",
+  "updated_sha256": "58b3285ee5c8ef4fff909e4fdb13780ac7324c2def4fc2e8e772b0122121150d",
+  "baseline": [
+    {
+      "case": "steady192",
+      "buffer": 0,
+      "instructions": 221989,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 9334,
+      "bucket_instructions": 206050
+    },
+    {
+      "case": "steady192",
+      "buffer": 1,
+      "instructions": 213706,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 8710,
+      "bucket_instructions": 197847
+    },
+    {
+      "case": "steady192",
+      "buffer": 0,
+      "instructions": 261769,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 14976,
+      "bucket_instructions": 246352
+    },
+    {
+      "case": "steady192",
+      "buffer": 1,
+      "instructions": 261699,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 14976,
+      "bucket_instructions": 246351
+    },
+    {
+      "case": "steady192",
+      "buffer": 0,
+      "instructions": 261769,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 14976,
+      "bucket_instructions": 246352
+    },
+    {
+      "case": "steady192",
+      "buffer": 1,
+      "instructions": 261699,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 14976,
+      "bucket_instructions": 246351
+    },
+    {
+      "case": "steady320",
+      "buffer": 0,
+      "instructions": 359063,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 19136,
+      "bucket_instructions": 342622
+    },
+    {
+      "case": "steady320",
+      "buffer": 1,
+      "instructions": 358993,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 19136,
+      "bucket_instructions": 342621
+    },
+    {
+      "case": "steady320",
+      "buffer": 0,
+      "instructions": 384023,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 23296,
+      "bucket_instructions": 367582
+    },
+    {
+      "case": "steady320",
+      "buffer": 1,
+      "instructions": 383953,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 23296,
+      "bucket_instructions": 367581
+    },
+    {
+      "case": "steady320",
+      "buffer": 0,
+      "instructions": 384023,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 23296,
+      "bucket_instructions": 367582
+    },
+    {
+      "case": "steady320",
+      "buffer": 1,
+      "instructions": 383953,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 23296,
+      "bucket_instructions": 367581
+    },
+    {
+      "case": "shrink",
+      "buffer": 0,
+      "instructions": 139618,
+      "entries": 1040,
+      "drops": 0,
+      "table_stores": 12688,
+      "bucket_instructions": 125441
+    },
+    {
+      "case": "empty",
+      "buffer": 1,
+      "instructions": 105987,
+      "entries": 0,
+      "drops": 0,
+      "table_stores": 11648,
+      "bucket_instructions": 92175
+    },
+    {
+      "case": "empty",
+      "buffer": 0,
+      "instructions": 40444,
+      "entries": 0,
+      "drops": 0,
+      "table_stores": 1040,
+      "bucket_instructions": 26563
+    },
+    {
+      "case": "full",
+      "buffer": 1,
+      "instructions": 631829,
+      "entries": 26624,
+      "drops": 0,
+      "table_stores": 26624,
+      "bucket_instructions": 614177
+    },
+    {
+      "case": "full",
+      "buffer": 0,
+      "instructions": 631899,
+      "entries": 26624,
+      "drops": 0,
+      "table_stores": 26624,
+      "bucket_instructions": 614178
+    },
+    {
+      "case": "overflow",
+      "buffer": 1,
+      "instructions": 253754,
+      "entries": 2080,
+      "drops": 520,
+      "table_stores": 28704,
+      "bucket_instructions": 239142
+    },
+    {
+      "case": "overflow",
+      "buffer": 0,
+      "instructions": 255126,
+      "entries": 2080,
+      "drops": 520,
+      "table_stores": 28704,
+      "bucket_instructions": 240445
+    },
+    {
+      "case": "edges",
+      "buffer": 1,
+      "instructions": 29913,
+      "entries": 52,
+      "drops": 0,
+      "table_stores": 2132,
+      "bucket_instructions": 16069
+    },
+    {
+      "case": "edges",
+      "buffer": 0,
+      "instructions": 29983,
+      "entries": 52,
+      "drops": 0,
+      "table_stores": 2132,
+      "bucket_instructions": 16070
+    },
+    {
+      "case": "empty",
+      "buffer": 1,
+      "instructions": 15958,
+      "entries": 0,
+      "drops": 0,
+      "table_stores": 52,
+      "bucket_instructions": 2146
+    },
+    {
+      "case": "empty",
+      "buffer": 0,
+      "instructions": 16028,
+      "entries": 0,
+      "drops": 0,
+      "table_stores": 52,
+      "bucket_instructions": 2147
+    }
+  ],
+  "updated": [
+    {
+      "case": "steady192",
+      "buffer": 0,
+      "instructions": 165562,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 7784,
+      "bucket_instructions": 149613
+    },
+    {
+      "case": "steady192",
+      "buffer": 1,
+      "instructions": 167635,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 8088,
+      "bucket_instructions": 151766
+    },
+    {
+      "case": "steady192",
+      "buffer": 0,
+      "instructions": 163587,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 7488,
+      "bucket_instructions": 148165
+    },
+    {
+      "case": "steady192",
+      "buffer": 1,
+      "instructions": 163517,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 7488,
+      "bucket_instructions": 148164
+    },
+    {
+      "case": "steady192",
+      "buffer": 0,
+      "instructions": 163587,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 7488,
+      "bucket_instructions": 148165
+    },
+    {
+      "case": "steady192",
+      "buffer": 1,
+      "instructions": 163517,
+      "entries": 7488,
+      "drops": 0,
+      "table_stores": 7488,
+      "bucket_instructions": 148164
+    },
+    {
+      "case": "steady320",
+      "buffer": 0,
+      "instructions": 239971,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 11648,
+      "bucket_instructions": 223525
+    },
+    {
+      "case": "steady320",
+      "buffer": 1,
+      "instructions": 239901,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 11648,
+      "bucket_instructions": 223524
+    },
+    {
+      "case": "steady320",
+      "buffer": 0,
+      "instructions": 239971,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 11648,
+      "bucket_instructions": 223525
+    },
+    {
+      "case": "steady320",
+      "buffer": 1,
+      "instructions": 239901,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 11648,
+      "bucket_instructions": 223524
+    },
+    {
+      "case": "steady320",
+      "buffer": 0,
+      "instructions": 239971,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 11648,
+      "bucket_instructions": 223525
+    },
+    {
+      "case": "steady320",
+      "buffer": 1,
+      "instructions": 239901,
+      "entries": 11648,
+      "drops": 0,
+      "table_stores": 11648,
+      "bucket_instructions": 223524
+    },
+    {
+      "case": "shrink",
+      "buffer": 0,
+      "instructions": 110487,
+      "entries": 1040,
+      "drops": 0,
+      "table_stores": 11648,
+      "bucket_instructions": 96305
+    },
+    {
+      "case": "empty",
+      "buffer": 1,
+      "instructions": 97231,
+      "entries": 0,
+      "drops": 0,
+      "table_stores": 11648,
+      "bucket_instructions": 83414
+    },
+    {
+      "case": "empty",
+      "buffer": 0,
+      "instructions": 29792,
+      "entries": 0,
+      "drops": 0,
+      "table_stores": 1040,
+      "bucket_instructions": 15906
+    },
+    {
+      "case": "full",
+      "buffer": 1,
+      "instructions": 500489,
+      "entries": 26624,
+      "drops": 0,
+      "table_stores": 26624,
+      "bucket_instructions": 482832
+    },
+    {
+      "case": "full",
+      "buffer": 0,
+      "instructions": 504249,
+      "entries": 26624,
+      "drops": 0,
+      "table_stores": 26624,
+      "bucket_instructions": 486523
+    },
+    {
+      "case": "overflow",
+      "buffer": 1,
+      "instructions": 226595,
+      "entries": 2080,
+      "drops": 520,
+      "table_stores": 27700,
+      "bucket_instructions": 211978
+    },
+    {
+      "case": "overflow",
+      "buffer": 0,
+      "instructions": 223104,
+      "entries": 2080,
+      "drops": 520,
+      "table_stores": 27700,
+      "bucket_instructions": 208418
+    },
+    {
+      "case": "edges",
+      "buffer": 1,
+      "instructions": 38052,
+      "entries": 52,
+      "drops": 0,
+      "table_stores": 2132,
+      "bucket_instructions": 24203
+    },
+    {
+      "case": "edges",
+      "buffer": 0,
+      "instructions": 41832,
+      "entries": 52,
+      "drops": 0,
+      "table_stores": 2132,
+      "bucket_instructions": 27914
+    },
+    {
+      "case": "empty",
+      "buffer": 1,
+      "instructions": 28323,
+      "entries": 0,
+      "drops": 0,
+      "table_stores": 52,
+      "bucket_instructions": 14506
+    },
+    {
+      "case": "empty",
+      "buffer": 0,
+      "instructions": 24553,
+      "entries": 0,
+      "drops": 0,
+      "table_stores": 52,
+      "bucket_instructions": 10667
+    }
+  ]
+}

@@ -3,14 +3,31 @@ create_clock -period 10.00                           core_clk
 create_clock -period 2.50                           sdram_clk
 create_clock -period 2.50                           rx_cal_clk
 create_clock -period 2.50                           tx_cal_clk
-create_clock -period 5.000                          axi_clk
+create_clock -period 40.00 [get_ports {jtag_inst1_TCK}]
+# axi_clk is not an object of this design: both instantiations of the SoC tie the
+# sub-module's axi_clk port to core_clk, and rtl/v_dma/video_dma_read.v says so in
+# a comment.  This line asked for a 200 MHz clock on a port the netlist does not
+# have, so Efinity answered 'No valid object(s) found for 'axi_clk'' once per read
+# and the real clock - core_clk at 100 MHz - was left to stand on its own.
+# create_clock -period 5.000                          axi_clk
 create_clock -period 2.5000                         tx_cal_clk_90edge
-create_clock -period 10.0000                        peripheralClk
+# Same story as axi_clk: no such object, one 'No valid object(s)' warning per read.
+# The peripheral clock of this SoC is core_clk.
+# create_clock -period 10.0000                        peripheralClk
 
-set_clock_groups    -group  {   core_clk      }
-set_clock_groups    -group  {   sdram_clk     }
-set_clock_groups    -group  {   rx_cal_clk    }
-set_clock_groups    -group  {   tx_cal_clk    }
+# These four lines used to be one 'set_clock_groups -group {x}' each, with no option
+# at all.  Efinity defaulted each of them to -exclusive and said so four times per
+# read.  The intent is the usual one for PLL domains, so it is now written the way
+# the asynchronous groups further down already write it: one statement, the option
+# spelled out, one group per clock domain.
+# jtag_inst1_TCK belongs in here too.  Now that the JTAG clock is actually
+# created above, the tool starts timing the core_clk <-> TCK paths inside the
+# SoC's jtagBridge, and they come out at 0.010 and 0.015 ns of slack - present,
+# and therefore reported as passing, but with no margin at all.  Before the
+# clock existed those paths were not timed either, so putting TCK in the
+# asynchronous group restores the previous treatment rather than hiding
+# anything new: JTAG is a debug clock driven by the pod, not a data domain.
+set_clock_groups -asynchronous -group {core_clk} -group {sdram_clk} -group {rx_cal_clk} -group {tx_cal_clk} -group {jtag_inst1_TCK}
 
 
 # GPIO Constraints
@@ -32,17 +49,25 @@ set_clock_groups    -group  {   tx_cal_clk    }
 
 # JTAG Constraints
 ####################
-# create_clock -period 40.00 [get_ports {jtag_inst1_TCK}]
+# The JTAG clock has to exist for the delays below to have something to reference.
+# It was commented out while the twelve lines that depend on it were left active,
+# so every one of them came back as 'No clocks matched jtag_inst1_TCK'.
+# jtag_inst1_TCK is real - ti60_top.peri.xml declares it under efxpt:jtag.
 set_output_delay -clock jtag_inst1_TCK -max 0.134 [get_ports {jtag_inst1_TDO}]
 set_output_delay -clock jtag_inst1_TCK -min -0.075 [get_ports {jtag_inst1_TDO}]
 set_input_delay -clock_fall -clock jtag_inst1_TCK -max 0.322 [get_ports {jtag_inst1_CAPTURE}]
 set_input_delay -clock_fall -clock jtag_inst1_TCK -min 0.187 [get_ports {jtag_inst1_CAPTURE}]
-set_input_delay -clock_fall -clock jtag_inst1_TCK -max 0.322 [get_ports {jtag_inst1_RESET}]
-set_input_delay -clock_fall -clock jtag_inst1_TCK -min 0.187 [get_ports {jtag_inst1_RESET}]
 set_input_delay -clock_fall -clock jtag_inst1_TCK -max 0.279 [get_ports {jtag_inst1_SEL}]
 set_input_delay -clock_fall -clock jtag_inst1_TCK -min 0.162 [get_ports {jtag_inst1_SEL}]
-set_input_delay -clock_fall -clock jtag_inst1_TCK -max 0.322 [get_ports {jtag_inst1_UPDATE}]
-set_input_delay -clock_fall -clock jtag_inst1_TCK -min 0.187 [get_ports {jtag_inst1_UPDATE}]
+# jtag_inst1_RESET and jtag_inst1_UPDATE are declared in ti60_top.peri.xml (under
+# efxpt:jtag), but the tool does not consider them ports of the netlist and
+# answered both of them with 'No ports matched' - twelve warnings per build, all
+# of them about constraints that were doing nothing.  CAPTURE, SEL and SHIFT do
+# resolve, so those stay.
+# set_input_delay -clock_fall -clock jtag_inst1_TCK -max 0.322 [get_ports {jtag_inst1_RESET}]
+# set_input_delay -clock_fall -clock jtag_inst1_TCK -min 0.187 [get_ports {jtag_inst1_RESET}]
+# set_input_delay -clock_fall -clock jtag_inst1_TCK -max 0.322 [get_ports {jtag_inst1_UPDATE}]
+# set_input_delay -clock_fall -clock jtag_inst1_TCK -min 0.187 [get_ports {jtag_inst1_UPDATE}]
 set_input_delay -clock_fall -clock jtag_inst1_TCK -max 0.388 [get_ports {jtag_inst1_SHIFT}]
 set_input_delay -clock_fall -clock jtag_inst1_TCK -min 0.225 [get_ports {jtag_inst1_SHIFT}]
 # JTAG Constraints (extra... not used by current Efinity debug tools)
@@ -54,7 +79,10 @@ set_input_delay -clock_fall -clock jtag_inst1_TCK -min 0.225 [get_ports {jtag_in
 
 # HSIO GPIO Constraints
 #########################
-create_clock -period 40.00 [get_ports {clk_25m}]
+# clk_25m is already created on line 1.  A second create_clock for the same port
+# only produced 'A clock with name 'clk_25m' already exists. Overwriting the
+# previous clock with the same name' on every read.
+# create_clock -period 40.00 [get_ports {clk_25m}]
 set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~95}] -max 0.302 [get_ports {ddr_addr[0]}]
 set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~95}] -min -0.140 [get_ports {ddr_addr[0]}]
 set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~36}] -max 0.302 [get_ports {ddr_addr[1]}]
@@ -83,10 +111,16 @@ set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~21
 set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~35}] -min -0.140 [get_ports {ddr_addr[12]}]
 set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~71}] -max 0.302 [get_ports {ddr_addr[13]}]
 set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~71}] -min -0.140 [get_ports {ddr_addr[13]}]
-set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~109}] -max 0.302 [get_ports {ddr_addr[14]}]
-set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~109}] -min -0.140 [get_ports {ddr_addr[14]}]
-set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~143~1}] -max 0.302 [get_ports {ddr_addr[15]}]
-set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~143~1}] -min -0.140 [get_ports {ddr_addr[15]}]
+# ddr_addr stops at [13] here: rtl/ddr3_controller/ddr3_parameter.vh sets ROW_WIDTH
+# to 14, so [14] and [15] are not ports of the netlist and these four lines were
+# dead ('set_output_delay: No valid output port(s) found').  ti60_top.peri.xml does
+# hand those two bits pins (GPIOR_P_06 / GPIOB_N_11) and the pinout report places
+# them, so RTL and pinout disagree - but an SDC file cannot fix that, and leaving
+# four constraints in place that are silently ignored is worse than removing them.
+# set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~109}] -max 0.302 [get_ports {ddr_addr[14]}]
+# set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~109}] -min -0.140 [get_ports {ddr_addr[14]}]
+# set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~143~1}] -max 0.302 [get_ports {ddr_addr[15]}]
+# set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~143~1}] -min -0.140 [get_ports {ddr_addr[15]}]
 set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~74~1}] -max 0.302 [get_ports {ddr_ba[0]}]
 set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~74~1}] -min -0.140 [get_ports {ddr_ba[0]}]
 set_output_delay -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~132~1}] -max 0.302 [get_ports {ddr_ba[1]}]
@@ -294,18 +328,33 @@ set_output_delay -clock tx_cal_clk -reference_pin [get_ports {tx_cal_clk~CLKOUT~
 # ddr_odt[0] -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~73~1}]
 # ddr_ras_n -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~48}]
 # ddr_we_n -clock sdram_clk -reference_pin [get_ports {sdram_clk~CLKOUT~218~94}]
-set_input_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~59}] -max 0.476 [get_ports {system_spi_0_io_data_0_IN}]
-set_input_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~59}] -min 0.276 [get_ports {system_spi_0_io_data_0_IN}]
-set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~61}] -max 0.302 [get_ports {system_spi_0_io_data_0_OUT}]
-set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~61}] -min -0.140 [get_ports {system_spi_0_io_data_0_OUT}]
-set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~61}] -max 0.302 [get_ports {system_spi_0_io_data_0_OE}]
-set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~61}] -min -0.140 [get_ports {system_spi_0_io_data_0_OE}]
+# The SPI pins are tied off in RTL (rtl/ti60_top.v passes () for write/writeEnable
+# and 1'b0 for read on all four data lines), so system_spi_0_io_data_*_IN / _OUT /
+# _OE are not ports of the netlist.  All twelve lines were reported as
+# 'set_input_delay / set_output_delay: No valid ... port(s) found'.  If SPI is ever
+# wired up, these constraints come back with it.
+# set_input_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~59}] -max 0.476 [get_ports {system_spi_0_io_data_0_IN}]
+# set_input_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~59}] -min 0.276 [get_ports {system_spi_0_io_data_0_IN}]
+# set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~61}] -max 0.302 [get_ports {system_spi_0_io_data_0_OUT}]
+# set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~61}] -min -0.140 [get_ports {system_spi_0_io_data_0_OUT}]
+# set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~61}] -max 0.302 [get_ports {system_spi_0_io_data_0_OE}]
+# set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~61}] -min -0.140 [get_ports {system_spi_0_io_data_0_OE}]
+# set_input_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~60}] -max 0.476 [get_ports {system_spi_0_io_data_1_IN}]
+# set_input_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~60}] -min 0.276 [get_ports {system_spi_0_io_data_1_IN}]
+# set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~62}] -max 0.302 [get_ports {system_spi_0_io_data_1_OUT}]
+# set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~62}] -min -0.140 [get_ports {system_spi_0_io_data_1_OUT}]
+# set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~62}] -max 0.302 [get_ports {system_spi_0_io_data_1_OE}]
+# set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~62}] -min -0.140 [get_ports {system_spi_0_io_data_1_OE}]
+
+# HDMI Clocks
 set_input_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~60}] -max 0.476 [get_ports {system_spi_0_io_data_1_IN}]
 set_input_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~60}] -min 0.276 [get_ports {system_spi_0_io_data_1_IN}]
-set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~62}] -max 0.302 [get_ports {system_spi_0_io_data_1_OUT}]
-set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~62}] -min -0.140 [get_ports {system_spi_0_io_data_1_OUT}]
-set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~62}] -max 0.302 [get_ports {system_spi_0_io_data_1_OE}]
-set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~62}] -min -0.140 [get_ports {system_spi_0_io_data_1_OE}]
+set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~61}] -max 0.302 [get_ports {system_spi_0_io_data_0_OUT}]
+set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~61}] -min -0.140 [get_ports {system_spi_0_io_data_0_OUT}]
+set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~31}] -max 0.302 [get_ports {system_spi_0_io_sclk_write}]
+set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~31}] -min -0.140 [get_ports {system_spi_0_io_sclk_write}]
+set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~30}] -max 0.302 [get_ports {system_spi_0_io_ss}]
+set_output_delay -clock core_clk -reference_pin [get_ports {core_clk~CLKOUT~1~30}] -min -0.140 [get_ports {system_spi_0_io_ss}]
 
 # HDMI Clocks
 create_clock -period 11.667 hdmi_tx_slow_clk

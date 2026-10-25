@@ -16,12 +16,38 @@
 
 # ---- RTL simulation scratch ---------------------------------------------------
 /work_sim/
+/xsim.dir/
+tests/sim.log
 *.vvp
 *.vcd
 *.fst
 simulator/cache/
 simulator/output/
+# ---- simulator C-extension build output --------------------------------------
+simulator/build/
 *.pkl
+
+# ---- tool logs that land in the project root ---------------------------------
+# xvlog writes these next to whatever directory the runner was invoked from, so
+# an iverilog/Vivado run leaves two empty files at the top level.
+xvlog.log
+xvlog.pb
+
+# ---- backups ----------------------------------------------------------------
+# Files kept deliberately, but they are copies of tracked sources: a .bak
+# entering history would be duplicate content that no build reads.
+*.bak
+*.bak_*
+backups/
+
+# ---- local scratch: throwaway dumps from ad-hoc runs -------------------------
+# Hex dumps and ppm frames written while poking at the design. Regenerable,
+# bulky, and read by no build.
+/scratch/
+
+# ---- logs and exported pictures anywhere -------------------------------------
+*.log
+!/tests/*.log
 
 # ---- firmware build products (sw/build_firmware.bat regenerates them) ---------
 /sw/build/
@@ -34,11 +60,24 @@ simulator/output/
 # ---- downloaded toolchain runtime (tools/setup_iverilog_portable.ps1) --------
 /tools/rtl_runtime/
 
-# ---- python bytecode ----------------------------------------------------------
+# ---- python bytecode / compiled C extensions ---------------------------------
 __pycache__/
 *.pyc
+*.pyd
 
 # ---- editor / OS noise --------------------------------------------------------
 Thumbs.db
 desktop.ini
 *.swp
+# Portable toolchain runtimes fetched by tools/setup_*.ps1 (large, reproducible)
+tools/pypy/
+tools/downloads/
+
+# Local audio inputs and generated BGM clips are not redistributable sources.
+/assets/audio/source/
+/assets/audio/bgm/
+/assets/audio/generated/
+/rtl/bitblt/asset_rom.hex
+/rtl/bitblt/asset_rom_path.vh
+/rtl/bitblt/asset_rom.hex
+/rtl/bitblt/asset_rom_path.vh

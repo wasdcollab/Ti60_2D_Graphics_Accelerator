@@ -1,0 +1,78 @@
+========================================================
+1. Building RISC-V C Firmware Symbols
+========================================================
+========================================================
+ Building RISC-V firmware (riscv-none-elf-gcc flow)
+========================================================
+[fw] C:\Users\TimeCheney123\AppData\Local\Programs\Python\Python310\python.exe D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\build_visual_assets.py
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\build_visual_assets.py:160: DeprecationWarning: Image.Image.getdata is deprecated and will be removed in Pillow 14 (2027-10-15). Use get_flattened_data instead.
+  for r,g,b,a in dream.getdata()])
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\build_visual_assets.py:193: DeprecationWarning: Image.Image.getdata is deprecated and will be removed in Pillow 14 (2027-10-15). Use get_flattened_data instead.
+  colored.putdata([(255,255,255,a) if min(r,g,b)>200 else (*col,a) for r,g,b,a in bullet.getdata()])
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\build_visual_assets.py:85: DeprecationWarning: Image.Image.getdata is deprecated and will be removed in Pillow 14 (2027-10-15). Use get_flattened_data instead.
+  for color, a in zip(rgb.getdata(), alpha.getdata()):
+Asset bank: 26 assets, 6387 encoded bytes
+[fw] C:\Users\TimeCheney123\AppData\Local\Programs\Python\Python310\python.exe D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\build_stage_backgrounds.py
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\build_stage_backgrounds.py:551: DeprecationWarning: Image.Image.getdata is deprecated and will be removed in Pillow 14 (2027-10-15). Use get_flattened_data instead.
+  for color, a in zip(im.convert('RGB').getdata(), im.getchannel('A').getdata()):
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\build_stage_backgrounds.py:567: DeprecationWarning: Image.Image.getdata is deprecated and will be removed in Pillow 14 (2027-10-15). Use get_flattened_data instead.
+  for color, a in zip(rgb.getdata(), alpha.getdata()):
+stage_ice      1366x768 cols=16 runs=2036   encoded= 4652 bytes
+stage_lava     1366x768 cols=16 runs=2248   encoded= 3906 bytes
+stage_dream    1366x768 cols=16 runs=1866   encoded= 3947 bytes
+snow           32x768 PREVIEW ONLY (screen is rtl/v_dma/video_weather.v, 170 dots) rows=30..758
+asset ROM      12313 bytes written, 16384 available
+asset ROM      12313 bytes -> rtl\bitblt\bg_rle.hex
+stage bank: 4 assets, 12510 encoded bytes (asset ROM 12313 B)
+[fw] C:\Users\TimeCheney123\AppData\Local\Programs\Python\Python310\python.exe D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\build_asset_rom.py
+Asset ROM: 12313 background bytes + 760 font bytes in 16384 bytes
+[fw] C:\Users\TimeCheney123\AppData\Local\Programs\Python\Python310\python.exe D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\check_hud_layout.py
+  HUD layout: 23 elements, 0 baked label(s) to check against, playfield band x=181..1185 on a 1366x768 screen
+    (no baked labels: the plates are painted by the firmware and its labels are drawn at run time, so there is nothing baked to collide with)
+  HUD layout: no overlap, nothing in the playfield, nothing off screen
+[fw] C:\Users\TimeCheney123\AppData\Local\Programs\Python\Python310\python.exe D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\check_ddr_layout.py
+  DDR layout: 55 surfaces + 26 decoded assets, 0x1600000..0x5800000 of a 0x5800000 window
+  DDR layout: every surface and asset owns a disjoint range
+[fw] toolchain: D:\FPGAqiansai\toolchain\bin\riscv-none-elf-gcc.exe
+[fw] riscv-none-elf-gcc.exe (xPack GNU RISC-V Embedded GCC x86_64) 13.4.0
+[fw] D:\FPGAqiansai\toolchain\bin\riscv-none-elf-gcc.exe -march=rv32im -mabi=ilp32 -Oz -flto -ffreestanding -fno-builtin -fno-common -ffunction-sections -fdata-sections -fno-strict-aliasing -Wall -Wextra -Werror -g -ID:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\driver -c D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\startup/crt0.S -o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\crt0.o
+[fw] D:\FPGAqiansai\toolchain\bin\riscv-none-elf-gcc.exe -march=rv32im -mabi=ilp32 -Oz -flto -ffreestanding -fno-builtin -fno-common -ffunction-sections -fdata-sections -fno-strict-aliasing -Wall -Wextra -Werror -g -ID:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\driver -c D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\driver/gpu2d.c -o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\gpu2d.o
+[fw] D:\FPGAqiansai\toolchain\bin\riscv-none-elf-gcc.exe -march=rv32im -mabi=ilp32 -Oz -flto -ffreestanding -fno-builtin -fno-common -ffunction-sections -fdata-sections -fno-strict-aliasing -Wall -Wextra -Werror -g -ID:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\driver -c D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\driver/gamepad.c -o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\gamepad.o
+[fw] D:\FPGAqiansai\toolchain\bin\riscv-none-elf-gcc.exe -march=rv32im -mabi=ilp32 -Oz -flto -ffreestanding -fno-builtin -fno-common -ffunction-sections -fdata-sections -fno-strict-aliasing -Wall -Wextra -Werror -g -ID:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\driver -c D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\driver/audio_stream.c -o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\audio_stream.o
+[fw] D:\FPGAqiansai\toolchain\bin\riscv-none-elf-gcc.exe -march=rv32im -mabi=ilp32 -Oz -flto -ffreestanding -fno-builtin -fno-common -ffunction-sections -fdata-sections -fno-strict-aliasing -Wall -Wextra -Werror -g -ID:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\driver -c D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\app/main.c -o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\main.o
+[fw] D:\FPGAqiansai\toolchain\bin\riscv-none-elf-gcc.exe -march=rv32im -mabi=ilp32 -Oz -flto -ffreestanding -fno-builtin -fno-common -ffunction-sections -fdata-sections -fno-strict-aliasing -Wall -Wextra -Werror -g -ID:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\driver -c D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\app/visual_assets.c -o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\visual_assets.o
+[fw] D:\FPGAqiansai\toolchain\bin\riscv-none-elf-gcc.exe -march=rv32im -mabi=ilp32 -Oz -flto -ffreestanding -fno-builtin -fno-common -ffunction-sections -fdata-sections -fno-strict-aliasing -Wall -Wextra -Werror -g -ID:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\driver -c D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\app/stage_bg.c -o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\stage_bg.o
+[fw] D:\FPGAqiansai\toolchain\bin\riscv-none-elf-gcc.exe -march=rv32im -mabi=ilp32 -Oz -flto -ffreestanding -fno-builtin -fno-common -ffunction-sections -fdata-sections -fno-strict-aliasing -Wall -Wextra -Werror -g -T D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\linker\ti60_sapphire.ld -Wl,-Map=D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\firmware.map -o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\firmware.elf D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\crt0.o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\gpu2d.o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\gamepad.o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\audio_stream.o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\main.o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\visual_assets.o D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\obj\stage_bg.o -nostdlib -nostartfiles -flto -Wl,--gc-sections -Wl,--build-id=none -Wl,--no-relax -Wl,--no-warn-rwx-segments -lgcc
+[fw] D:\FPGAqiansai\toolchain\bin\riscv-none-elf-objcopy.exe -O binary D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\firmware.elf D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\firmware.bin
+[fw] size:
+text	   data	    bss	    dec	    hex	filename
+  64244	      8	    500	  64752	   fcf0	D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\firmware.elf
+[fw] linked image ends at 0xF900FCF0 (64752 bytes of 64768 usable, stack top 0xF9010000)
+[fw] bss: 0xF900FAFC..0xF900FCF0 (500 bytes)
+[fw] OK  sym=sw\build\firmware.sym
+[fw] C:\Users\TimeCheney123\AppData\Local\Programs\Python\Python310\python.exe D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\elf_to_bram.py --bin D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\sw\build\firmware.bin --gcc-dir D:\FPGAqiansai\toolchain --ram-bytes 65536 --verify
+BRAM image: 64252 bytes of firmware -> 16384 words, 4 lanes x 16384 lines
+  wrote ip\soc
+  wrote ip\soc\source\hardware\netlist
+[fw] OK  elf=sw\build\firmware.elf
+[fw] OK  bin=sw\build\firmware.bin (64252 bytes)
+[fw] OK  map=sw\build\firmware.map
+[SUCCESS] firmware.elf/.bin built and BRAM lanes regenerated.
+========================================================
+2. Setting Efinity Environment
+========================================================
+========================================================
+========================================================
+Running: efx_run_map.py ti60_top --family Titanium --device Ti60F225 --project_xml D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\ti60_top.xml --dir D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\ip\soc --output_dir outflow --work_dir work_syn --opt root=ti60_top --opt veri_options=verilog_mode=verilog_2k,vhdl_mode=vhdl_2008 work-dir=work_syn write_efx_verilog=on I=ip/soc I=rtl I=rtl/common I=rtl/ddr3_controller I=rtl/bitblt
+   map :	PASS 
+Running: efx_run_pt_unified.py ti60_top Titanium Ti60F225 --output_dir outflow --timing_model I3 --project_xml ti60_top.xml
+   interface :	PASS 
+Running: efx_run_pnr.py ti60_top --prj D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\ti60_top.xml --family Titanium --device Ti60F225 --timing_model I3 --dir D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\ip\soc --output_dir outflow --work_dir work_pnr --opt sdc_file=sdc/ti60_top.sdc
+   pnr :	PASS 
+Running: efx_run_pgm.py ti60_top --family Titanium --device Ti60F225 --output_dir outflow --work_dir work_pnr --opt mode=active width=1 enable_roms=smart spi_low_power_mode=on io_weak_pullup=on oscillator_clock_divider=DIV8 bitstream_compression=on enable_external_master_clock=off active_capture_clk_edge=negedge jtag_usercode=0xFFFFFFFF release_tri_then_reset=on four_byte_addressing=off
+   pgm :	PASS 
+========================================================
+[SUCCESS] Full system compiled!
+Bitstream: outflow\ti60_top.bit
+Flash HEX: outflow\ti60_top.hex
+========================================================

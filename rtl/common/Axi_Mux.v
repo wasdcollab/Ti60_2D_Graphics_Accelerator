@@ -40,7 +40,7 @@
 
 `timescale 1ns/100ps
 
-`define     X3 
+`define     X4
 
 `include  "Axi_Mux_Param.vh"
 
@@ -2422,201 +2422,62 @@ endmodule
   --2022-10-12  Axi_Mux_Addr_Ctrl
     修改了通道切换状态机（ Sta_Cnl_Switch ）, 提高了切换效率
 **********************************************************/
-module  Axi_Mux_Addr_Ctrl
-(
-  //System Signal
-  Sys_Clk         , //System Clock
-  Sys_Rst_N       , //System Reset
-  //AXI Bus Siganl
-  O_M_A_VALID     , //(O)address valid.
-  I_M_A_READY     , //(I)address ready.
-  I_S_A_VALID     , //(I)address valid.
-  O_S_A_READY     , //(O)address ready.
-  //Config & State
-  Cfg_Arb_Type    , //(I)Config Arbitrtion Type
-  Cfg_Cnl_Mask    , //(I)Config Channle Mask
-  I_Cnl_Sw_En     , //(I)Channle Swith Enable
-  O_Act_Cnl_End   , //(O)Active Enable
-  O_Act_Cnl_Num   , //(O)Active Channel Number
-  O_Act_Cnl_List    //(O)Active Channel List
+module Axi_Mux_Addr_Ctrl #(
+    parameter AXI_CHANNEL_NUM=2,
+    localparam CHANNEL_CNT_WIDTH=$clog2(AXI_CHANNEL_NUM)
+)(
+    input wire Sys_Clk,Sys_Rst_N,
+    output wire O_M_A_VALID,
+    input wire I_M_A_READY,
+    input wire [AXI_CHANNEL_NUM-1:0] I_S_A_VALID,
+    output wire [AXI_CHANNEL_NUM-1:0] O_S_A_READY,
+    input wire Cfg_Arb_Type,
+    input wire [AXI_CHANNEL_NUM-1:0] Cfg_Cnl_Mask,
+    input wire I_Cnl_Sw_En,
+    output wire O_Act_Cnl_End,
+    output wire [CHANNEL_CNT_WIDTH-1:0] O_Act_Cnl_Num,
+    output wire [AXI_CHANNEL_NUM-1:0] O_Act_Cnl_List
 );
-
-  //Define  Parameter
-  /////////////////////////////////////////////////////////
-  //////////////
-  //AXI通道个数设置
-  parameter     AXI_CHANNEL_NUM     = 2 ; //Slave的通道个数
-
-  localparam    CHANNEL_CNT_WIDTH   = $clog2( AXI_CHANNEL_NUM ) ; //通道计数的宽度
-
-  //abbreviation
-  //////////////
-  localparam    ACN   = AXI_CHANNEL_NUM     ;
-  localparam    CCW   = CHANNEL_CNT_WIDTH   ;
-  /////////////////////////////////////////////////////////
-
-  // Signal Define
-  /////////////////////////////////////////////////////////
-  input               Sys_Clk         ; //System Clock
-  input               Sys_Rst_N       ; //System Reset
-  //Axi Master Signal   
-  output              O_M_A_VALID     ; //(O)address valid.
-  input               I_M_A_READY     ; //(I)address ready.
-
-  //Axi Slave Signal    
-  input   [ACN-1:0]   I_S_A_VALID     ; //(I)address valid.
-  output  [ACN-1:0]   O_S_A_READY     ; //(O)address ready.
-  //Config & State    
-  input               Cfg_Arb_Type    ; //(I)Config Arbitrtion Type
-                                        //仲裁策略 0:共享;1:优先级（S0为最高优先级）；
-  input   [ACN-1:0]   Cfg_Cnl_Mask    ; //(I)Config Channle Mask
-                                        //通道掩码 Bit位为0，对应通道不工作
-  input               I_Cnl_Sw_En     ; //(I)Channle Swith Enable
-  output              O_Act_Cnl_End   ; //(O)Active Enable
-  output  [CCW-1:0]   O_Act_Cnl_Num   ; //(O)State Bus Active Channel
-  output  [ACN-1:0]   O_Act_Cnl_List  ; //(O)Active Channel List
-
-  /////////////////////////////////////////////////////////
-//000000000000000000000000000000000000000000000000000000000
-//输入数据处理
-//********************************************************/
-  /////////////////////////////////////////////////////////
-  wire              M_A_Ready   = I_M_A_READY   ; //(I)[RdAddr]Read address ready.
-  wire  [ACN-1:0]   S_A_Valid   = I_S_A_VALID   ; //(I)[RdAddr]Read address valid.
-
-  wire              Cnl_Sw_En   = I_Cnl_Sw_En   ; //(I)Channle Swith Enable
-  
-  /////////////////////////////////////////////////////////
-  //通过掩码确定有效Valid信号
-  wire  [ACN-1:0]   Effe_S_Val  = S_A_Valid & Cfg_Cnl_Mask  ;
-
-  /////////////////////////////////////////////////////////
-//000000000000000000000000000000000000000000000000000000000
-
-//111111111111111111111111111111111111111111111111111111111
-//
-//********************************************************/
-  /////////////////////////////////////////////////////////
-  wire              M_A_Valid   ; //(O)address valid.
-  wire  [ACN-1:0]   S_A_Ready   ; //(O)address ready.
-  
-  wire              M_A_End     = ( M_A_Ready   & M_A_Valid ) ; 
-
-  /////////////////////////////////////////////////////////
-  reg               Sta_Cnl_Switch      = 2'h0                  ; //通道切换状态机
-  reg   [CCW-1:0]   Channel_Cnt         = {CCW{1'h0}}           ; //通道计数器
-  reg   [ACN-1:0]   Channel_List        = {{ACN-1{1'h0}},1'h1}  ; //通道列表，每Bit表示一个通道
-
-  wire              Act_Cnl_Hit         ; //通道激活
-  wire              Cnl_Search_En       ; //通道搜索允许
-
-  localparam        S_ADDR_IDLE = 1'h0  ; //空闲状态
-  localparam        S_ADDR_ACT  = 1'h1  ; //激活状态
-
-  always @ (posedge Sys_Clk or negedge Sys_Rst_N)
-  begin
-    if (~Sys_Rst_N)   
-    begin
-      Sta_Cnl_Switch  <=  S_ADDR_IDLE ;
-      Channel_List    <=  {{ACN-1{1'h0}},1'h1} ;
-      Channel_Cnt     <=  {CCW{1'h0}} ;
-    end
-    else 
-    begin
-      case  (Sta_Cnl_Switch)
-        //空闲状态
-        S_ADDR_IDLE : 
-        begin
-          if (Act_Cnl_Hit)      Sta_Cnl_Switch  <=  S_ADDR_ACT  ;
-          if (Cfg_Arb_Type & Act_Cnl_Hit)
-          begin
-            Channel_Cnt     <=  {CCW{1'h0}} ;
-            Channel_List    <=  {{ACN-1{1'h0}},1'h1} ;
-          end
-          else if (Cnl_Search_En)
-          begin   
-            if (Channel_List[ACN-1])  
-            begin
-              Channel_Cnt   <=  {CCW{1'h0}} ;
-              Channel_List  <=  {{ACN-1{1'h0}},1'h1} ;
+    localparam ACN=AXI_CHANNEL_NUM,CCW=CHANNEL_CNT_WIDTH;
+    wire [ACN-1:0] requests=I_S_A_VALID & Cfg_Cnl_Mask;
+    reg active,choice;
+    reg [CCW-1:0] selected,cursor_rr,cursor_bg,choice_num;
+    reg [ACN-1:0] selected_list,choice_list;
+    integer probe,slot;
+    always @* begin
+        choice=0;choice_num=0;choice_list=0;slot=0;
+        if(Cfg_Arb_Type && requests[0]) begin
+            choice=1;choice_list={{(ACN-1){1'b0}},1'b1};
+        end else begin
+            for(probe=0;probe<ACN;probe=probe+1) begin
+                slot=(Cfg_Arb_Type ? cursor_bg : cursor_rr)+probe;
+                if(slot>=ACN) slot=slot-ACN;
+                if(!choice && requests[slot] && (!Cfg_Arb_Type || slot!=0)) begin
+                    choice=1;choice_num=slot[CCW-1:0];
+                    choice_list={{(ACN-1){1'b0}},1'b1}<<slot;
+                end
             end
-            else  
-            begin
-              Channel_Cnt   <=  Channel_Cnt + {{CCW-1{1'h0}},1'h1} ;
-              Channel_List  <=  {Channel_List[ACN-2:0] ,Channel_List[ACN-1] } ;
-            end    
-          end
-        end 
-        //激活状态
-        S_ADDR_ACT  : 
-        begin
-          if (M_A_End)              Sta_Cnl_Switch  <=  S_ADDR_IDLE ;
-          if ((~Act_Cnl_Hit) & Cnl_Search_En)
-          begin
-            if (Channel_List[ACN-1])  
-            begin
-              Channel_Cnt   <=  {CCW{1'h0}} ;
-              Channel_List  <=  {{ACN-1{1'h0}},1'h1} ;
+        end
+    end
+    assign O_M_A_VALID=active && |(selected_list & I_S_A_VALID);
+    assign O_S_A_READY=selected_list & {ACN{active && I_M_A_READY}};
+    assign O_Act_Cnl_End=O_M_A_VALID && I_M_A_READY;
+    assign O_Act_Cnl_Num=selected;
+    assign O_Act_Cnl_List=selected_list;
+    always @(posedge Sys_Clk or negedge Sys_Rst_N) begin
+        if(!Sys_Rst_N) begin
+            active<=0;selected<=0;selected_list<=0;cursor_rr<=0;cursor_bg<=1;
+        end else if(active) begin
+            if(O_Act_Cnl_End) begin
+                active<=0;selected_list<=0;
+                cursor_rr<=selected==ACN-1 ? {CCW{1'b0}} : selected+1'b1;
+                if(selected!=0)
+                    cursor_bg<=selected==ACN-1 ? {{(CCW-1){1'b0}},1'b1} : selected+1'b1;
             end
-            else  
-            begin
-              Channel_Cnt   <=  Channel_Cnt + {{CCW-1{1'h0}},1'h1} ;
-              Channel_List  <=  {Channel_List[ACN-2:0] ,Channel_List[ACN-1] } ;
-            end
-          end          
-        end 
-      endcase  
+        end else if(I_Cnl_Sw_En && choice) begin
+            active<=1;selected<=choice_num;selected_list<=choice_list;
+        end
     end
-  end
-
-  /////////////////////////////////////////////////////////
-  reg   [CCW-1:0]   Act_Cnl_Num  = {CCW{1'h0}} ; //当前激活的通道编号    
-
-  always @ (posedge Sys_Clk or negedge Sys_Rst_N)
-  begin
-    if (~Sys_Rst_N)           Act_Cnl_Num <= {CCW{1'h0}}  ;
-    else if (Act_Cnl_Hit & (Sta_Cnl_Switch == S_ADDR_IDLE))   
-    begin
-      Act_Cnl_Num  <= Channel_Cnt  ;
-    end
-  end  
-
-  /////////////////////////////////////////////////////////      
-  reg   [ACN-1:0]   Act_Cnl_List = {ACN{1'h0}} ; //当前激活的通道列表      
-
-  always @ (posedge Sys_Clk or negedge Sys_Rst_N)
-  begin
-    if (~Sys_Rst_N)       Act_Cnl_List <= {ACN{1'h0}} ;
-    else
-    begin
-      case  (Sta_Cnl_Switch)
-        S_ADDR_IDLE : if (Act_Cnl_Hit)  Act_Cnl_List <= Channel_List ;
-        S_ADDR_ACT  : if (M_A_End)      Act_Cnl_List <= {ACN{1'h0}}  ;
-      endcase
-    end
-  end  
-
-  /////////////////////////////////////////////////////////
-  //精确控制通道搜寻
-  
-  assign  Cnl_Search_En = |(Effe_S_Val  & (~Act_Cnl_List) ) ;
-  assign  Act_Cnl_Hit   = |(Effe_S_Val  & (~Act_Cnl_List)   & Channel_List  ) ;  //通道激活
-
-  /////////////////////////////////////////////////////////
-  assign    M_A_Valid = |(Act_Cnl_List  & S_A_Valid       ) ;
-  assign    S_A_Ready =  (Act_Cnl_List  & {ACN{M_A_Ready}}) ;
-
-  /////////////////////////////////////////////////////////
-  wire              O_M_A_VALID     = M_A_Valid     ; //(O)[RdAddr]Read address valid.
-  wire  [ACN-1:0]   O_S_A_READY     = S_A_Ready     ; //(O)[RdAddr]Read address ready.
-
-  wire              O_Act_Cnl_End   = M_A_End       ; //(O)Active Enable
-  wire  [CCW-1:0]   O_Act_Cnl_Num   = Act_Cnl_Num   ; //(O)State Bus Active Channel
-  wire  [ACN-1:0]   O_Act_Cnl_List  = Act_Cnl_List  ; //(O)Active Channel List
-  
-  /////////////////////////////////////////////////////////
-//111111111111111111111111111111111111111111111111111111111
-
 endmodule
 
 ///////////////////////////////////////////////////////////

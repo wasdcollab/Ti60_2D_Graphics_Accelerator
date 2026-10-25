@@ -275,15 +275,15 @@ module tb_axi_mux_rd;
   integer s2_rv_cnt = 0;      // R beats Axi_Mux routed to S2
   integer s0_rv_cnt = 0;      // ... and to the two idle slaves, which would
   integer s1_rv_cnt = 0;      //     mean the data went to the wrong place
-  integer r_info_val_cnt = 0;
-  reg     prev_m_rvalid = 1'b0;
+  // r_info_val_cnt and prev_m_rvalid used to live here: both were assigned on
+  // every clock and never read by anything.  The one that looked useful -
+  // counting the mux's internal R_Info_Val handshakes - measured nothing that
+  // the queue depth and the overflow counter do not already say.
 
   always @(posedge clk) begin
     if (s2_rvalid) s2_rv_cnt <= s2_rv_cnt + 1;
     if (s0_rvalid) s0_rv_cnt <= s0_rv_cnt + 1;
     if (s1_rvalid) s1_rv_cnt <= s1_rv_cnt + 1;
-    if (dut.U3_Axi_Mux_Rd_Ctrl.R_Info_Val)
-      r_info_val_cnt <= r_info_val_cnt + 1;
   end
 
   // trace every AR that leaves the mux
@@ -293,7 +293,6 @@ module tb_axi_mux_rd;
 
   // trace every R beat on BOTH sides of the mux, so a dropped RLAST shows up
   always @(posedge clk) begin
-    prev_m_rvalid <= m_rvalid;
     if (m_rvalid)
       $display("  [%0t] M  R beat data=%h last=%b ready=%b",
                $time, m_rdata, m_rlast, m_rready);
@@ -328,6 +327,7 @@ module tb_axi_mux_rd;
 
   // ---- run and report ----------------------------------------------------
   integer cyc = 0;
+  integer fail = 0;
   always @(posedge clk) cyc <= cyc + 1;
 
   initial begin
@@ -350,13 +350,40 @@ module tb_axi_mux_rd;
     $display("  R beats routed: S0=%0d  S1=%0d  S2=%0d", s0_rv_cnt, s1_rv_cnt, s2_rv_cnt);
     $display("  S0 (VDMA) ARs sent=%0d done=%0d   (active=%b)",
              s0_sent, s0_done, S0_ACTIVE);
-    if (done_bursts == TOTAL)
-      $display("  RESULT: PASS - all %0d bursts completed with MAXOUT=%0d",
+    // The three counters above used to be printed and never judged: the only
+    // verdict was "all TOTAL bursts finished".  A mux that overflows its
+    // AR-to-R queue, or that hands an R beat to a slave which never asked for
+    // one, still completes every burst - so both of the failures this bench
+    // exists to catch came out green.
+    fail = 0;
+    if (done_bursts != TOTAL) begin
+      $display("  FAIL: %0d of %0d bursts completed (stuck or timed out after %0d cycles)",
+               done_bursts, TOTAL, cyc);
+      fail = 1;
+    end
+    if (sent != TOTAL) begin
+      $display("  FAIL: %0d ARs were issued, expected %0d", sent, TOTAL);
+      fail = 1;
+    end
+    if (err_seen != 0) begin
+      $display("  FAIL: the AR-to-R queue overflowed %0d times - R data was dropped", err_seen);
+      fail = 1;
+    end
+    if (s0_rv_cnt != 0 || s1_rv_cnt != 0) begin
+      $display("  FAIL: %0d R beats reached S0 and %0d reached S1; both are idle here",
+               s0_rv_cnt, s1_rv_cnt);
+      fail = 1;
+    end
+    if (s2_rv_cnt == 0) begin
+      $display("  FAIL: no R beat reached S2 at all");
+      fail = 1;
+    end
+    if (fail == 0)
+      $display("  RESULT: PASS - all %0d bursts completed with MAXOUT=%0d, queue never overflowed, no beat misrouted",
                TOTAL, MAXOUT);
     else
-      $display("  RESULT: *** STUCK *** completed %0d of %0d after %0d cycles",
-               done_bursts, TOTAL, cyc);
-    $finish;
+      $display("  RESULT: *** FAIL *** see the lines above");
+    $finish(fail ? 1 : 0);
   end
 
 endmodule

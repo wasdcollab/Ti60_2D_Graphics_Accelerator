@@ -1,0 +1,10 @@
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tests\tb_step3_bitblt_copy.sv:141: warning: Extra digits given for sized hex constant.
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tests\tb_step3_bitblt_copy.sv:142: warning: Extra digits given for sized hex constant.
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tests\tb_step3_bitblt_copy.sv:244: warning: Extra digits given for sized hex constant.
+D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tests\tb_step3_bitblt_copy.sv:245: warning: Extra digits given for sized hex constant.
+COPY timeout diagnostic: row=0 rows_done=0 reserved=34 writes_done=0 pending=34 rd_left=0 wr_left=0
+WRITE WAIT: active=1 WVALID=0 read_queue=0 staged_op=2 running_op=1
+SHARED GUARD: pending=1 AWVALID/READY=0/0 WVALID/READY=0/0
+FATAL: D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tests\tb_step3_bitblt_copy.sv:564: vector 0: DONE timeout
+       Time: 600950000  Scope: tb_step3_bitblt_copy.run_vector
+PASS expected pre-fix command overlap deadlock reproduced
