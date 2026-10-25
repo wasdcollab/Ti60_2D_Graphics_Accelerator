@@ -80,6 +80,12 @@ module display_engine_top #(
     input  wire [71:0]                hair_lft,
     input  wire [71:0]                hair_mid,
 
+    // Procedural impact rings (from rtl/apb/apb_command_dispatcher.v, bank 2).
+    // 4 slots x 32 bits each, see 2_layer_generators/video_fx_ring.v.
+    input  wire [127:0]               fx_a,
+    input  wire [127:0]               fx_b,
+    input  wire [127:0]               fx_c,
+
     // HUD & FPS Telemetry
     input  wire                       hud_enable,
     input  wire [7:0]                 cpu_fps_bcd,
@@ -165,6 +171,9 @@ module display_engine_top #(
     reg [71:0] ho_s1,  ho_s2,  ho_latched;
     reg [71:0] hl_s1,  hl_s2,  hl_latched;
     reg [71:0] hm_s1,  hm_s2,  hm_latched;
+    reg [127:0] fxa_s1, fxa_s2, fxa_latched;
+    reg [127:0] fxb_s1, fxb_s2, fxb_latched;
+    reg [127:0] fxc_s1, fxc_s2, fxc_latched;
 
     always @(posedge pixel_clk or negedge pixel_rst_n) begin
         if (!pixel_rst_n) begin
@@ -207,6 +216,9 @@ module display_engine_top #(
             hm_s1          <= 72'd0;
             hm_s2          <= 72'd0;
             hm_latched     <= 72'd0;
+            fxa_s1 <= 128'd0; fxa_s2 <= 128'd0; fxa_latched <= 128'd0;
+            fxb_s1 <= 128'd0; fxb_s2 <= 128'd0; fxb_latched <= 128'd0;
+            fxc_s1 <= 128'd0; fxc_s2 <= 128'd0; fxc_latched <= 128'd0;
         end else begin
             fps_sync1      <= {fpga_fps_bcd, cpu_fps_bcd};
             fps_sync2      <= fps_sync1;
@@ -238,6 +250,12 @@ module display_engine_top #(
             hl_s2          <= hl_s1;
             hm_s1          <= hair_mid;
             hm_s2          <= hm_s1;
+            fxa_s1         <= fx_a;
+            fxa_s2         <= fxa_s1;
+            fxb_s1         <= fx_b;
+            fxb_s2         <= fxb_s1;
+            fxc_s1         <= fx_c;
+            fxc_s2         <= fxc_s1;
 
             if (v_cnt == V_ACT && h_cnt == 12'd0) begin
                 wctl_latched   <= wctl_s2;
@@ -251,6 +269,9 @@ module display_engine_top #(
                 ho_latched     <= ho_s2;
                 hl_latched     <= hl_s2;
                 hm_latched     <= hm_s2;
+                fxa_latched    <= fxa_s2;
+                fxb_latched    <= fxb_s2;
+                fxc_latched    <= fxc_s2;
             end
         end
     end
@@ -373,6 +394,28 @@ module display_engine_top #(
         .rgb         (b_rgb)
     );
 
+    // Layer 4b: Procedural impact rings / cores (no DDR traffic at all)
+    wire        f_visible;
+    wire        f_add;
+    wire [7:0]  f_alpha;
+    wire [23:0] f_rgb;
+    video_fx_ring u_fx (
+        .pixel_clk   (pixel_clk),
+        .pixel_rst_n (pixel_rst_n),
+        .x           (pixel_x_d1),
+        .y           (pixel_y_d1),
+        .de          (t_de_d1),
+        .p_a         (fxa_latched),
+        .p_b         (fxb_latched),
+        .p_c         (fxc_latched),
+        .mask_x      (wbox_x_latched),
+        .mask_y      (wbox_y_latched),
+        .visible     (f_visible),
+        .add         (f_add),
+        .alpha       (f_alpha),
+        .rgb         (f_rgb)
+    );
+
     // Layer 5: HUD OSD
     wire        hud_visible;
     wire [23:0] hud_rgb;
@@ -414,6 +457,10 @@ module display_engine_top #(
         .b_beam_add   (b_beam_add),
         .b_beam_alpha (b_beam_alpha),
         .b_rgb        (b_rgb),
+        .f_visible    (f_visible),
+        .f_add        (f_add),
+        .f_alpha      (f_alpha),
+        .f_rgb        (f_rgb),
         .hud_visible  (hud_visible),
         .hud_rgb      (hud_rgb),
         .hud_enable   (hud_en_sync2),

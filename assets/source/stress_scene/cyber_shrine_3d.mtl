@@ -1,0 +1,11 @@
+# Japanese Shrine Materials
+newmtl Cinnabar_Wood
+Ka 0.12 0.02 0.01
+Kd 0.54 0.10 0.06
+Ks 0.20 0.25 0.30
+Ns 15.0
+newmtl Weathered_Stone
+Ka 0.04 0.06 0.08
+Kd 0.14 0.18 0.22
+Ks 0.35 0.40 0.50
+Ns 25.0

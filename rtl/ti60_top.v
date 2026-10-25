@@ -843,6 +843,8 @@ module ti60_top #(
     wire [71:0] cfg_hair_lft;
     wire [71:0] cfg_hair_mid;
 
+    wire [127:0] cfg_fx_a, cfg_fx_b, cfg_fx_c;
+
     wire [27:0] cfg_bucket_base;
     wire [14:0] cfg_btile_addr;
     wire [7:0]  cfg_btile_data;
@@ -975,6 +977,9 @@ module ti60_top #(
         .hair_out               (cfg_hair_out),
         .hair_lft               (cfg_hair_lft),
         .hair_mid               (cfg_hair_mid),
+        .fx_a                   (cfg_fx_a),
+        .fx_b                   (cfg_fx_b),
+        .fx_c                   (cfg_fx_c),
 
         // Bullet Bucket Table & Tile Store Write Port
         .bucket_base            (cfg_bucket_base),
@@ -1303,6 +1308,9 @@ module ti60_top #(
         .hair_out               (cfg_hair_out),
         .hair_lft               (cfg_hair_lft),
         .hair_mid               (cfg_hair_mid),
+        .fx_a                   (cfg_fx_a),
+        .fx_b                   (cfg_fx_b),
+        .fx_c                   (cfg_fx_c),
 
         // HUD & FPS Telemetry
         .hud_enable             (~force_hud_disable),

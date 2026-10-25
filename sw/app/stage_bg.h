@@ -39,14 +39,14 @@ typedef struct {
  * (rtl/bitblt/bg_rle.hex) and how large that ROM is.  stage_bg_boot()
  * copies the whole ROM to MM_STAGE_RLE and points stage_rle[] at the
  * per-plate offsets inside that DDR copy. */
-#define SB_RLE_TOTAL 12313
-#define SB_RLE_ROM_BYTES 12313
-#define SB_RLE_OFF_STAGE_DREAM 8430
+#define SB_RLE_TOTAL 12581
+#define SB_RLE_ROM_BYTES 12581
+#define SB_RLE_OFF_STAGE_DREAM 8548
 #define SB_RLE_OFF_STAGE_ICE 0
-#define SB_RLE_OFF_STAGE_LAVA 4588
-#define SB_RLE_LEN_STAGE_ICE 4588
+#define SB_RLE_OFF_STAGE_LAVA 4706
+#define SB_RLE_LEN_STAGE_ICE 4706
 #define SB_RLE_LEN_STAGE_LAVA 3842
-#define SB_RLE_LEN_STAGE_DREAM 3883
+#define SB_RLE_LEN_STAGE_DREAM 4033
 
 extern const stage_asset_t stage_assets[SB_COUNT];
 extern const uint8_t *stage_rle[SB_COUNT];

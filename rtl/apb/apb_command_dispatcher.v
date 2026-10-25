@@ -98,6 +98,13 @@ module apb_command_dispatcher #(
     output reg  [71:0] hair_lft,
     output reg  [71:0] hair_mid,
 
+    // Procedural impact rings, bank 2 (0x200..0x22F).  Four slots, three words
+    // each; see rtl/display_engine/2_layer_generators/video_fx_ring.v for the
+    // field packing and sw/driver/gpu2d.h for the byte offsets.
+    output wire [127:0] fx_a,
+    output wire [127:0] fx_b,
+    output wire [127:0] fx_c,
+
     // Bullet Bucket Table & Tile Store Write Port
     output reg  [27:0] bucket_base,
     output reg  [14:0] btile_addr,
@@ -138,6 +145,17 @@ module apb_command_dispatcher #(
     output reg hb_we,
     output reg [7:0] hb_val
 );
+
+    // -------------------------------------------------------------------------
+    // Impact ring slots (bank 2).  One flat register per word, gathered into
+    // the three 128-bit buses the scanout takes: slot 0 in bits [31:0].
+    // -------------------------------------------------------------------------
+    reg [31:0] fx_a0, fx_a1, fx_a2, fx_a3;
+    reg [31:0] fx_b0, fx_b1, fx_b2, fx_b3;
+    reg [31:0] fx_c0, fx_c1, fx_c2, fx_c3;
+    assign fx_a = {fx_a3, fx_a2, fx_a1, fx_a0};
+    assign fx_b = {fx_b3, fx_b2, fx_b1, fx_b0};
+    assign fx_c = {fx_c3, fx_c2, fx_c1, fx_c0};
 
     assign laser_colx = {laser_colx_hi, laser_colx_lo};
     wire [16:0] bucket_drop_sum={1'b0,bucket_drop_count}+{5'd0,bucket_pool_drop};
@@ -286,6 +304,9 @@ module apb_command_dispatcher #(
             hair_out             <= 72'd0;
             hair_lft             <= 72'd0;
             hair_mid             <= 72'd0;
+            fx_a0 <= 32'd0; fx_a1 <= 32'd0; fx_a2 <= 32'd0; fx_a3 <= 32'd0;
+            fx_b0 <= 32'd0; fx_b1 <= 32'd0; fx_b2 <= 32'd0; fx_b3 <= 32'd0;
+            fx_c0 <= 32'd0; fx_c1 <= 32'd0; fx_c2 <= 32'd0; fx_c3 <= 32'd0;
             bucket_base          <= 28'd0;
             btile_addr           <= 15'd0;
             btile_data           <= 8'd0;
@@ -394,6 +415,26 @@ module apb_command_dispatcher #(
             if (apb_psel && apb_penable && !apb_pwrite && (apb_paddr == 16'h0058)) begin
                 sw0_latched <= 1'b0;
                 sw2_latched <= 1'b0;
+            end
+
+            // Bank 2: procedural impact ring slots (0x200..0x23F).  Four slots
+            // at a 16-byte stride: +0 word A, +4 word B, +8 word C.
+            if (apb_write && apb_paddr[15:8] == 8'd2) begin
+                case (apb_paddr[7:0])
+                    8'h00: fx_a0 <= apb_pwdata;
+                    8'h04: fx_b0 <= apb_pwdata;
+                    8'h08: fx_c0 <= apb_pwdata;
+                    8'h10: fx_a1 <= apb_pwdata;
+                    8'h14: fx_b1 <= apb_pwdata;
+                    8'h18: fx_c1 <= apb_pwdata;
+                    8'h20: fx_a2 <= apb_pwdata;
+                    8'h24: fx_b2 <= apb_pwdata;
+                    8'h28: fx_c2 <= apb_pwdata;
+                    8'h30: fx_a3 <= apb_pwdata;
+                    8'h34: fx_b3 <= apb_pwdata;
+                    8'h38: fx_c3 <= apb_pwdata;
+                    default: ;
+                endcase
             end
 
             if (apb_write && apb_paddr[15:8] == 8'd0) begin
@@ -543,6 +584,23 @@ module apb_command_dispatcher #(
                 8'hEC: apb_prdata = hair_mid[71:48];
                 8'hF0: apb_prdata = {4'd0, bucket_base};
                 8'hF4: apb_prdata = {17'd0, btile_ptr};
+                default: apb_prdata = 32'd0;
+            endcase
+        end
+        if (apb_psel && !apb_pwrite && apb_paddr[15:8] == 8'd2) begin
+            case (apb_paddr[7:0])
+                8'h00: apb_prdata = fx_a0;
+                8'h04: apb_prdata = fx_b0;
+                8'h08: apb_prdata = fx_c0;
+                8'h10: apb_prdata = fx_a1;
+                8'h14: apb_prdata = fx_b1;
+                8'h18: apb_prdata = fx_c1;
+                8'h20: apb_prdata = fx_a2;
+                8'h24: apb_prdata = fx_b2;
+                8'h28: apb_prdata = fx_c2;
+                8'h30: apb_prdata = fx_a3;
+                8'h34: apb_prdata = fx_b3;
+                8'h38: apb_prdata = fx_c3;
                 default: apb_prdata = 32'd0;
             endcase
         end

@@ -55,6 +55,14 @@ module video_pixel_compositor (
     input  wire [7:0]  b_beam_alpha,
     input  wire [23:0] b_rgb,
 
+    // Impact layer: procedural rings/discs from 2_layer_generators/video_fx_ring.
+    // Already on the stage-2 cycle, so it is blended in its own stage between
+    // the laser and the beam rather than widening stage 2's blend chain.
+    input  wire        f_visible,
+    input  wire        f_add,
+    input  wire [7:0]  f_alpha,
+    input  wire [23:0] f_rgb,
+
     // Layer 5: HUD OSD
     input  wire        hud_visible,
     input  wire [23:0] hud_rgb,
@@ -269,43 +277,118 @@ module video_pixel_compositor (
     end
 
     // -------------------------------------------------------------------------
-    // Stage 3: Player Beam & HUD over Stage 2 -> Final Output Registration
+    // Stage 2b: Impact rings over the laser stage
     // -------------------------------------------------------------------------
-    wire [8:0] b_sum_r = {1'b0, s2_r} + {1'b0, s2_b_rgb[23:16]};
-    wire [8:0] b_sum_g = {1'b0, s2_g} + {1'b0, s2_b_rgb[15:8]};
-    wire [8:0] b_sum_b = {1'b0, s2_b} + {1'b0, s2_b_rgb[7:0]};
+    // Same two ways of compositing the rest of the chain uses: a saturated add
+    // for light, an alpha blend for matter.  This is its own register stage so
+    // stage 2 and stage 3 keep the combinational depth (and the slack) they had.
+    wire [8:0] f_sum_r = {1'b0, s2_r} + {1'b0, f_rgb[23:16]};
+    wire [8:0] f_sum_g = {1'b0, s2_g} + {1'b0, f_rgb[15:8]};
+    wire [8:0] f_sum_b = {1'b0, s2_b} + {1'b0, f_rgb[7:0]};
+
+    wire [7:0] f_add_r = f_sum_r[8] ? 8'd255 : f_sum_r[7:0];
+    wire [7:0] f_add_g = f_sum_g[8] ? 8'd255 : f_sum_g[7:0];
+    wire [7:0] f_add_b = f_sum_b[8] ? 8'd255 : f_sum_b[7:0];
+
+    wire [7:0] f_mix_r = blend8(f_rgb[23:16], s2_r, f_alpha);
+    wire [7:0] f_mix_g = blend8(f_rgb[15:8],  s2_g, f_alpha);
+    wire [7:0] f_mix_b = blend8(f_rgb[7:0],   s2_b, f_alpha);
+
+    wire [7:0] s2b_comb_r = f_visible && f_add ? f_add_r
+                          : f_visible          ? f_mix_r : s2_r;
+    wire [7:0] s2b_comb_g = f_visible && f_add ? f_add_g
+                          : f_visible          ? f_mix_g : s2_g;
+    wire [7:0] s2b_comb_b = f_visible && f_add ? f_add_b
+                          : f_visible          ? f_mix_b : s2_b;
+
+    wire [7:0] s2b_comb_a = f_visible ? 8'hFF : s2_a;
+
+    reg [7:0]  s2b_r, s2b_g, s2b_b, s2b_a;
+    reg        s2b_hs, s2b_vs, s2b_de;
+
+    reg        s2b_b_visible, s2b_b_beam_vis, s2b_b_hair_vis, s2b_b_beam_add;
+    reg [7:0]  s2b_b_beam_alpha;
+    reg [23:0] s2b_b_rgb;
+
+    reg        s2b_hud_visible, s2b_hud_enable;
+    reg [23:0] s2b_hud_rgb;
+
+    always @(posedge pixel_clk or negedge pixel_rst_n) begin
+        if (!pixel_rst_n) begin
+            s2b_r            <= 8'd0;
+            s2b_g            <= 8'd0;
+            s2b_b            <= 8'd0;
+            s2b_a            <= 8'd0;
+            s2b_hs           <= 1'b0;
+            s2b_vs           <= 1'b0;
+            s2b_de           <= 1'b0;
+            s2b_b_visible    <= 1'b0;
+            s2b_b_beam_vis   <= 1'b0;
+            s2b_b_hair_vis   <= 1'b0;
+            s2b_b_beam_add   <= 1'b0;
+            s2b_b_beam_alpha <= 8'd0;
+            s2b_b_rgb        <= 24'd0;
+            s2b_hud_visible  <= 1'b0;
+            s2b_hud_enable   <= 1'b0;
+            s2b_hud_rgb      <= 24'd0;
+        end else begin
+            s2b_r            <= s2b_comb_r;
+            s2b_g            <= s2b_comb_g;
+            s2b_b            <= s2b_comb_b;
+            s2b_a            <= s2b_comb_a;
+            s2b_hs           <= s2_hs;
+            s2b_vs           <= s2_vs;
+            s2b_de           <= s2_de;
+            s2b_b_visible    <= s2_b_visible;
+            s2b_b_beam_vis   <= s2_b_beam_vis;
+            s2b_b_hair_vis   <= s2_b_hair_vis;
+            s2b_b_beam_add   <= s2_b_beam_add;
+            s2b_b_beam_alpha <= s2_b_beam_alpha;
+            s2b_b_rgb        <= s2_b_rgb;
+            s2b_hud_visible  <= s2_hud_visible;
+            s2b_hud_enable   <= s2_hud_enable;
+            s2b_hud_rgb      <= s2_hud_rgb;
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Stage 3: Player Beam & HUD over Stage 2b -> Final Output Registration
+    // -------------------------------------------------------------------------
+    wire [8:0] b_sum_r = {1'b0, s2b_r} + {1'b0, s2b_b_rgb[23:16]};
+    wire [8:0] b_sum_g = {1'b0, s2b_g} + {1'b0, s2b_b_rgb[15:8]};
+    wire [8:0] b_sum_b = {1'b0, s2b_b} + {1'b0, s2b_b_rgb[7:0]};
 
     wire [7:0] b_add_r = b_sum_r[8] ? 8'd255 : b_sum_r[7:0];
     wire [7:0] b_add_g = b_sum_g[8] ? 8'd255 : b_sum_g[7:0];
     wire [7:0] b_add_b = b_sum_b[8] ? 8'd255 : b_sum_b[7:0];
 
-    wire [7:0] b_mix_r = blend8(s2_b_rgb[23:16], s2_r, s2_b_beam_alpha);
-    wire [7:0] b_mix_g = blend8(s2_b_rgb[15:8],  s2_g, s2_b_beam_alpha);
-    wire [7:0] b_mix_b = blend8(s2_b_rgb[7:0],   s2_b, s2_b_beam_alpha);
+    wire [7:0] b_mix_r = blend8(s2b_b_rgb[23:16], s2b_r, s2b_b_beam_alpha);
+    wire [7:0] b_mix_g = blend8(s2b_b_rgb[15:8],  s2b_g, s2b_b_beam_alpha);
+    wire [7:0] b_mix_b = blend8(s2b_b_rgb[7:0],   s2b_b, s2b_b_beam_alpha);
 
-    wire b_add = s2_b_visible && s2_b_beam_vis &&  s2_b_beam_add;
-    wire b_mix = s2_b_visible && s2_b_beam_vis && !s2_b_beam_add;
+    wire b_add = s2b_b_visible && s2b_b_beam_vis &&  s2b_b_beam_add;
+    wire b_mix = s2b_b_visible && s2b_b_beam_vis && !s2b_b_beam_add;
 
     wire [7:0] b_out_r = b_add        ? b_add_r
                        : b_mix        ? b_mix_r
-                       : s2_b_visible ? s2_b_rgb[23:16]
-                       : s2_r;
+                       : s2b_b_visible ? s2b_b_rgb[23:16]
+                       : s2b_r;
     wire [7:0] b_out_g = b_add        ? b_add_g
                        : b_mix        ? b_mix_g
-                       : s2_b_visible ? s2_b_rgb[15:8]
-                       : s2_g;
+                       : s2b_b_visible ? s2b_b_rgb[15:8]
+                       : s2b_g;
     wire [7:0] b_out_b = b_add        ? b_add_b
                        : b_mix        ? b_mix_b
-                       : s2_b_visible ? s2_b_rgb[7:0]
-                       : s2_b;
+                       : s2b_b_visible ? s2b_b_rgb[7:0]
+                       : s2b_b;
 
-    wire [7:0] b_out_a = s2_b_visible ? 8'hFF : s2_a;
+    wire [7:0] b_out_a = s2b_b_visible ? 8'hFF : s2b_a;
 
-    wire hud_active = s2_hud_visible && s2_hud_enable;
+    wire hud_active = s2b_hud_visible && s2b_hud_enable;
 
-    wire [7:0] final_comb_r = hud_active ? s2_hud_rgb[23:16] : b_out_r;
-    wire [7:0] final_comb_g = hud_active ? s2_hud_rgb[15:8]  : b_out_g;
-    wire [7:0] final_comb_b = hud_active ? s2_hud_rgb[7:0]   : b_out_b;
+    wire [7:0] final_comb_r = hud_active ? s2b_hud_rgb[23:16] : b_out_r;
+    wire [7:0] final_comb_g = hud_active ? s2b_hud_rgb[15:8]  : b_out_g;
+    wire [7:0] final_comb_b = hud_active ? s2b_hud_rgb[7:0]   : b_out_b;
     wire [7:0] final_comb_a = hud_active ? 8'd0             : b_out_a;
 
     always @(posedge pixel_clk or negedge pixel_rst_n) begin
@@ -318,11 +401,11 @@ module video_pixel_compositor (
             comp_g  <= 8'd0;
             comp_b  <= 8'd0;
         end else begin
-            comp_hs <= s2_hs;
-            comp_vs <= s2_vs;
-            comp_de <= s2_de;
+            comp_hs <= s2b_hs;
+            comp_vs <= s2b_vs;
+            comp_de <= s2b_de;
 
-            if (s2_de) begin
+            if (s2b_de) begin
                 comp_a <= final_comb_a;
                 comp_r <= final_comb_r;
                 comp_g <= final_comb_g;

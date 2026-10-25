@@ -1336,6 +1336,51 @@ static void damage_restore(uint32_t fb, uint32_t plate)
     }
 }
 
+static void moon_halo_apply(uint32_t buf, int mx, int my, int r_core, int r_halo, uint32_t glow_rgb)
+{
+    volatile uint32_t *fb = (volatile uint32_t *)buf;
+    uint32_t gr = (glow_rgb >> 16) & 0xFFu;
+    uint32_t gg = (glow_rgb >> 8) & 0xFFu;
+    uint32_t gb = glow_rgb & 0xFFu;
+    int r2_core = r_core * r_core;
+    int r2_halo = r_halo * r_halo;
+    int dr = r_halo - r_core;
+
+    for (int dy = -r_halo; dy <= r_halo; dy++) {
+        int y = my + dy;
+        if (y < 0 || y >= (int)SCREEN_HEIGHT) continue;
+        volatile uint32_t *row = fb + (uint32_t)(y * (SCREEN_STRIDE / 4));
+        for (int dx = -r_halo; dx <= r_halo; dx++) {
+            int x = mx + dx;
+            if (x < 0 || x >= (int)SCREEN_WIDTH) continue;
+            int d2 = dx * dx + dy * dy;
+            if (d2 <= r2_core) {
+                /* Emissive pure white Moon Core with Alpha=0xFF for hardware Bloom */
+                row[x] = 0xFFFFFFFFu;
+            } else if (d2 <= r2_halo) {
+                /* Integer square root for distance */
+                int d = r_core;
+                while ((d + 1) * (d + 1) <= d2) d++;
+                int dist = d - r_core;
+                if (dist > dr) dist = dr;
+                /* inv: 256 at moon edge -> 0 at halo outer boundary */
+                uint32_t inv = (uint32_t)((dr - dist) * 256 / dr);
+                /* Quadratic smooth falloff matching the death aura aesthetic */
+                uint32_t a = (inv * inv) >> 8; /* 0..256 */
+                if (a > 200u) a = 200u;
+                uint32_t bg = row[x];
+                uint32_t br = (bg >> 16) & 0xFFu;
+                uint32_t bg_c = (bg >> 8) & 0xFFu;
+                uint32_t bb = bg & 0xFFu;
+                uint32_t nr = (gr * a + br * (256u - a)) >> 8;
+                uint32_t ng = (gg * a + bg_c * (256u - a)) >> 8;
+                uint32_t nb = (gb * a + bb * (256u - a)) >> 8;
+                row[x] = (nr << 16) | (ng << 8) | nb;
+            }
+        }
+    }
+}
+
 /* Decode the three stage plates and record the weather dots once at boot. */
 static void stage_bg_boot(void)
 {
@@ -1350,6 +1395,11 @@ static void stage_bg_boot(void)
 
     for (unsigned s = 0; s < SB_STAGE_COUNT; s++)
         stage_bg_decode(s, STAGE_BG_BUF(s));
+
+    /* Apply silky-smooth true-color radial alpha halos to Stage 1 & Stage 3 moons */
+    moon_halo_apply(STAGE_BG_BUF(SB_STAGE_ICE),   939,  87, 27, 86, 0x00D0EBFFu);
+    moon_halo_apply(STAGE_BG_BUF(SB_STAGE_DREAM), 918, 113, 28, 90, 0x00EFE0FFu);
+
     gpu2d_flush_dcache();
 }
 
@@ -1420,7 +1470,8 @@ static void stage_strip_render(uint32_t fb)
     } else if (laser_columns_live) {
         laser_ctrl = (1u << 18);            /* the beams always use band 0 */
     }
-    weather_ctrl_word = (1u << 15) | (stage << 13) | ((unsigned)scroll << 8) | slide | laser_ctrl;
+    uint32_t w_en = is_stress_stage ? 0u : (1u << 15);
+    weather_ctrl_word = w_en | (stage << 13) | ((unsigned)scroll << 8) | slide | laser_ctrl;
     GPU2D_REG_WEATHER = weather_ctrl_word;
     /* tlm[41] is LIVE again: game_render() writes the bucket_build() slice
      * into it at frame start, and diag_window() reports it as 's'.  tlm[40]
@@ -2007,6 +2058,7 @@ static uint8_t  boss_freeze_timer;   /* frames the field holds still before the 
 static uint8_t  boss_shake;          /* frames the scenery is still shaking */
 static uint8_t  boss_pending_opener; /* a hold that ends in the spell card */
 static uint8_t  boss_card_active;    /* Phase 2: card background preloaded and active across spell card */
+static uint8_t  boss_spell_vfx_timer;/* Climax shockwave ring + flash timer on spell card release */
 /* 6.1 aimed one column down the craft's lane.  8.2 throws three at once, so
  * the column, its timer and its phase became arrays; slot 0 is still 6.1's
  * cut, and cut_phase below mirrors it because the workbench grades that
@@ -2018,6 +2070,9 @@ static uint8_t  cut_phase;           /* 0 idle, 1 preview, 2 firing (slot 0) */
 static uint8_t  lockon_timer;        /* 6.2: frames left in the phase        */
 static uint8_t  lockon_arm;          /* 6.2: 0 idle, 1 laying out, 2 holding  */
 static uint8_t  dialog_was_active;  /* dialog stood last frame; restore backdrop when it ends */
+static uint8_t  pause_was_active;   /* pause card stood last frame; restore backdrop when unpausing */
+#define SET_CARD_W  512
+#define SET_CARD_H  392
 static int16_t  boss_hp_shown;      /* the bar's lagging "damage trail" */          /* frames the boss's laser columns stay up */
 static uint8_t  boss_opener_stage;   /* how many spell cards this boss has spent */
 static uint16_t dialog_timer, slow_timer, jam_timer;
@@ -2072,6 +2127,16 @@ static uint16_t color_matrix_flash_acc;   /* its level, in 8.8 fixed point    */
 #define HIT_RING_FRAMES  16
 static int16_t  hit_ring_x, hit_ring_y;
 static uint8_t  hit_ring_timer;
+
+/* Hitstop: the number of rendered frames the world is held still for after a
+ * heavy hit.  Everything still draws - the flash, the ring and the core are
+ * what the player is looking at - but no logic tick runs, so the picture is
+ * frozen for two or three frames exactly where the impact lands.  This is the
+ * cheapest "impact" there is: no pixels, no bandwidth, two frames of wall
+ * clock, and it is what makes a ring feel like it has weight. */
+#define HITSTOP_HIT      2
+#define HITSTOP_KILL     3
+static uint8_t  hitstop;
 
 
 /* ---- runtime options (settings / pause menu) ------------------------ */
@@ -3461,6 +3526,7 @@ static void take_hit(void)
     hit_ring_x = player_x;
     hit_ring_y = player_y;
     hit_ring_timer = HIT_RING_FRAMES;
+    hitstop = HITSTOP_HIT;
 
     /* Clear the field.  The pool is DDR so the flags byte is the only write,
      * and one mote per shot is what sells "the curtain was blown apart" -
@@ -3928,6 +3994,7 @@ static void boss_fire(void)
 static void boss_clear_lasers(void)
 {
     boss_laser = 0;
+    boss_spell_vfx_timer = 0;
     for (int k = 0; k < CUT_SLOTS; k++) {
         beam_phase[k] = 0;
         beam_timer[k] = 0;
@@ -3946,6 +4013,11 @@ static void boss_opener(int wipe)
     audio_event(AUDIO_EVENT_BOSS);
     int cx = boss_x + 32;
     int cy = boss_y + 28;
+
+    /* Climax Stage 2 & 3: 3-frame dimensional hitstop + 44-frame expanding
+     * hardware shockwave ring (video_fx_ring.v) & overexposure flash. */
+    hitstop = HITSTOP_KILL;
+    boss_spell_vfx_timer = 44;
 
     /* Three rings: 16 aimed outward, 16 faster, and a middle ring
      * shaped into 8 high-tier additive Big Orbs (OP_ADD) + 8 high-speed
@@ -4016,8 +4088,21 @@ static void boss_update(void)
         break;
 
     case BOSS_FREEZE:
-        if (boss_freeze_timer) boss_freeze_timer--;
-        else {
+        if (boss_freeze_timer) {
+            boss_freeze_timer--;
+            /* Climax Stage 1: Inward-converging energy particles during spell card charge */
+            if (boss_pending_opener && (boss_freeze_timer & 1u) == 0u) {
+                int a = (int)((boss_freeze_timer * 3u) & 15u);
+                int b = (a + 8) & 15;
+                int cx = boss_x + 32, cy = boss_y + 28;
+                spawn_particle(cx + (dir16_x[a] * 4), cy + (dir16_y[a] * 4),
+                               -(dir16_x[a] >> 2), -(dir16_y[a] >> 2),
+                               PARTICLE_CRIT, 14);
+                spawn_particle(cx + (dir16_x[b] * 4), cy + (dir16_y[b] * 4),
+                               -(dir16_x[b] >> 2), -(dir16_y[b] >> 2),
+                               PARTICLE_CYAN, 14);
+            }
+        } else {
             /* The hold releases into an ordinary fight - and, when the hold was
              * the card's own entrance, into the card.  The card is NOT an
              * opening move: it is spent at the two thirds and one third marks
@@ -4037,6 +4122,7 @@ static void boss_update(void)
         break;
 
     case BOSS_FIGHT:
+        if (boss_spell_vfx_timer) boss_spell_vfx_timer--;
         if (boss_laser) {
             boss_laser--;
             if (!boss_laser) boss_card_active = 0;
@@ -4177,6 +4263,7 @@ static void boss_update(void)
             eb_free_hint = 0;
             active_ebullets_count = 0;
                 visual_burst(boss_x + 32, boss_y + 32);
+            hitstop = HITSTOP_KILL;
             for (int k = 0; k < 12; k++) {
                 int ox = boss_x + (int)(xorshift32() % 64u);
                 int oy = boss_y + (int)(xorshift32() % 64u);
@@ -5315,87 +5402,106 @@ static void draw_boss_art(uint32_t fb, int x, int y)
 /* Paint one age of the burst into a frame of its own, at (dst, stride).  The
  * five layers and their arithmetic are the originals; only the origin moved,
  * from the live playfield to the frame's own top-left corner. */
-static void burst_paint(uint32_t dst, uint32_t stride, int age)
+static void draw_mc_line(volatile uint32_t *pix, int x0, int y0, int x1, int y1, uint32_t col)
 {
-    int ring1 = 4 + age * 2;            /* 4 .. 50 pixels out  */
-    int ring2 = 2 + age * 2;            /* 2 .. 48 pixels out  */
-    int ember = 3 + age * 2;            /* 3 .. 49 pixels out  */
-    uint32_t c1 = MM_EMISSIVE_TAG | ((age < 6)  ? 0x00FFFFFFu :
-                  (age < 12) ? 0x00FFE8A0u :
-                  (age < 18) ? 0x00FF9038u : 0x00C04828u);
-    uint32_t c2 = MM_EMISSIVE_TAG | ((age < 8)  ? 0x00A8E8FFu :
-                  (age < 16) ? 0x0060B0FFu : 0x003068C0u);
-    uint32_t ce = MM_EMISSIVE_TAG | ((age < 10) ? 0x00FFF4C0u : 0x00FF8040u);
-
-    /* Core flash first, so the explosion frames sit on top of it and the white
-     * only shows through their transparent pixels - a backlight rather than a
-     * white square stamped over the artwork.  It shrinks as it fades. */
-    if (age < 10) {
-        int size = 8 - age / 2;
-        int origin = BURST_CENTRE - size / 2;
-        r_fill(dst + (uint32_t)((origin + size / 4) * (int)stride + origin * 4),
-               (uint32_t)size, (uint32_t)(size / 2), MM_EMISSIVE_TAG | 0x00FFE8A0u, stride);
-        r_fill(dst + (uint32_t)(origin * (int)stride + (origin + size / 4) * 4),
-               (uint32_t)(size / 2), (uint32_t)size, MM_EMISSIVE_TAG | 0x00FFFFFFu, stride);
-    }
-
-    /* The licensed explosion frame.  draw_art() clips against the SCREEN, so
-     * it cannot be used here - this frame is plain DDR - and the asset's own
-     * row pitch is w*4, which is what draw_art() hands the engine too. */
-    {
-        const visual_asset_t *a = &visual_assets[ART_BURST_0 + age / 6u];
-        unsigned w = a->w * a->scale, h = a->h * a->scale;
-        r_blit(dst + (uint32_t)((BURST_CENTRE - 16) * (int)stride) +
-                   (uint32_t)((BURST_CENTRE - 16) * 4),
-               a->dst, w, h, w * 4u, stride);
-    }
-
-    for (int k = 0; k < 16; k++) {
-        int ax = BURST_CENTRE + ((dir16_x[k] * ring1) >> 4);
-        int ay = BURST_CENTRE + ((dir16_y[k] * ring1) >> 4);
-        int bx = BURST_CENTRE + ((dir16_x[(k + 4) & 15] * ring2) >> 4);
-        int by = BURST_CENTRE + ((dir16_y[(k + 4) & 15] * ring2) >> 4);
-        int ex = BURST_CENTRE + ((dir16_x[k] * ember) >> 4);
-        int ey = BURST_CENTRE + ((dir16_y[k] * ember) >> 4);
-
-        /* The lobes are 4x4, not 2x2: at 2 pixels the sixteen of them read as
-         * scattered dots rather than as a wavefront, which is why the first
-         * version of this effect still looked like confetti. */
-        r_fill(dst + (uint32_t)(ay * (int)stride) + (uint32_t)(ax * 4),
-               4, 4, c1, stride);
-        r_fill(dst + (uint32_t)(by * (int)stride) + (uint32_t)(bx * 4),
-               2, 2, c2, stride);
-        r_fill(dst + (uint32_t)(ey * (int)stride) + (uint32_t)(ex * 4),
-               3, 3, ce, stride);
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    int ax = dx < 0 ? -dx : dx;
+    int ay = dy < 0 ? -dy : dy;
+    int steps = ax > ay ? ax : ay;
+    if (steps == 0) steps = 1;
+    for (int s = 0; s <= steps; s++) {
+        int x = x0 + (dx * s) / steps;
+        int y = y0 + (dy * s) / steps;
+        if (x >= 0 && x < (int)MM_BURST_FRAME_W && y >= 0 && y < (int)MM_BURST_FRAME_W)
+            pix[y * MM_BURST_FRAME_W + x] = col;
     }
 }
 
 static void burst_frames_build(void)
 {
+    /* Touhou-style 112x112 Rotating Hexagram Magic Summoning Array (32 frames) */
+    static const int8_t cos32[32] = {
+        127, 125, 117, 106,  90,  71,  49,  25,
+          0, -25, -49, -71, -90,-106,-117,-125,
+       -127,-125,-117,-106, -90, -71, -49, -25,
+          0,  25,  49,  71,  90, 106, 117, 125
+    };
+    static const int8_t sin32[32] = {
+          0,  25,  49,  71,  90, 106, 117, 125,
+        127, 125, 117, 106,  90,  71,  49,  25,
+          0, -25, -49, -71, -90,-106,-117,-125,
+       -127,-125,-117,-106, -90, -71, -49, -25
+    };
+
     for (unsigned a = 0; a < BURST_FRAMES; a++) {
-        uint32_t dst = MM_BURST_FRAME + a * MM_BURST_FRAME_BYTES;
-        /* Key the frame BEFORE painting it: a colour-keyed copy does not write
-         * the keyed pixels, so every pixel burst_paint() never reaches
-         * would otherwise keep whatever the DDR powered up with.  On
-         * the workbench that residue is zero - an opaque black square
-         * the dark backdrop hides, which is why every assertion stayed
-         * green - but on the board it is real noise, and burst_render()
-         * copies the lot to the screen as a 112x112 block of garbage.
-         * Keyed pixels are skipped by the engine, so the playfield
-         * keeps its background instead. */
-        r_fill(dst, MM_BURST_FRAME_W, MM_BURST_FRAME_W, MAGENTA_KEY,
-               MM_BURST_FRAME_STRIDE);
-        burst_paint(dst, MM_BURST_FRAME_STRIDE, (int)a);
-        r_sync();
-        gpu2d_flush_dcache();
-        /* Straight alpha: retain the light's RGB, fade coverage only. Keyed
-         * holes remain holes, including the unpainted frame border. */
-        uint32_t *pixels = (uint32_t *)dst;
-        uint32_t opacity = (a < 16u ? 255u : 255u - (a - 16u) * 18u) << 24;
+        volatile uint32_t *pix = (volatile uint32_t *)(MM_BURST_FRAME + a * MM_BURST_FRAME_BYTES);
+        /* Clear frame to 0 (for additive OP_ADD blending) */
         for (unsigned p = 0; p < MM_BURST_FRAME_W * MM_BURST_FRAME_W; ++p)
-            if (pixels[p] != MAGENTA_KEY)
-                pixels[p] = (pixels[p] & 0x00FFFFFFu) | opacity;
-        gpu2d_flush_dcache();
+            pix[p] = 0u;
+
+        int cx = (int)(MM_BURST_FRAME_W / 2);
+        int cy = cx;
+
+        /* 1. Outer runic ring (r=45..48) and inner seal ring (r=33..35) */
+        for (int y = 0; y < (int)MM_BURST_FRAME_W; y++) {
+            int dy = y - cy;
+            for (int x = 0; x < (int)MM_BURST_FRAME_W; x++) {
+                int dx = x - cx;
+                int d2 = dx * dx + dy * dy;
+                if (d2 >= 45 * 45 && d2 <= 48 * 48) {
+                    pix[y * MM_BURST_FRAME_W + x] = 0x0030C8FFu; /* luminous cyan ring */
+                } else if (d2 >= 33 * 33 && d2 <= 35 * 35) {
+                    pix[y * MM_BURST_FRAME_W + x] = 0x0020A0E0u; /* inner boundary */
+                } else if (d2 <= 5 * 5) {
+                    pix[y * MM_BURST_FRAME_W + x] = 0xFFFFFFFFu; /* emissive radiant core */
+                }
+            }
+        }
+
+        /* 2. Compute 6 rotating vertices of the Hexagram */
+        int vx[6], vy[6];
+        for (int k = 0; k < 6; k++) {
+            int angle = (int)((a + (unsigned)k * 32u / 6u) & 31u);
+            vx[k] = cx + ((int)cos32[angle] * 39) / 128;
+            vy[k] = cy + ((int)sin32[angle] * 39) / 128;
+        }
+
+        /* 3. Draw the two interlocking equilateral triangles of the Hexagram */
+        uint32_t hex_col = (a & 1u) ? 0x00FF80D0u : 0x00FF60B0u; /* mystical radiant magenta */
+        draw_mc_line(pix, vx[0], vy[0], vx[2], vy[2], hex_col);
+        draw_mc_line(pix, vx[2], vy[2], vx[4], vy[4], hex_col);
+        draw_mc_line(pix, vx[4], vy[4], vx[0], vy[0], hex_col);
+
+        draw_mc_line(pix, vx[1], vy[1], vx[3], vy[3], hex_col);
+        draw_mc_line(pix, vx[3], vy[3], vx[5], vy[5], hex_col);
+        draw_mc_line(pix, vx[5], vy[5], vx[1], vy[1], hex_col);
+
+        /* 4. Draw 12 outer runic ticks on the outer boundary */
+        for (int k = 0; k < 12; k++) {
+            int angle = (int)((a / 2u + (unsigned)k * 32u / 12u) & 31u);
+            int x0 = cx + ((int)cos32[angle] * 45) / 128;
+            int y0 = cy + ((int)sin32[angle] * 45) / 128;
+            int x1 = cx + ((int)cos32[angle] * 51) / 128;
+            int y1 = cy + ((int)sin32[angle] * 51) / 128;
+            draw_mc_line(pix, x0, y0, x1, y1, 0x0060E0FFu);
+        }
+
+        /* 5. Draw glowing diamond energy nodes at the 6 star vertices */
+        for (int k = 0; k < 6; k++) {
+            for (int dy = -2; dy <= 2; dy++) {
+                int ady = dy < 0 ? -dy : dy;
+                for (int dx = -2; dx <= 2; dx++) {
+                    int adx = dx < 0 ? -dx : dx;
+                    if (adx + ady <= 2) {
+                        int nx = vx[k] + dx;
+                        int ny = vy[k] + dy;
+                        if (nx >= 0 && nx < (int)MM_BURST_FRAME_W && ny >= 0 && ny < (int)MM_BURST_FRAME_W)
+                            pix[ny * MM_BURST_FRAME_W + nx] = 0x00FFE860u; /* golden spark */
+                    }
+                }
+            }
+        }
     }
     gpu2d_flush_dcache();
 }
@@ -5413,7 +5519,87 @@ static void burst_frames_build(void)
  * bombbounds scenario); clipping the one sprite is both cheaper and the
  * reason that class of bug cannot come back.
  */
-static void burst_render(uint32_t fb, int x, int y, int age)
+/* ---- procedural impact rings on the scanout -----------------------------
+ * Both rings used to be drawn into the framebuffer: one 112x112 pre-baked frame
+ * per burst through the BitBlt engine (src read + dst read + dst write, plus a
+ * damage_restore of the same rectangle on the next frame) and sixteen 2x2 FILL
+ * commands for the player-hit ring.  The scanout can compute the same circle
+ * from the pixel position, so what the CPU owes the hardware is four 96-bit
+ * descriptors: twelve APB writes a frame, no DDR traffic, no engine command.
+ *
+ * One hardware slot per impact.  Age 0..3 is a hot additive disc - the core of
+ * the hit, drawn by the saturated-add path so it really does clip to white -
+ * and 4..23 is an expanding blended annulus that cools from white to ember.
+ * Slot 0 is the player-hit ring, which the hardware's priority pick always
+ * places over the boss-spark bursts behind it.
+ *
+ * A ring's colour has to carry the fade on the add path (that path has no
+ * alpha), which is why the core fades through a small table instead of
+ * multiplying by an alpha the compositor would ignore.
+ */
+#define FX_RINGS 1
+#define FX_RING_SLOTS 4
+
+static void fx_rings_upload(void)
+{
+    uint32_t a[FX_RING_SLOTS], b[FX_RING_SLOTS], c[FX_RING_SLOTS];
+    static const uint32_t core_fade[4] = {
+        0x00FFFFFFu, 0x00C8C8C8u, 0x00808080u, 0x00404040u
+    };
+    int slot = 0;
+
+    for (int i = 0; i < FX_RING_SLOTS; i++) { a[i] = 0u; b[i] = 0u; c[i] = 0u; }
+
+    if (hit_ring_timer) {
+        int age = HIT_RING_FRAMES - (int)hit_ring_timer;
+        int r = 14 + age * 10;
+        int alpha = 210 - age * 9;
+        if (alpha < 40) alpha = 40;
+        a[slot] = (1u << 31) | (1u << 30) | ((uint32_t)r << 21) |
+                  ((uint32_t)(hit_ring_y & 1023) << 11) |
+                  (uint32_t)(hit_ring_x & 2047);
+        b[slot] = ((uint32_t)(r > 7 ? r - 7 : 0) << 16) | (uint32_t)(alpha & 0xFF);
+        c[slot] = (hit_ring_timer > HIT_RING_FRAMES / 2) ? 0x00FFFFFFu : 0x00FFC060u;
+        slot++;
+    }
+    for (int i = 0; i < 16 && slot < FX_RING_SLOTS; i++) {
+        const visual_fx_t *f = &visual_fx[i];
+        int age, r, ri, alpha;
+        uint32_t rgb;
+        if (!f->active) continue;
+        age = (int)f->age;
+        if (age > 23) continue;
+        if (age < 4) {
+            r = 8 + age * 6;
+            ri = 0;
+            alpha = 0;
+            rgb = core_fade[age];
+        } else {
+            r = 26 + (age - 4) * 6;
+            ri = r - 7;
+            alpha = 170 - (age - 4) * 8;
+            if (alpha < 30) alpha = 30;
+            rgb = (age < 10) ? 0x00FFE8B0u : 0x00FF8040u;
+        }
+        a[slot] = (1u << 31) | (((uint32_t)(age < 4)) << 30) |
+                  ((uint32_t)(r > 511 ? 511 : r) << 21) |
+                  ((uint32_t)(f->y & 1023) << 11) |
+                  (uint32_t)(f->x & 2047);
+        b[slot] = ((uint32_t)(ri > 511 ? 511 : ri) << 16) | (uint32_t)(alpha & 0xFF);
+        c[slot] = rgb & 0xFFFFFFu;
+        slot++;
+    }
+
+    /* Unconditional: it is twelve APB writes (about 48 core cycles) and it is
+     * also what clears the slots of impacts that just expired. */
+    for (int i = 0; i < FX_RING_SLOTS; i++) {
+        GPU2D_REG_FX_RING(i, 0) = a[i];
+        GPU2D_REG_FX_RING(i, 1) = b[i];
+        GPU2D_REG_FX_RING(i, 2) = c[i];
+    }
+}
+
+static __attribute__((unused)) void burst_render(uint32_t fb, int x, int y, int age)
 {
     uint32_t src = MM_BURST_FRAME + (uint32_t)age * MM_BURST_FRAME_BYTES;
     int radius = 8 + age * 2;
@@ -6553,6 +6739,17 @@ static void game_render(uint32_t fb)
             damage_mark_index(FB_LEFT_BACK  + dbase, DIALOG_W, DIALOG_H, SCREEN_STRIDE, 1u);
             damage_track = 0;
         }
+        if (!paused && pause_was_active) {
+            pause_was_active = 0u;
+            int pw = SET_CARD_W, ph = SET_CARD_H;
+            int px = (SCREEN_WIDTH - pw) / 2;
+            int py = (SCREEN_HEIGHT - ph) / 2;
+            uint32_t pbase = (uint32_t)py * SCREEN_STRIDE + (uint32_t)(px * 4);
+            damage_track = 1;
+            damage_mark_index(FB_LEFT_FRONT + pbase, (uint32_t)pw, (uint32_t)ph, SCREEN_STRIDE, 0u);
+            damage_mark_index(FB_LEFT_BACK  + pbase, (uint32_t)pw, (uint32_t)ph, SCREEN_STRIDE, 1u);
+            damage_track = 0;
+        }
         damage_full = damage_plate[buffer] != plate;
         if (damage_full) {
             r_blit(fb, plate, SCREEN_WIDTH, SCREEN_HEIGHT,
@@ -6585,7 +6782,7 @@ static void game_render(uint32_t fb)
          * That is once per stage instead of once per frame. */
         if (border_plate[buffer] != plate) {
             border_plate[buffer] = plate;
-            uint32_t bcol = is_stress_stage ? 0x00E04020u :
+            uint32_t bcol = is_stress_stage ? 0x004090FFu :
                             (wave == 0 ? 0x003070D0u :
                              wave == 1 ? 0x00D05030u : 0x009060C0u);
             r_fill(fb + (uint32_t)((GAME_LEFT - 4) * 4), 4, SCREEN_HEIGHT,
@@ -6604,34 +6801,28 @@ static void game_render(uint32_t fb)
     stage_strip_render(fb);
     damage_track = 1;
 
-    /* Stage 3's moon gets a bloom, blended over the live backdrop with the
-     * same hardware-alpha path the craft's aura uses.  It is one 64x64 blend
-     * a frame and the cheapest thing that makes the dream stage look less
-     * flat than the other two - the moon is at (430, 88) inside the 640x600
-     * plate, radius 32, so the aura covers it exactly. */
-    if (stage_bg_active == SB_STAGE_DREAM && !boss_shake && !boss_card_active) {
-        /* The moon is painted into the stage-3 plate itself, at the screen
-         * position the generator puts it: sh(430), sv(88) = (918, 113).  The
-         * bloom follows the plate, not the playfield. */
-        int mx = 918 - 32;
-        int my = 113 - 32;
-        /* 70, not 150: the aura is brightest at its own centre, which is
-         * exactly where the moon disc sits.  A strong blend swallowed the disc
-         * and left a plain blue circle; repainting the disc on top of it was
-         * worse still, because the 48x48 source patch carries a slab of sky
-         * with it and left a visible square.  At 70 the disc reads through the
-         * haze and the stage opens on a softly glowing moon. */
-        r_alpha_begin(70);
-        r_alpha(fb + (uint32_t)(my * SCREEN_STRIDE) + (uint32_t)(mx * 4),
-                MM_AURA_SPRITE, MM_AURA_SPRITE_W, MM_AURA_SPRITE_H,
-                MM_AURA_SPRITE_STRIDE, SCREEN_STRIDE, 70);
-        r_alpha_end();
-    }
-
     /* boss */
     if (boss_state == BOSS_ENTER || boss_state == BOSS_FIGHT ||
-        boss_state == BOSS_FREEZE)
+        boss_state == BOSS_FREEZE) {
+        /* Boss Magic Summoning Array (Touhou-style Hexagram Mystic Circle) */
+        if (boss_state == BOSS_FREEZE || boss_spell_vfx_timer > 0) {
+            int bcx = boss_x + 32;
+            int bcy = boss_y + 28;
+            int frame = (int)((frame_tick >> 1) & 31u);
+            uint32_t src = MM_BURST_FRAME + (uint32_t)frame * MM_BURST_FRAME_BYTES;
+            int bx = bcx - (int)(MM_BURST_FRAME_W / 2);
+            int by = bcy - (int)(MM_BURST_FRAME_W / 2);
+            if (bx >= GAME_LEFT && bx + (int)MM_BURST_FRAME_W <= GAME_RIGHT &&
+                by >= 0 && by + (int)MM_BURST_FRAME_W <= (int)SCREEN_HEIGHT) {
+                r_add_begin();
+                r_add(fb + (uint32_t)(by * SCREEN_STRIDE) + (uint32_t)(bx * 4),
+                      src, MM_BURST_FRAME_W, MM_BURST_FRAME_W,
+                      MM_BURST_FRAME_STRIDE, SCREEN_STRIDE);
+                r_add_end();
+            }
+        }
         draw_boss_art(fb, boss_x, boss_y);
+    }
 
     /* minions */
     for (int i = 0; i < MAX_ENEMIES; i++) {
@@ -6770,9 +6961,16 @@ static void game_render(uint32_t fb)
                               BOSS_LASER_X(2), BOSS_LASER_X(3));
     }
 
+#if FX_RINGS
+    /* Rings and cores are a scanout layer now: twelve APB writes a frame and
+     * the framebuffer is not touched at all - no engine command, no DDR
+     * traffic, and nothing for the next frame's damage_restore to repair. */
+    fx_rings_upload();
+#else
     for (int i = 0; i < 16; i++)
         if (visual_fx[i].active)
             burst_render(fb, visual_fx[i].x, visual_fx[i].y, visual_fx[i].age);
+#endif
 
     /* Phase 2 Task 08: Combat FX particle rendering (OP_ADD) */
     particles_render(fb);
@@ -6924,6 +7122,11 @@ static void game_render(uint32_t fb)
      * is also what makes the expansion read as a wave rather than as a circle
      * that simply got bigger. */
     if (hit_ring_timer) {
+#if FX_RINGS
+        /* Drawn by video_fx_ring from fx_rings_upload(): slot 0 of the scanout
+         * layer.  Sixteen 2x2 FILLs - sixteen engine commands and sixteen
+         * damage rectangles - became one descriptor. */
+#else
         int age = HIT_RING_FRAMES - (int)hit_ring_timer;
         int r = 14 + age * 10;
         uint32_t col = (hit_ring_timer > HIT_RING_FRAMES / 2) ? 0x00FFFFFFu
@@ -6936,6 +7139,7 @@ static void game_render(uint32_t fb)
                 r_fill(fb + (uint32_t)(py * SCREEN_STRIDE) +
                        (uint32_t)(px * 4), 2, 2, col, SCREEN_STRIDE);
         }
+#endif
     }
 
     /* ---- HUD gutters ----------------------------------------------------
@@ -7266,12 +7470,6 @@ static void game_render(uint32_t fb)
 /* ===================================================================== */
 #define SET_ITEMS 7
 
-/* The card's size lives in one place because two things depend on it: the
- * renderer that paints it and the weather occlusion box that has to match it to
- * the pixel. */
-#define SET_CARD_W  512
-#define SET_CARD_H  392
-
 /* 0 = Soft Halo (tight round kernel), 1 = Wide Halo (the same shape one size
  * up).  Both are channel-agnostic; the power-on default is the tight one,
  * because the stage this build is judged on carries 192 shots at once and the
@@ -7305,17 +7503,25 @@ static void pause_card(uint32_t fb, int px, int py, int pw, int ph)
 {
     uint32_t base = fb + (uint32_t)(py * SCREEN_STRIDE) + (uint32_t)(px * 4);
 
-    r_fill(base, (uint32_t)pw, (uint32_t)ph, 0x00333D4Eu, SCREEN_STRIDE);
-    r_fill(base, (uint32_t)pw, 2, 0x006A7A90u, SCREEN_STRIDE);
-    r_fill(base, 2, (uint32_t)ph, 0x006A7A90u, SCREEN_STRIDE);
+    /* Solid high-contrast deep obsidian card with layered cyan/silver borders.
+     * Uses zero DDR read bandwidth to prevent display DMA FIFO underflow. */
+    r_fill(base, (uint32_t)pw, (uint32_t)ph, 0x000E1422u, SCREEN_STRIDE);
+    r_fill(base + (uint32_t)(4 * SCREEN_STRIDE) + 16, (uint32_t)(pw - 8), (uint32_t)(ph - 8),
+           0x00131A28u, SCREEN_STRIDE);
+    r_fill(base, (uint32_t)pw, 2, 0x0068A0DCu, SCREEN_STRIDE);
+    r_fill(base, 2, (uint32_t)ph, 0x0068A0DCu, SCREEN_STRIDE);
     r_fill(base + (uint32_t)((ph - 2) * SCREEN_STRIDE), (uint32_t)pw, 2,
-           0x0018202Cu, SCREEN_STRIDE);
-    r_fill(base + (uint32_t)((pw - 2) * 4), 2, (uint32_t)ph, 0x0018202Cu,
+           0x00060910u, SCREEN_STRIDE);
+    r_fill(base + (uint32_t)((pw - 2) * 4), 2, (uint32_t)ph, 0x00060910u,
            SCREEN_STRIDE);
 }
 
 static void settings_render(uint32_t fb)
 {
+    pause_was_active = 1u;
+    uint8_t prev_dt = damage_track;
+    damage_track = 0u;
+
     /* Centred on the screen that exists.  256/124 is the centre of a 1024x600
      * display, so on 1366x768 the card sat high and to the left. */
     int pw = SET_CARD_W, ph = SET_CARD_H;
@@ -7368,6 +7574,7 @@ static void settings_render(uint32_t fb)
                       game_audio_volume ? 0x0060FF60u : 0x00A0A0A0u);
         }
     }
+    damage_track = prev_dt;
 }
 
 #define ACT_STAY         0
@@ -7527,6 +7734,7 @@ static void game_init(void)
     hud_sig[HUD_SIG_STRESS] = 0u;
     bt_drop_peak = 0u;
     fx_cursor = 0; player_pose = 0;
+    hitstop = 0; hit_ring_timer = 0;
     for (int i = 0; i < 16; i++) visual_fx[i].active = 0;
     for (int i = 0; i < MAX_PARTICLES; i++) game_particles[i].life = 0;
     particle_cursor = 0;
@@ -7955,6 +8163,9 @@ static void update_screen_effects(void)
             color_matrix_flash_timer = 0;
             gpu2d_set_color_matrix(COLOR_MATRIX_BYPASS, 0);
         }
+    } else if (boss_spell_vfx_timer > 32u) {
+        /* Climax Stage 2: White-hot overexposure flash at the moment of Spell Card release */
+        gpu2d_set_color_matrix(COLOR_MATRIX_FLASH, (uint8_t)((boss_spell_vfx_timer - 32u) * 16u));
     } else if (boss_state == BOSS_DYING && boss_dead_timer > 45) {
         gpu2d_set_color_matrix(COLOR_MATRIX_FLASH, (uint8_t)((boss_dead_timer - 45u) * 16u));
     } else {
@@ -8394,14 +8605,12 @@ int main(void)
             /* The wait for the scanout to release the back buffer is dead
              * time as far as the pad is concerned - and it is most of the
              * pass.  Sample all the way through it. */
-            if (menu_last_sel == menu_sel) continue;
             if (!frame_wait_free(right_back)) continue;
             draw_menu(right_back, menu_sel);
             gpu2d_wait_idle();
             if (gpu2d_stalled) continue;
             gpu2d_flush_dcache();
             GPU2D_REG_FRAME_NEXT = right_back;
-            menu_last_sel = menu_sel;
             right_back ^= 0x00600000u;
             continue;
         }
@@ -8582,6 +8791,15 @@ int main(void)
                  * paying it back by running even slower. */
                 unsigned sim_steps = 0u;
                 unsigned max_steps = is_stress_stage ? 1u : LOGIC_MAX_STEPS;
+                /* Hitstop: hold the world for HITSTOP_* rendered frames.  The
+                 * owed time is dropped, not repaid - repaying it would run the
+                 * freeze straight back at double speed on the frame after,
+                 * which is a stutter, not an impact. */
+                if (hitstop) {
+                    hitstop = (uint8_t)(hitstop - 1u);
+                    max_steps = 0u;
+                    sim_acc = 0u;
+                }
                 while (sim_acc >= LOGIC_STEP_CYCLES &&
                        sim_steps < max_steps) {
                     game_update(&pad);

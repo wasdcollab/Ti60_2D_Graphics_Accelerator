@@ -154,7 +154,7 @@ static int stress_frame(uint32_t fb)
     /* One full-screen opaque background and one cached opaque HUD per frame.
      * Source alpha/key then stay fixed for every workload sprite. */
     gpu2d_set_colorkey(0, STRESS_KEY);
-    gpu2d_copy(fb,MM_VISUAL_BACKGROUND,SCREEN_WIDTH,SCREEN_HEIGHT,SCREEN_STRIDE,SCREEN_STRIDE);
+    gpu2d_copy(fb, MM_STRESS_BG, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_STRIDE, SCREEN_STRIDE);
     if (!stress_finish()) return 0;
     gpu2d_copy(fb,MM_STRESS_PANEL,1024,128,4096,SCREEN_STRIDE);
     if (!stress_finish()) return 0;

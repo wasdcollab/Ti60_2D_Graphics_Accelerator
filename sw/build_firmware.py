@@ -35,7 +35,14 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-DEFAULT_GCC_DIR = os.environ.get("RISCV_GCC_DIR", r"D:\FPGAqiansai\toolchain")
+_CANDIDATE_GCC_DIRS = (
+    r"D:\toolchain\riscv-gcc",
+    r"D:\FPGAqiansai\toolchain",
+)
+DEFAULT_GCC_DIR = os.environ.get(
+    "RISCV_GCC_DIR",
+    next((d for d in _CANDIDATE_GCC_DIRS if os.path.isdir(d)), _CANDIDATE_GCC_DIRS[0]),
+)
 
 IMAGE_LIMIT = 0xF900FD00
 STACK_TOP = 0xF9010000

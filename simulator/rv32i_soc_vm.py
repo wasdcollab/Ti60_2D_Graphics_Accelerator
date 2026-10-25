@@ -507,6 +507,10 @@ class SapphireSoCVM:
 
         if addr == APB_BASE + 0x13C:
             return 255
+        if APB_BASE + 0x200 <= addr < APB_BASE + 0x240:
+            # Procedural impact ring slots (APB bank 2): read back what was
+            # written, so a test can check the descriptor the firmware built.
+            return self.params.get(addr - APB_BASE, 0)
         if APB_BASE <= addr < APB_BASE + 0x200:
             return self.params.get(addr - APB_BASE, 0)
 
@@ -563,6 +567,11 @@ class SapphireSoCVM:
             return
         if addr == APB_BASE + 0x124:
             self.params[0x124] = val
+            return
+        if APB_BASE + 0x200 <= addr < APB_BASE + 0x240:
+            # Procedural impact ring slots (APB bank 2).  The scanout model
+            # draws them; nothing else in the workbench interprets them.
+            self.params[addr - APB_BASE] = val
             return
         if APB_BASE <= addr < APB_BASE + 0x200:
             self._apb_store(addr - APB_BASE, val)

@@ -36,6 +36,7 @@
         <efx:design_file name="rtl/display_engine/2_layer_generators/video_bullet_overlay.v" version="default" library="default" />
         <efx:design_file name="rtl/display_engine/2_layer_generators/video_laser.v" version="default" library="default" />
         <efx:design_file name="rtl/display_engine/2_layer_generators/video_beam.v" version="default" library="default" />
+  <efx:design_file name="rtl/display_engine/2_layer_generators/video_fx_ring.v" version="default" library="default" />
         <efx:design_file name="rtl/display_engine/2_layer_generators/video_dual_hud.v" version="default" library="default" />
         <efx:design_file name="rtl/display_engine/3_compositor/video_pixel_compositor.v" version="default" library="default" />
         <efx:design_file name="rtl/display_engine/4_post_process/video_bloom_filter.v" version="default" library="default" />

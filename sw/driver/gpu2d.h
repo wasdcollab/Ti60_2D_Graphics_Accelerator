@@ -207,6 +207,18 @@ extern uint32_t gpu2d_stalled;
 #define GPU2D_REG_BTILE_DATA      (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xF8))
 #define GPU2D_REG_BPAL_DATA       (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0xFC))
 
+/* Procedural impact rings: APB bank 2, four slots at a 16-byte stride.
+ *   word 0: {en[31], add[30], r_out[29:21], cy[20:11], cx[10:0]}
+ *   word 1: {15'd0, r_in[24:16], alpha[7:0]}
+ *   word 2: {8'd0, rgb[23:0]}
+ * The scanout computes the circle from the pixel position, so a ring costs no
+ * DDR traffic, no BitBlt command and no damage-repair rectangle - see
+ * rtl/display_engine/2_layer_generators/video_fx_ring.v.  `add` uses the
+ * saturated-add path and ignores `alpha`; clear it for a blended ring. */
+#define GPU2D_REG_FX_RING(slot, word) \
+    (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x200u + \
+                            ((uint32_t)(slot) << 4) + ((uint32_t)(word) << 2)))
+
 /* Slot 0 of the hair group, i.e. the offset GPU2D_REG_HAIR(k, f) is built on
  * (0xC0 + 16k + 4f).  It used to read 0xB0, which is LASER_COLX_LO: a useful
  * base for nothing.  Nothing reads this name today, and it is a plain offset

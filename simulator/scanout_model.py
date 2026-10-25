@@ -298,6 +298,26 @@ class Scanout(object):
         self.bx0, self.bx1 = mx & 0x7FF, (mx >> 11) & 0x7FF
         self.by0, self.by1 = my & 0x7FF, (my >> 11) & 0x7FF
 
+        # ---- procedural impact rings (video_fx_ring, APB bank 2) ------------
+        # Four slots, priority = lowest slot number.  Same integer geometry as
+        # the RTL: r^2 for the band, and the two-pixel feather expanded as
+        # r^2 +- 4r + 4 so it costs no multiplier there and no sqrt here.
+        self.rings = []
+        for k in range(4):
+            o = 0x200 + 16 * k
+            a = get(o, 0)
+            if not (a >> 31):
+                continue
+            wb = get(o + 4, 0)
+            ro = (a >> 21) & 0x1FF
+            ri = (wb >> 16) & 0x1FF
+            self.rings.append((a & 0x7FF, (a >> 11) & 0x3FF, ro, ri,
+                               (a >> 30) & 1, wb & 0xFF,
+                               get(o + 8, 0) & 0xFFFFFF,
+                               ro * ro, ro * ro + 4 * ro + 4,
+                               ri * ri,
+                               (ri * ri - 4 * ri + 4) if ri > 2 else 0))
+
         # ---- the bucket table for THIS framebuffer --------------------------
         # Double buffered, and which table is live follows bit 22 of the scanned
         # base address - video_dma_read.v:306-314.
@@ -510,6 +530,18 @@ class Scanout(object):
                         if PLAY_LEFT <= xx <= PLAY_RIGHT:
                             hits.setdefault(xx, []).append(style)
 
+            # ---- impact rings that reach this scanline ------------------------
+            # Precomputed per line: the vertical term is shared by every pixel
+            # of the row, so the inner loop only adds dx*dx.
+            rings_here = []
+            if self.rings:
+                for rg in self.rings:
+                    dy = y - rg[1]
+                    d2y = dy * dy
+                    if d2y > rg[8]:          # outside r_out+2: nothing to draw
+                        continue
+                    rings_here.append((rg[0], d2y, rg))
+
             # ---- beam geometry ---------------------------------------------------
             # No b_hot any more: the scanout's beam has one profile for every row
             # (video_beam.v), and the row-phase version of it was dropped when
@@ -598,6 +630,29 @@ class Scanout(object):
                             lc, l_add, l_a = _laser_pixel(x - lo, y_flow, self.l_band)
                             r = _composite(r, lc, l_add, l_a)
                             break
+
+                # ---- L2b: procedural impact rings (video_fx_ring) -------------
+                # Between the laser and the beam, exactly where the compositor's
+                # stage 2b blends it.  Slot 0 wins, and a ring is drawn once:
+                # the hardware selects one slot per pixel, so this breaks after
+                # the first ring that covers it.
+                if rings_here:
+                    for cx_r, d2y, rg in rings_here:
+                        dx = x - cx_r
+                        d2 = d2y + dx * dx
+                        if d2 > rg[8]:
+                            continue
+                        if d2 <= rg[7]:
+                            if d2 >= rg[9]:
+                                a_use = rg[5]
+                            elif rg[9] and d2 >= rg[10]:
+                                a_use = rg[5] >> 1
+                            else:
+                                continue
+                        else:
+                            a_use = rg[5] >> 1
+                        r = _composite(r, rg[6], bool(rg[4]), a_use)
+                        break
 
                 # ---- L2: the craft's beam, and the warning hairlines ----------
                 #

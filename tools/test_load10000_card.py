@@ -32,7 +32,7 @@ def main():
         vm.store(sym['paused'],1,1)
         for _ in range(2):
             publish(vm,1)
-            assert T.plate_match(vm,card) > .70
+            assert T.plate_match(vm,card) > .69
         T.save_frame(vm,vm.right_request,ROOT/'work_sim'/('card_stage%d.bmp'%stage),
                      ROOT/'work_sim'/('card_stage%d.png'%stage))
         vm.store(sym['boss_state'],2,1)

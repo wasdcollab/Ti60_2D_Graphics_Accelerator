@@ -177,11 +177,11 @@ reg [7:0] sfx_rom [0:8191];
 
                 if (pending_event != EVT_NONE) begin
                     case (pending_event)
-                        EVT_SHOT:  begin sfx_rom_addr <= SFX_SHOT_START; sfx_rom_left <= SFX_SHOT_LEN; sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b0; sfx_noise_mode <= 1'b0; end
-                        EVT_LASER: begin sfx_inc <= 24'd98000; sfx_left <= 16'd18000; sfx_rom_mode <= 1'b0; sfx_rom_boost <= 1'b0; sfx_noise_mode <= 1'b0; end
-                        EVT_KILL:  begin sfx_rom_addr <= SFX_KILL_START; sfx_rom_left <= SFX_KILL_LEN; sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; sfx_noise_mode <= 1'b0; end
-                        EVT_BOSS:  begin sfx_rom_addr <= SFX_BOSS_START; sfx_rom_left <= SFX_BOSS_LEN; sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; sfx_noise_mode <= 1'b0; end
-                        EVT_HIT:   begin sfx_inc <= 24'd0; sfx_left <= 16'd720; sfx_rom_mode <= 1'b0; sfx_rom_boost <= 1'b0; sfx_noise_mode <= 1'b1; end
+                        EVT_SHOT:  begin sfx_rom_addr <= SFX_SHOT_START;  sfx_rom_left <= SFX_SHOT_LEN;  sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b0; sfx_noise_mode <= 1'b0; end
+                        EVT_LASER: begin sfx_rom_addr <= SFX_LASER_START; sfx_rom_left <= SFX_LASER_LEN; sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; sfx_noise_mode <= 1'b0; end
+                        EVT_KILL:  begin sfx_rom_addr <= SFX_KILL_START;  sfx_rom_left <= SFX_KILL_LEN;  sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; sfx_noise_mode <= 1'b0; end
+                        EVT_BOSS:  begin sfx_rom_addr <= SFX_BOSS_START;  sfx_rom_left <= SFX_BOSS_LEN;  sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; sfx_noise_mode <= 1'b0; end
+                        EVT_HIT:   begin sfx_rom_addr <= SFX_HIT_START;   sfx_rom_left <= SFX_HIT_LEN;   sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; sfx_noise_mode <= 1'b0; end
                         default:   begin sfx_inc <= 24'd0; sfx_left <= 16'd0; sfx_rom_mode <= 1'b0; sfx_rom_boost <= 1'b0; sfx_noise_mode <= 1'b0; end
                     endcase
                     sfx_phase <= 24'd0;
