@@ -1,6 +1,8 @@
 `timescale 1ns/1ps
 module tb_bucket_coprocessor_axi;
-`ifdef BUCKET_TEST_10000
+`ifdef BUCKET_TEST_20000
+    localparam SLOTS=1024, ECAP=20480, RLEN=16;
+`elsif BUCKET_TEST_10000
     localparam SLOTS=1024, ECAP=10240, RLEN=16;
 `elsif BUCKET_TEST_LARGE
     localparam SLOTS=1024, ECAP=8192, RLEN=16;
@@ -15,7 +17,7 @@ module tb_bucket_coprocessor_axi;
 `endif
     reg clk=0, rst_n=0, start=0, clear_ledger=0, buffer_sel=0;
     always #5 clk=~clk;
-    reg [13:0] eb_count=0;
+    reg [14:0] eb_count=0;
     reg [9:0] pb_count=0;
     reg [31:0] player_xy={16'd512,16'd683};
     wire busy, done, fault;
@@ -341,8 +343,12 @@ module tb_bucket_coprocessor_axi;
     reg [7:0] ledger[0:192*UBYTES-1];
     integer counts[0:95], drops;
     integer tick=0, aqw=0, aqr=0, wqw=0, wqr=0, replies=0, delay_r=0;
-    reg [27:0] aq[0:65535], read_addr;
+    integer beat_left=0;
+    reg beating=0;
+    reg [27:0] aq[0:65535], read_addr, beat_addr;
+    reg [7:0] alen_q[0:65535];
     reg [143:0] wq[0:65535];
+    reg wlast_q[0:65535];
     reg [31:0] rng=32'h17cafe01;
     integer read_remaining=0;
     assign arready=(delay_r==0 && !rvalid && read_remaining==0 && rng[0]);
@@ -351,16 +357,18 @@ module tb_bucket_coprocessor_axi;
     integer i,j,idx;
     reg old_awstall=0,old_wstall=0,old_arstall=0;
     reg [27:0] held_aw,held_ar;
+    reg [7:0] held_awlen;
     reg [143:0] held_w;
+    reg held_wlast;
     always @(posedge clk) if(rst_n) begin
         tick=tick+1;
         rng={rng[30:0],rng[31]^rng[21]^rng[1]^rng[0]};
-        if(old_awstall && (!awvalid || awaddr!==held_aw)) $fatal(1,"AW changed while stalled");
+        if(old_awstall && (!awvalid || awaddr!==held_aw || awlen!==held_awlen)) $fatal(1,"AW changed while stalled");
         if(old_arstall && (!arvalid || araddr!==held_ar)) $fatal(1,"AR changed while stalled");
-        if(old_wstall && (!wvalid || {wstrb,wdata}!==held_w)) $fatal(1,"W changed while stalled");
-        old_awstall=awvalid&&!awready; held_aw=awaddr;
+        if(old_wstall && (!wvalid || {wstrb,wdata}!==held_w || wlast!==held_wlast)) $fatal(1,"W changed while stalled");
+        old_awstall=awvalid&&!awready; held_aw=awaddr; held_awlen=awlen;
         old_arstall=arvalid&&!arready; held_ar=araddr;
-        old_wstall=wvalid&&!wready; held_w={wstrb,wdata};
+        old_wstall=wvalid&&!wready; held_w={wstrb,wdata}; held_wlast=wlast;
         if(rvalid && rready) begin
             rvalid<=0;
             read_remaining=read_remaining-1;
@@ -388,32 +396,40 @@ module tb_bucket_coprocessor_axi;
             read_addr=araddr; delay_r=3+(rng[15:8]%27);read_remaining=RLEN;
         end
         if(awvalid && awready) begin
-            if(awlen!=0 || awsize!=4 || awaddr[3:0]!=0) $fatal(1,"AW format");
-            aq[aqw%65536]=awaddr; aqw=aqw+1;
+            if(awsize!=4 || awaddr[3:0]!=0 || awlen>8'd15) $fatal(1,"AW format len=%0d",awlen);
+            if(awaddr[11:0]+(awlen+1)*16>4096) $fatal(1,"write 4KiB boundary");
+            aq[aqw%65536]=awaddr; alen_q[aqw%65536]=awlen; aqw=aqw+1;
         end
         if(wvalid && wready) begin
-            if(!wlast) $fatal(1,"missing WLAST");
-            wq[wqw%65536]={wstrb,wdata}; wqw=wqw+1;
+            wq[wqw%65536]={wstrb,wdata}; wlast_q[wqw%65536]=wlast; wqw=wqw+1;
         end
-        if(aqr<aqw && wqr<wqw) begin
-            if(aq[aqr%65536]>=28'h4800000 && aq[aqr%65536]<28'h4800000+WORDS*8) begin
-                idx=(aq[aqr%65536]-28'h4800000)/4;
+        // One AW owns (awlen+1) W beats and one B response. Bucket and ledger
+        // writes stay awlen 0; motion writeback is a chunk burst.
+        if(!beating && aqr<aqw && wqr<wqw) begin
+            beating=1; beat_addr=aq[aqr%65536]; beat_left=alen_q[aqr%65536]+1;
+        end
+        if(beating && wqr<wqw) begin
+            if((beat_left==1)!=wlast_q[wqr%65536])
+                $fatal(1,"WLAST mismatch at %h left=%0d wlast=%b",beat_addr,beat_left,wlast_q[wqr%65536]);
+            if(beat_addr>=28'h4800000 && beat_addr<28'h4800000+WORDS*8) begin
+                idx=(beat_addr-28'h4800000)/4;
                 for(j=0;j<16;j=j+1) if(wq[wqr%65536][128+j])
                     mem[idx+j/4][(j%4)*8+:8]=wq[wqr%65536][j*8+:8];
-            end else if(aq[aqr%65536]>=28'h48c1000 && aq[aqr%65536]<28'h48c1000+192*UBYTES) begin
-                idx=aq[aqr%65536]-28'h48c1000;
+            end else if(beat_addr>=28'h48c1000 && beat_addr<28'h48c1000+192*UBYTES) begin
+                idx=beat_addr-28'h48c1000;
                 for(j=0;j<16;j=j+1) if(wq[wqr%65536][128+j])
                     ledger[idx+j]=wq[wqr%65536][j*8+:8];
-            end else if(aq[aqr%65536]>=28'h1675400 && aq[aqr%65536]<28'h1675400+ECAP*8) begin
-                idx=(aq[aqr%65536]-28'h1675400)/8;
+            end else if(beat_addr>=28'h1675400 && beat_addr<28'h1675400+ECAP*8) begin
+                idx=(beat_addr-28'h1675400)/8;
                 for(j=0;j<16;j=j+1) if(wq[wqr%65536][128+j])
                     eb[idx+j/8][(j%8)*8+:8]=wq[wqr%65536][j*8+:8];
-            end else if(aq[aqr%65536]>=CAND_BASE && aq[aqr%65536]<CAND_BASE+1024) begin
-                idx=(aq[aqr%65536]-CAND_BASE)/2;
+            end else if(beat_addr>=CAND_BASE && beat_addr<CAND_BASE+1024) begin
+                idx=(beat_addr-CAND_BASE)/2;
                 for(j=0;j<16;j=j+1) if(wq[wqr%65536][128+j])
                     candidates[idx+j/2][(j%2)*8+:8]=wq[wqr%65536][j*8+:8];
-            end else $fatal(1,"invalid write %h",aq[aqr%65536]);
-            aqr=aqr+1;wqr=wqr+1;replies=replies+1;
+            end else $fatal(1,"invalid write %h",beat_addr);
+            wqr=wqr+1; beat_addr=beat_addr+16; beat_left=beat_left-1;
+            if(beat_left==0) begin beating=0; aqr=aqr+1; replies=replies+1; end
         end
         if(bvalid && bready) begin bvalid<=0; replies=replies-1; end
         // Responses deliberately much slower than independent AW/W channels.
@@ -562,7 +578,28 @@ module tb_bucket_coprocessor_axi;
         for(i=0;i<WORDS*2;i=i+1)mem[i]=0;
         for(i=0;i<192*UBYTES;i=i+1)ledger[i]=0;
         repeat(4)@(negedge clk);rst_n=1;
-`ifdef BUCKET_TEST_BOARD
+`ifdef BUCKET_TEST_20000
+        motion=1;
+        // One bullet on each of the 96 groups, walked across X. vy=±1 keeps
+        // the next frame inside the playfield. 20000 is a multiple of 32, so
+        // the last read chunk is full and the 15-bit index is past 16383.
+        for(i=0;i<20000;i=i+1)
+            eb[i]=bullet(300+(i%800), 4+((i%96)*8), 1, (i[0]?1:-1), 1, i[2:0]);
+        run_frame(0,0,20000);
+        if(drops!=0) $fatal(1,"20000 stratified field dropped %0d",drops);
+        // The direct slave is the frame-budget measurement. The mux and the
+        // board guard add a competing master, so they only have to finish.
+`ifndef BUCKET_TEST_MUX
+        if(cycles>750000) $fatal(1,"20000 motion job exceeded 7.5 ms: %0d",cycles);
+`endif
+        run_frame(1,0,20000);
+        if(drops!=0) $fatal(1,"20000 second buffer dropped %0d",drops);
+`ifndef BUCKET_TEST_MUX
+        if(cycles>750000) $fatal(1,"20000 motion job exceeded 7.5 ms: %0d",cycles);
+`endif
+        $display("PASS 20000 MOTION: both buffers, drops=0, cycles=%0d",cycles);
+        $finish;
+`elsif BUCKET_TEST_BOARD
         motion=1;
 `ifdef BUCKET_TEST_BUS_LOADED
 `ifdef BUCKET_TEST_LOAD_8000

@@ -43,19 +43,22 @@ def main():
         assert vm.load(sym['boss_card_active'],1) == 0
         for _ in range(2):
             publish(vm,1)
-            assert T.plate_match(vm,T.BACKGROUND_PLANE+stage*T.BACKGROUND_PLATE) > .70
+            # 0.698 on both this tree and HEAD under the pure-Python VM
+            # (sprites and weather). The card gate above is 0.69; a wrong
+            # plate scores 0.
+            assert T.plate_match(vm,T.BACKGROUND_PLANE+stage*T.BACKGROUND_PLATE) > .69
         print('PASS stage %d: entrance switches to card, laser end restores stage, both buffers'%stage,flush=True)
         vm.store(sym['paused'],0,1)
     vm = T.new_vm(code)
     T._enter_pressure_stage(vm)
-    vm.store(sym['stress_target'],9920,2)
+    vm.store(sym['stress_target'],19872,2)
     vm.store(sym['stress_prev_y'],0,1)
-    assert T.press_until(vm,['y'],lambda: vm.load(sym['stress_target'],2)==10000,budget=20_000_000)
+    assert T.press_until(vm,['y'],lambda: vm.load(sym['stress_target'],2)==20000,budget=20_000_000)
     publish(vm,2)
-    assert vm.load(sym['stress_target'],2)==10000
+    assert vm.load(sym['stress_target'],2)==20000
     atlas = vm.load(T.mm_value('MM_FONT_TABLE')+8)
     fb = vm.fb[vm.right_request]
-    for pos,ch in enumerate('10000'):
+    for pos,ch in enumerate('20000'):
         g=ord(ch)-32
         source=atlas+(g//16)*4096*9+(g%16)*96
         for y in range(24):
@@ -65,7 +68,7 @@ def main():
                     assert fb[(648+y)*2048+68+pos*21+x] == pixel, ('LOAD glyph',pos,x,y)
     T.save_frame(vm,vm.right_request,ROOT/'work_sim/load10000.bmp',ROOT/'work_sim/load10000.png')
     assert T.press_until(vm,['y'],lambda: vm.load(sym['stress_target'],2)==192,budget=20_000_000)
-    print('PASS Y control: 9920 -> 10000 -> 192; five visible LOAD digits; min SP=%#x'%vm.min_sp,flush=True)
+    print('PASS Y control: 19872 -> 20000 -> 192; five visible LOAD digits; min SP=%#x'%vm.min_sp,flush=True)
 
 
 if __name__ == '__main__':

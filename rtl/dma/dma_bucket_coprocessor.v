@@ -15,11 +15,20 @@
 //   rasterizer).  video_bullet_scanline.v paints a line from that group's table
 //   alone, so there is no on-chip active pool to carry a sprite down; the 2.8x
 //   per-group write inflation is the price of a 1024-slot lossless table, and it
-//   buys DROP = 0 at the full 8160-sprite pool.  SINGLE_GROUP_REG = 1 remains
+//   buys DROP = 0 for a spread field (the 20480-record pool, 20000 stratified).
+//   A group that exceeds 1024 still drops; the on-chip table is not larger.
+//   SINGLE_GROUP_REG = 1 remains
 //   for the retired active-pool path (one entry, in the top group).
 // - Directly writes 32-bit packed bucket entries into DDR3 MM_BUCKET_TABLE.
 // - Automatically clears old unused table slots from the previous frame.
-// - At most eight writes outstanding; completion waits for every response.
+// - At most eight write bursts outstanding; completion waits for every B.
+// - Motion writeback is one INCR burst per read chunk. A 16-beat read covers
+//   32 bullets; if any word in that chunk changed, the captured words are
+//   written back as one burst (awlen = last word actually consumed, so a
+//   short tail never writes past bullet_limit). Unchanged words in a dirty
+//   chunk go back out as the bytes just read. Bucket, candidate, clear and
+//   used-count writes stay single-beat. The chunk is 256 bytes and the pool
+//   base is 256-byte aligned, so a burst cannot cross a 4 KiB boundary.
 // - CPU must flush bullet data before start and not touch tables while busy.
 // - clear_ledger is idle-only, after the CPU zeroes and flushes BOTH tables.
 //
@@ -27,8 +36,10 @@
 //   stage 1 (ST_MOVE)  : X' = X + Vx, Y' = Y + Vy          (one adder per axis)
 //   stage 2 (ST_CHECK) : playfield bounds -> kill, danger-box -> candidate
 //   stage 3 (ST_EVAL)  : slot / bounding rows / group range from the NEW position
-//   A moved record is written back to DDR (x,y: 4 bytes; a kill: the flags byte
-//   only).  Lances (EF_LANCE) are left to the CPU: they bounce, they are few.
+//   A moved record is written back to DDR in the chunk burst above (x,y: 4
+//   bytes; a kill: the flags byte only; the other bytes of the 128-bit word
+//   are the originals).  Lances (EF_LANCE) are left to the CPU: they bounce,
+//   they are few.
 //   Two index lists come back through the write channel, 8 x uint16 per beat:
 //     free list      MM_EBULLET_LIST            every inactive or just-killed
 //                                               front-run slot, ascending
@@ -56,7 +67,7 @@ module dma_bucket_coprocessor #(
     input  wire                       start,          // 1-cycle pulse to start
     input  wire                       clear_ledger,   // 1-cycle pulse to reset old_first/old_end/used_count
     input  wire                       buffer_sel,     // 0: FB0 table (0x04800000), 1: FB1 table (0x0480C000)
-    input  wire [13:0]                eb_count,       // enemy bullet front-run bound (up to 8192)
+    input  wire [14:0]                eb_count,       // enemy front-run bound (15 bits, up to 32767)
     input  wire [9:0]                 pb_count,       // player bullet bound (up to 512)
     input  wire [31:0]                player_xy,      // {player_y[15:0], player_x[15:0]}
     input  wire                       motion_en,      // with start: move/cull enemy bullets in DDR
@@ -93,7 +104,7 @@ module dma_bucket_coprocessor #(
     // AXI4 Write Master (for writing bucket entries and zeroing tail)
     output reg  [3:0]                 m_axi_awid,
     output reg  [AXI_ADDR_WIDTH-1:0]  m_axi_awaddr,
-    output wire [7:0]                 m_axi_awlen,
+    output reg  [7:0]                 m_axi_awlen,
     output wire [2:0]                 m_axi_awsize,
     output wire [1:0]                 m_axi_awburst,
     output wire [1:0]                 m_axi_awlock,
@@ -103,7 +114,7 @@ module dma_bucket_coprocessor #(
     output reg  [3:0]                 m_axi_wid,
     output reg  [AXI_DATA_WIDTH-1:0]  m_axi_wdata,
     output reg  [15:0]                m_axi_wstrb,
-    output wire                       m_axi_wlast,
+    output reg                        m_axi_wlast,
     output reg                        m_axi_wvalid,
     input  wire                       m_axi_wready,
 
@@ -129,11 +140,11 @@ module dma_bucket_coprocessor #(
     // region directly after the enemy pool (MM_EBULLET_ACTIVE_BASE in memory_map.h);
     // the free list grows up from its start, the candidate list lives in its last CAND_CAP entries.
     localparam [27:0] MM_EBULLET_LIST   = 28'h1675400 + EB_CAPACITY * 8;
-    localparam [13:0] CAND_CAP          = 14'd512;
-    localparam [13:0] FREE_CAP          = EB_CAPACITY - CAND_CAP;
+    localparam [14:0] CAND_CAP          = 15'd512;
+    localparam [14:0] FREE_CAP          = EB_CAPACITY - CAND_CAP;
     localparam [27:0] MM_EB_CAND_LIST   = MM_EBULLET_LIST + FREE_CAP * 2;
-    localparam [13:0] EB_FRONT_RUN      = EB_CAPACITY - 32;
-    localparam [13:0] EB_TOTAL_LIMIT    = EB_CAPACITY;
+    localparam [14:0] EB_FRONT_RUN      = EB_CAPACITY - 32;
+    localparam [14:0] EB_TOTAL_LIMIT    = EB_CAPACITY;
 
     localparam [4:0]  BTILE_SLOT_PBULLET = 5'd16;
     localparam [4:0]  BTILE_SLOT_ORB     = 5'd17;
@@ -154,8 +165,6 @@ module dma_bucket_coprocessor #(
     assign m_axi_awsize  = 3'd4;   // 16 bytes = 128-bit
     assign m_axi_awburst = 2'b01;  // INCR
     assign m_axi_awlock  = 2'b00;
-    assign m_axi_awlen   = 8'd0;   // Single beat writes
-    assign m_axi_wlast   = 1'b1;
 
     // Tile bounding rows lookup table
     function [9:0] get_tile_rows;
@@ -226,14 +235,15 @@ module dma_bucket_coprocessor #(
         ST_WRITE_GROUPS=12, ST_REC_WR=13, ST_NEXT=14,
         ST_CLEAR_SETUP=15, ST_CLEAR_LOAD=16, ST_CLEAR_WAIT=17,
         ST_CLEAR_WRITE=18, ST_WRITE_USED=19, ST_DRAIN=20, ST_DONE=21,
-        ST_PACK_WAIT=22, ST_PACK0=23, ST_PACK1=24, ST_PACK2=25, ST_PACK_SEND=26;
+        ST_PACK_WAIT=22, ST_PACK0=23, ST_PACK1=24, ST_PACK2=25, ST_PACK_SEND=26,
+        ST_CHUNK_FLUSH=27, ST_CHUNK_W=28;
     reg [5:0] state;
     reg [COUNT_BITS-1:0] cur_count[0:95];
     reg [COUNT_BITS-1:0] used_count[0:255];
     reg [COUNT_BITS-1:0] used_count_q;
     reg [95:0] ledger_valid[0:1];
     reg buffer_r, motion_r, is_player, orb_tail;
-    reg [13:0] enemy_limit, player_limit, bullet_idx, bullet_limit;
+    reg [14:0] enemy_limit, player_limit, bullet_idx, bullet_limit;
     reg [31:0] player_r, bound_x_r, bound_y_r;
     reg [27:0] table_base, read_address;
     reg [3:0] read_index, beat_index;
@@ -243,7 +253,11 @@ module dma_bucket_coprocessor #(
     reg [6:0] init_group, group_index, group_last, clear_group;
     reg [COUNT_BITS-1:0] clear_index, clear_limit;
     reg [31:0] entry_word;
-    reg [13:0] record_index;
+    reg [14:0] record_index;
+    reg [27:0] chunk_base;
+    reg [3:0] chunk_last;
+    reg [4:0] burst_beat;
+    reg chunk_dirty;
     reg signed [17:0] moved_x, moved_y;
     reg [4:0] wr_pend;
     reg abort_job;
@@ -264,14 +278,26 @@ module dma_bucket_coprocessor #(
     end
     reg [127:0] burst_data;
     wire burst_write=state==ST_READ_R && m_axi_rvalid && m_axi_rready;
+    wire word_capture=(state==ST_NEXT) && changed &&
+                      (second_bullet || bullet_idx>=bullet_limit);
     wire [2047:0] burst_words;
     genvar burst_bank;
     generate for(burst_bank=0;burst_bank<16;burst_bank=burst_bank+1) begin : g_burst
         reg [127:0] value;
-        always @(posedge clk) if(burst_write && read_index==burst_bank)
-            value<=m_axi_rdata;
+        always @(posedge clk) begin
+            if(burst_write && read_index==burst_bank[3:0])
+                value<=m_axi_rdata;
+            else if(word_capture && beat_index==burst_bank[3:0])
+                value<=changed_word;
+        end
         assign burst_words[burst_bank*128+:128]=value;
     end endgenerate
+    function [127:0] burst_word_at;
+        input [3:0] ix;
+        begin
+            burst_word_at=burst_words[ix*128+:128];
+        end
+    endfunction
     always @(posedge clk) burst_data<=burst_words[beat_index*128+:128];
     wire signed [17:0] position_x={{2{bullet_buf[15]}},bullet_buf[15:0]};
     wire signed [17:0] position_y={{2{bullet_buf[31]}},bullet_buf[31:16]};
@@ -342,8 +368,8 @@ module dma_bucket_coprocessor #(
             drop_count<=0;eb_live<=0;eb_kill<=0;eb_free<=0;eb_cand<=0;
             m_axi_arid<=4'd3;m_axi_araddr<=0;m_axi_arlen<=0;
             m_axi_arvalid<=0;m_axi_rready<=0;
-            m_axi_awid<=4'd3;m_axi_awaddr<=0;m_axi_awvalid<=0;
-            m_axi_wid<=4'd3;m_axi_wdata<=0;m_axi_wstrb<=0;m_axi_wvalid<=0;
+            m_axi_awid<=4'd3;m_axi_awaddr<=0;m_axi_awlen<=0;m_axi_awvalid<=0;
+            m_axi_wid<=4'd3;m_axi_wdata<=0;m_axi_wstrb<=0;m_axi_wlast<=1;m_axi_wvalid<=0;
             wr_pend<=0;
             ledger_valid[0]<=0;ledger_valid[1]<=0;
             buffer_r<=0;motion_r<=0;is_player<=0;orb_tail<=0;
@@ -353,6 +379,7 @@ module dma_bucket_coprocessor #(
             bullet_buf<=0;second_bullet<=0;changed<=0;
             init_group<=0;group_index<=0;group_last<=0;clear_group<=0;
             clear_index<=0;clear_limit<=0;record_index<=0;
+            chunk_base<=0;chunk_last<=0;burst_beat<=0;chunk_dirty<=0;
             moved_x<=0;moved_y<=0;tile_row<=0;tile_left<=0;
             tile_slot_r<=0;tile_width_r<=0;hue_r<=0;entry_word<=0;
             abort_job<=0;
@@ -389,7 +416,7 @@ module dma_bucket_coprocessor #(
                         buffer_r<=buffer_sel;motion_r<=motion_en;player_r<=player_xy;
                         bound_x_r<=bound_x;bound_y_r<=bound_y;
                         enemy_limit<=eb_count>EB_FRONT_RUN ? EB_FRONT_RUN : eb_count;
-                        player_limit<=pb_count>10'd512 ? 14'd512 : {4'd0,pb_count};
+                        player_limit<=pb_count>10'd512 ? 15'd512 : {5'd0,pb_count};
                         table_base<=buffer_sel ? MM_BUCKET_TABLE_1 : MM_BUCKET_TABLE_0;
                         is_player<=pb_count!=0;orb_tail<=0;bullet_idx<=0;
                         init_group<=0;state<=ST_INIT;
@@ -417,8 +444,10 @@ module dma_bucket_coprocessor #(
                             orb_tail<=1;bullet_idx<=EB_FRONT_RUN;bullet_limit<=EB_TOTAL_LIMIT;
                         end else begin clear_group<=0;state<=ST_CLEAR_SETUP;end
                     end else begin
-                        m_axi_araddr<=(is_player ? MM_PBULLET_BASE : MM_EBULLET_BASE)+{11'd0,bullet_idx,3'b000};
-                        read_address<=(is_player ? MM_PBULLET_BASE : MM_EBULLET_BASE)+{11'd0,bullet_idx,3'b000};
+                        m_axi_araddr<=(is_player ? MM_PBULLET_BASE : MM_EBULLET_BASE)+{10'd0,bullet_idx,3'b000};
+                        read_address<=(is_player ? MM_PBULLET_BASE : MM_EBULLET_BASE)+{10'd0,bullet_idx,3'b000};
+                        chunk_base<=(is_player ? MM_PBULLET_BASE : MM_EBULLET_BASE)+{10'd0,bullet_idx,3'b000};
+                        chunk_dirty<=0;
                         m_axi_arlen<=BURST_READ_LEN==16 ? 8'd15 : 8'd0;
                         m_axi_arvalid<=1;m_axi_rready<=1;read_index<=0;beat_index<=0;
                         state<=ST_READ_R;
@@ -440,7 +469,7 @@ module dma_bucket_coprocessor #(
                 end
                 ST_DISPATCH:begin
                     bullet_buf<=second_bullet ? read_word[127:64] : read_word[63:0];
-                    record_index<=bullet_idx;bullet_idx<=bullet_idx+14'd1;
+                    record_index<=bullet_idx;bullet_idx<=bullet_idx+15'd1;
                     state<=ST_MOVE;
                 end
                 ST_MOVE:begin
@@ -472,8 +501,8 @@ module dma_bucket_coprocessor #(
                 ST_CANDIDATE:begin
                     if(write_free) begin
                         m_axi_awaddr<=MM_EB_CAND_LIST+{11'd0,eb_cand[15:3],4'b0000};
-                        m_axi_awvalid<=1;m_axi_wdata<={8{{2'b00,record_index}}};
-                        m_axi_wstrb<=16'h0003<<{eb_cand[2:0],1'b0};m_axi_wvalid<=1;
+                        m_axi_awlen<=8'd0;m_axi_awvalid<=1;m_axi_wdata<={8{{1'b0,record_index}}};
+                        m_axi_wstrb<=16'h0003<<{eb_cand[2:0],1'b0};m_axi_wlast<=1;m_axi_wvalid<=1;
                         eb_cand<=eb_cand+16'd1;state<=ST_EVAL;
                     end
                 end
@@ -509,8 +538,8 @@ module dma_bucket_coprocessor #(
                 ST_PACK1:begin write_pack[63:32]<=pack_count>1 ? cache_q : 32'd0;state<=ST_PACK2;end
                 ST_PACK2:begin write_pack[95:64]<=pack_count>2 ? cache_q : 32'd0;state<=ST_PACK_SEND;end
                 ST_PACK_SEND:if(write_free) begin
-                    m_axi_awaddr<=pack_address;m_axi_awvalid<=1;
-                    m_axi_wdata<=write_pack;m_axi_wstrb<=16'hffff;m_axi_wvalid<=1;
+                    m_axi_awaddr<=pack_address;m_axi_awlen<=8'd0;m_axi_awvalid<=1;
+                    m_axi_wdata<=write_pack;m_axi_wstrb<=16'hffff;m_axi_wlast<=1;m_axi_wvalid<=1;
                     if(pack_tail) state<=ST_CLEAR_LOAD;
                     else if(group_index==group_last) state<=ST_NEXT;
                     else begin group_index<=group_index+7'd1;state<=ST_WRITE_GROUPS;end
@@ -518,22 +547,36 @@ module dma_bucket_coprocessor #(
                 ST_NEXT:begin
                     if(!second_bullet && bullet_idx<bullet_limit) begin
                         second_bullet<=1;state<=ST_DISPATCH;
-                    end else state<=changed ? ST_REC_WR : ST_LOAD;
-                    if(second_bullet || bullet_idx>=bullet_limit) begin
-                        if(!changed) begin
-                            if(bullet_idx>=bullet_limit || beat_index==(BURST_READ_LEN==16 ? 4'd15 : 4'd0))
-                                state<=ST_READ_AR;
-                            else begin beat_index<=beat_index+4'd1;read_address<=read_address+28'd16;state<=ST_LOAD;end
+                    end else begin
+                        if(changed) chunk_dirty<=1;
+                        if(bullet_idx>=bullet_limit || beat_index==(BURST_READ_LEN==16 ? 4'd15 : 4'd0)) begin
+                            chunk_last<=beat_index;state<=ST_CHUNK_FLUSH;
+                        end else begin
+                            beat_index<=beat_index+4'd1;read_address<=read_address+28'd16;state<=ST_LOAD;
                         end
                     end
                 end
-                ST_REC_WR:begin
-                    if(write_free) begin
-                        m_axi_awaddr<=read_address;m_axi_awvalid<=1;
-                        m_axi_wdata<=changed_word;m_axi_wstrb<=16'hffff;m_axi_wvalid<=1;
-                        if(bullet_idx>=bullet_limit || beat_index==(BURST_READ_LEN==16 ? 4'd15 : 4'd0))
-                            state<=ST_READ_AR;
-                        else begin beat_index<=beat_index+4'd1;read_address<=read_address+28'd16;state<=ST_LOAD;end
+                // One burst for the whole read chunk. awlen is the index of the
+                // last consumed beat, so the transfer is chunk_last+1 beats.
+                ST_CHUNK_FLUSH:begin
+                    if(!chunk_dirty) state<=ST_READ_AR;
+                    else if(write_free) begin
+                        m_axi_awaddr<=chunk_base;m_axi_awlen<= {4'd0,chunk_last};m_axi_awvalid<=1;
+                        m_axi_wdata<=burst_word_at(4'd0);m_axi_wstrb<=16'hffff;
+                        m_axi_wlast<=(chunk_last==4'd0);m_axi_wvalid<=1;
+                        burst_beat<=5'd1;chunk_dirty<=0;
+                        state<=(chunk_last==4'd0) ? ST_READ_AR : ST_CHUNK_W;
+                    end
+                end
+                ST_CHUNK_W:begin
+                    if(m_axi_wvalid && m_axi_wready) begin
+                        if(burst_beat>chunk_last) state<=ST_READ_AR;
+                        else begin
+                            m_axi_wdata<=burst_word_at(burst_beat[3:0]);
+                            m_axi_wstrb<=16'hffff;m_axi_wvalid<=1;
+                            m_axi_wlast<=(burst_beat[3:0]==chunk_last);
+                            burst_beat<=burst_beat+5'd1;
+                        end
                     end
                 end
                 ST_CLEAR_SETUP:begin
@@ -554,8 +597,8 @@ module dma_bucket_coprocessor #(
                     if(write_free) begin
                         if(clear_index<clear_limit) begin
                             m_axi_awaddr<=table_base+clear_group*(TABLE_SLOTS*4)+((clear_index>>2)<<4);
-                            m_axi_awvalid<=1;m_axi_wdata<=0;
-                            m_axi_wstrb<=16'hffff;m_axi_wvalid<=1;
+                            m_axi_awlen<=8'd0;m_axi_awvalid<=1;m_axi_wdata<=0;
+                            m_axi_wstrb<=16'hffff;m_axi_wlast<=1;m_axi_wvalid<=1;
                             clear_index<=clear_index+4;
                         end else state<=ST_WRITE_USED;
                     end
@@ -566,8 +609,8 @@ module dma_bucket_coprocessor #(
                         if(used_last) begin
                             m_axi_awaddr<=(buffer_r ? MM_BUCKET_USED_1 : MM_BUCKET_USED_0)
                                           +((clear_group*USED_BYTES>>4)<<4);
-                            m_axi_awvalid<=1;m_axi_wdata<=used_next;
-                            m_axi_wstrb<=16'hffff;m_axi_wvalid<=1;
+                            m_axi_awlen<=8'd0;m_axi_awvalid<=1;m_axi_wdata<=used_next;
+                            m_axi_wstrb<=16'hffff;m_axi_wlast<=1;m_axi_wvalid<=1;
                         end
                         if(clear_group==7'd95) state<=ST_DRAIN;
                         else begin clear_group<=clear_group+7'd1;state<=ST_CLEAR_SETUP;end

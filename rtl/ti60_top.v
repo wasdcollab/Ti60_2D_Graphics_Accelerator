@@ -274,7 +274,7 @@ module ti60_top #(
     wire  cfg_bucket_start;
     wire  cfg_bucket_clear;
     wire  cfg_bucket_buffer;
-    wire [13:0] cfg_bucket_eb_count;
+    wire [14:0] cfg_bucket_eb_count;
     wire [9:0] cfg_bucket_pb_count;
     wire [31:0] cfg_bucket_player;
     wire  cfg_bucket_motion;
@@ -1014,7 +1014,7 @@ module ti60_top #(
         .bucket_eb_cand(cfg_bucket_cand),.hb_we(),.hb_val()
     );
 
-    dma_bucket_coprocessor #(.EB_CAPACITY(10240),.BURST_READ_LEN(16),
+    dma_bucket_coprocessor #(.EB_CAPACITY(20480),.BURST_READ_LEN(16),
         .SINGLE_GROUP_REG(0),.TABLE_SLOTS(BUCKET_SLOTS)) u_bucket_coprocessor (
         .clk(core_clk),
         .rst_n(ddr_rstn),

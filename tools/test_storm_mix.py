@@ -27,7 +27,17 @@ def main():
                                   ("boss_fire_timer", 100, 1),
                                   ("boss_pat_timer", 100, 1),
                                   ("lockon_arm", 0, 1),
-                                  ("boss_x", 650, 2), ("boss_y", 300, 2)):
+                                  ("boss_x", 650, 2), ("boss_y", 300, 2),
+                                  # The pool clear above does not touch the CPU
+                                  # occupancy counter. On the hardware-motion
+                                  # path bullets_update() does not rescan the
+                                  # front run, so a stale count would shrink
+                                  # `room` after the first case.
+                                  ("active_ebullets_count", 0, 4),
+                                  ("active_count", 0, 2),
+                                  ("eb_free_hint", 0, 4),
+                                  ("eb_hi", 0, 4),
+                                  ("eb_lance_count", 0, 4)):
             vm.store(sym[name], value, size)
         observed = []
         store = vm.store
@@ -49,7 +59,9 @@ def main():
             call_func(vm, sym["game_update"], pad_on_stack=True)
         finally:
             vm.store = store
-        n = min(48, target)
+        # Budget 224, and a target >= 4000 also asks for the 64-shot reserve.
+        room = target + (64 if target >= 4000 else 0)
+        n = min(room, 224)
         if not n:
             assert not observed and vm.load(sym["stress_storm_step"], 2) == start
             results.append(dict(start=start, births=0))
@@ -57,33 +69,42 @@ def main():
         assert len(observed) == 1, observed
         end, live, cx, cy, px, py = observed[0]
         assert end == (start + n) & 65535 and len(live) == n, (start, end, len(live))
+        sched = [0, 128, 64, 198, 1, 129, 65, 199, 2, 130, 66, 200,
+                 3, 131, 67, 201, 4, 132, 68, 202, 5, 133, 69, 203]
         hues, edges = Counter(), Counter()
         for i, (x, y, vx, vy, flags, hue) in enumerate(live):
             step = start + i
-            expected = 5 if step % 3 == 0 else 3 if step % 6 == 1 else 4
+            kind = sched[step % 24] >> 6
+            sub = sched[step % 24] & 0x3F
+            expected = 5 if kind == 0 else 3 if kind == 1 else 4
             assert hue == expected and flags == 1, (step, hue, expected, flags)
             hues[hue] += 1
-            if hue in (3, 5):
-                factor = 11 if hue == 5 else 5
-                assert (x, y) == (cx, cy + (step * factor % 16) * 9 - 67)
-                a = ((step * 2) & 15) if hue == 5 else (
-                    aim_index(px - cx, py - cy) + ((step >> 2) & 3) - 1) & 15
+            lat_y = ((step * 5) % 96) * 8 + 4
+            if kind in (0, 1):
+                birth_x = 189 + ((step * 17 + (400 if kind == 1 else 0)) % 960)
+                assert (x, y) == (birth_x, lat_y), (step, x, y, birth_x, lat_y)
+                if kind == 0:
+                    a = (step * 2) & 15
+                else:
+                    a = (aim_index(px - cx, py - cy) + ((step & 12) >> 2) - 1
+                         + (8 if sub & 1 else 0)) & 15
                 dx = vm.load(sym["dir16_x"] + a, 1, signed=True)
                 dy = vm.load(sym["dir16_y"] + a, 1, signed=True)
                 assert (vx, vy) == (dx * 3 >> 4, dy * 3 >> 4)
             else:
-                left = bool(step & 2)
-                # Right births are clamped by spawn_ebullet to GAME_RIGHT-16.
-                assert (x, vx, vy) == ((183, 3, 0) if left else (1169, -3, 0))
-                assert 48 <= y < 720
+                drift = -1 if (step & 1) == 0 else 1
+                if not (1 <= lat_y + drift <= 767):
+                    drift = -drift
+                left = kind == 2
+                assert (x, y, vx, vy) == ((182, lat_y, 3, drift) if left else (1169, lat_y, -3, drift))
                 edges["left" if left else "right"] += 1
-        if n == 48:
-            assert hues == {5: 16, 3: 8, 4: 24} and edges == {"left": 12, "right": 12}
-        results.append(dict(start=start, births=n, hues=hues, edges=edges))
+        if n == 224 and start == 0:
+            assert hues == {5: 56, 3: 56, 4: 112} and edges == {"left": 56, "right": 56}
+        results.append(dict(start=start, births=n, hues=dict(hues), edges=dict(edges)))
     report = dict(bin_sha256=hashlib.sha256(source.read_bytes()).hexdigest(), cases=results)
     (ROOT / "work_sim/storm_round2_mix.json").write_text(json.dumps(report, indent=2) + "\n")
-    print("PASS: 51 linked-firmware cases: 48 phases, uint16 wrap, short fill, zero room")
-    print("Every full cycle: ring=16 cone=8 wall=24; walls left/right=12/12")
+    print("PASS: 51 linked-firmware cases: lattice births, uint16 wrap, short fill, zero room")
+    print("Budget 224 from step 0: ring=56 cone=56 wall=112; walls left/right=56/56")
 
 
 if __name__ == "__main__":

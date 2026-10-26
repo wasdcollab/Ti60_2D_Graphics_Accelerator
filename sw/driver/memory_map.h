@@ -127,7 +127,13 @@
 
 #define MM_ENEMY_COUNT          32
 #define MM_PBULLET_COUNT        512
-#define MM_EBULLET_COUNT        10240
+/* 20480 records. The coprocessor front run is COUNT-32 and the last 32 slots
+ * are the orb tail. The stress stage's Y control stops at 20000, inside that
+ * front run. The records end at 0x0169D400 and the free/candidate index lists
+ * (COUNT * 2 bytes) end at 0x016A7400, still below the font bank at 0x019B0000.
+ * APB 0x120 carries this count in 15 bits: [28:16] = count[12:0], [15:14] =
+ * count[14:13]. */
+#define MM_EBULLET_COUNT        20480
 #define MM_ITEM_COUNT           16
 /* 64, not 52: the block starts at 0x0160_5B00 and the next surface starts at
  * 0x0160_5C00, so the twelve words from 0x5BD0 to 0x5C00 were already reserved
@@ -518,8 +524,13 @@
 #define MM_PICK_MASK_BYTES      120UL
 #define MM_RUNTIME_WORK         0x048C6700UL
 #define MM_RUNTIME_WORK_BYTES   320UL
+/* Live lance indices. This used to be MM_EBULLET_COUNT * 2, which filled the
+ * gap in front of MM_RUNTIME_WORK exactly when the pool was 10240. Growing
+ * that formula with the pool would overwrite the runtime block, so the index
+ * is a fixed cap. A lance pattern is a handful of shafts, not the storm. */
 #define MM_LANCE_INDEX          0x048C1600UL
-#define MM_LANCE_INDEX_BYTES    (MM_EBULLET_COUNT * 2UL)
+#define MM_LANCE_INDEX_MAX      1024
+#define MM_LANCE_INDEX_BYTES    (MM_LANCE_INDEX_MAX * 2UL)
 
 #define MM_ORB_TILE             0x033F5000UL
 #define MM_ORB_TILE_W           16

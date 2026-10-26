@@ -26,6 +26,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,9 +40,20 @@ GCC = Path(os.environ.get("RISCV_GCC_DIR", r"D:\FPGAqiansai\toolchain"))
 TLM_FRAMES_ADDR = 0x01605B00 + 4          # tlm[TLM_FRAMES], telemetry marker
 
 
+def _riscv_tool(name):
+    """Windows packs ship name.exe; a Linux cross gcc does not."""
+    for candidate in (GCC / "bin" / (name + ".exe"), GCC / "bin" / name):
+        if candidate.exists():
+            return str(candidate)
+    found = shutil.which(name)
+    if not found:
+        raise FileNotFoundError(name)
+    return found
+
+
 def symbols(elf):
-    nm = GCC / "bin" / "riscv-none-elf-nm.exe"
-    result = subprocess.check_output([str(nm), str(elf)], text=True)
+    nm = _riscv_tool("riscv-none-elf-nm")
+    result = subprocess.check_output([nm, str(elf)], text=True)
     return {line.split()[2]: int(line.split()[0], 16)
             for line in result.splitlines() if len(line.split()) == 3}
 
@@ -85,7 +97,7 @@ def call_func(vm, addr, args=(), budget=12_000_000, pad_on_stack=False):
 
 def addr2line_map(elf, addrs):
     """Batch addr2line queries, using address markers to delimit inline chains."""
-    tool = GCC / "bin" / "riscv-none-elf-addr2line.exe"
+    tool = _riscv_tool("riscv-none-elf-addr2line")
     res = {}
     batch = list(dict.fromkeys(addrs))
     CH = 256

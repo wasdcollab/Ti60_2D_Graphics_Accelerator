@@ -183,7 +183,7 @@ public:
                     uint32_t src_stride, uint32_t dst_stride, py::object colorkey);
     void apb_store(uint32_t off, uint32_t val);
     void bucket_accel(uint32_t control);
-    uint32_t bucket_status = 0x20000000u, bucket_player_xy = 0x020002ABu;
+    uint32_t bucket_status = 0x20000000u, bucket_player_xy = 0x020002ABu, bucket_info = 0;
     uint16_t bucket_used[2][96] = {};
 
     // ---- execution --------------------------------------------------------
