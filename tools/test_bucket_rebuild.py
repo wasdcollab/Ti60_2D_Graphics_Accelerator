@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -23,6 +24,11 @@ import test_runner as T
 def symbols(elf):
     gcc = Path(os.environ.get("RISCV_GCC_DIR", r"E:\FPGA\toolchain\riscv-gcc"))
     nm = gcc / "bin" / "riscv-none-elf-nm.exe"
+    if not nm.exists():
+        plain = gcc / "bin" / "riscv-none-elf-nm"
+        nm = plain if plain.exists() else Path(shutil.which("riscv-none-elf-nm") or "")
+    if not nm or not Path(nm).exists():
+        raise FileNotFoundError("riscv-none-elf-nm")
     result = subprocess.check_output([str(nm), str(elf)], text=True)
     return {line.split()[2]: int(line.split()[0], 16)
             for line in result.splitlines() if len(line.split()) == 3}

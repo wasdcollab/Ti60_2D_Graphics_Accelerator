@@ -7,7 +7,7 @@ module tb_bgm_flash_spi;
     wire [31:0] rd;
     wire start, cs, busy, sclk, mosi;
     wire [7:0] tx, rx;
-    wire [13:0] eb_count;
+    wire [14:0] eb_count;
     wire motion;
     reg pad_clk=0, pad_mosi=0, pad_cs=1, miso_reg=0;
     reg [7:0] miso_byte=0, sent=0, received=0;
@@ -82,6 +82,19 @@ module tb_bgm_flash_spi;
             write_reg(16'h120,32'hA0000000|((i&8191)<<16)|((i&8192)<<1));
             if(eb_count!==i || motion!==1) $fatal(1,"motion count loss at %0d",i);
         end
+        begin
+            integer hi;
+            integer samples[0:5];
+            samples[0]=16383; samples[1]=16384; samples[2]=20000;
+            samples[3]=20480; samples[4]=32767; samples[5]=0;
+            for(hi=0;hi<6;hi=hi+1) begin
+                i=samples[hi];
+                write_reg(16'h120,32'h80000000|((i&8191)<<16)|((i&24576)<<1));
+                if(eb_count!==i[14:0] || motion!==0) $fatal(1,"15-bit count alias at %0d got %0d",i,eb_count);
+                write_reg(16'h120,32'hA0000000|((i&8191)<<16)|((i&24576)<<1));
+                if(eb_count!==i[14:0] || motion!==1) $fatal(1,"15-bit motion loss at %0d got %0d",i,eb_count);
+            end
+        end
         for(n=0;n<4;n=n+1) begin
             write_reg(16'h140,0);
             transfer(3); transfer(8'h20); transfer(n); transfer(8'hF8);
@@ -95,7 +108,7 @@ module tb_bgm_flash_spi;
         write_reg(16'h140,0);write_reg(16'h13c,3);
         write_reg(16'h140,1);repeat(3) @(negedge clk);
         if(busy || sclk) $fatal(1,"CS abort failed");
-        $display("PASS: SPI read 1024 bytes, registered IO pads, 24-bit addresses, CS abort; APB counts 8190..10240 with motion on/off");
+        $display("PASS: SPI read 1024 bytes, registered IO pads, 24-bit addresses, CS abort; APB counts 8190..10240 and 16383..32767 with motion on/off");
         $finish;
     end
     initial begin #5000000;$fatal(1,"test timeout");end

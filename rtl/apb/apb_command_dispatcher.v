@@ -135,7 +135,7 @@ module apb_command_dispatcher #(
     input wire [7:0] flash_rx,
     output reg bucket_start, bucket_clear_req, bucket_motion_en, bucket_buffer_sel,
     output reg [9:0] bucket_pb_count,
-    output reg [13:0] bucket_eb_count,
+    output reg [14:0] bucket_eb_count,
     output reg [31:0] bucket_player_xy,
     input wire bucket_busy, bucket_done, bucket_fault,
     input wire [15:0] bucket_drop_count, bucket_eb_live, bucket_eb_cand,
@@ -333,7 +333,7 @@ module apb_command_dispatcher #(
             bucket_motion_en     <= 1'b0;
             bucket_buffer_sel    <= 1'b0;
             bucket_pb_count      <= 10'd0;
-            bucket_eb_count      <= 14'd0;
+            bucket_eb_count      <= 15'd0;
             bucket_player_xy     <= 32'h0200_02AB;
             hb_we                <= 1'b0;
             hb_val               <= 8'd0;
@@ -366,7 +366,9 @@ module apb_command_dispatcher #(
                 bucket_motion_en  <= apb_pwdata[29];
                 bucket_buffer_sel <= apb_pwdata[0];
                 bucket_pb_count   <= apb_pwdata[13:4];
-                bucket_eb_count   <= {apb_pwdata[14],apb_pwdata[28:16]};
+                // count[14:13] lives in [15:14]; count[12:0] lives in [28:16].
+                // Bit 29 stays motion and [13:4] stays the player-bullet count.
+                bucket_eb_count   <= {apb_pwdata[15:14],apb_pwdata[28:16]};
             end
             if (apb_write && apb_paddr == 16'h0124) begin
                 bucket_player_xy  <= apb_pwdata;

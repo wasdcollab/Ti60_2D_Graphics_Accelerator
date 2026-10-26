@@ -109,6 +109,12 @@ SOURCES = [
 CFLAGS = [
     "-march=rv32im", "-mabi=ilp32",
     "-Oz",
+    # RISC-V prologue/epilogue calls into libgcc. Ubuntu gcc-riscv64-unknown-elf
+    # 13.2 emits about 1.7 KB more than the laptop xPack that last fit this
+    # image (margin was tens of bytes under 0xFD00). save-restore brings 13.2
+    # back under the on-chip RAM limit and leaves the same headroom on xPack
+    # 13.4 / 15.2. No C function in this image is an interrupt handler.
+    "-msave-restore",
     "-flto",
     "-ffreestanding", "-fno-builtin", "-fno-common",
     "-ffunction-sections", "-fdata-sections",

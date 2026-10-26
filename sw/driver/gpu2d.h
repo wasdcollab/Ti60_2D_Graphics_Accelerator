@@ -24,6 +24,10 @@ extern "C" {
 /* Base address of the BitBlt APB3 peripheral (SoC APB slave 0) */
 #define GPU2D_BASE_ADDR         0xF8100000UL
 #define GPU2D_REG_BUCKET_ACCEL  (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x120))
+/* Enemy-bullet count is 15 bits on APB 0x120. [28:16] holds count[12:0] and
+ * [15:14] holds count[14:13]. Bit 31 is start, bit 30 clears the ledger,
+ * bit 29 is motion, [13:4] is the player-bullet count, bit 0 selects the buffer. */
+#define GPU2D_BUCKET_EB(n) ((((uint32_t)(n) & 0x1FFFu) << 16) | (((uint32_t)(n) & 0x6000u) << 1))
 #define GPU2D_REG_BUCKET_CFG    (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x124))
 #define GPU2D_REG_BUCKET_INFO   (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x128))
 #define GPU2D_REG_BUCKET_CYCLES (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x12C))

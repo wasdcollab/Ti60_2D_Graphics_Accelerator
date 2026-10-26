@@ -36,7 +36,7 @@ def run(vm, control):
         return (-q if dy < 0 else q) & 15
 
     pools = [(0x01620000, range(min((control >> 4) & 1023, 512)), True),
-             (0x01675400, range(min(((control >> 16) & 8191) | ((control & 16384) >> 1), FRONT)), False),
+             (0x01675400, range(min(((control >> 16) & 0x1FFF) | ((control & 0xC000) >> 1), FRONT)), False),
              (0x01675400, range(FRONT, CAPACITY), False)]
     for base, indices, pb in pools:
         for i in indices:

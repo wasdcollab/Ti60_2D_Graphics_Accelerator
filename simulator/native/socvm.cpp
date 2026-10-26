@@ -3,6 +3,7 @@
 
 #include "socvm.h"
 
+#include <cmath>
 #include <cstdio>
 
 namespace socvm {
@@ -232,7 +233,7 @@ uint32_t SapphireSoCVM::load(uint32_t addr, int size, bool sgn) {
 
     if (addr == APB_BASE + 0x120) return bucket_status;
     if (addr == APB_BASE + 0x124) return bucket_player_xy;
-    if (addr == APB_BASE + 0x128) return 0; // functional model, not DDR timing
+    if (addr == APB_BASE + 0x128) return bucket_info;
     if (addr >= APB_BASE && addr < APB_BASE + 0x100)
         return params_get(addr - APB_BASE, 0);
 
@@ -248,15 +249,24 @@ uint32_t SapphireSoCVM::load(uint32_t addr, int size, bool sgn) {
 
 // ---------------------------------------------------------------------------
 void SapphireSoCVM::bucket_accel(uint32_t control) {
+    // Mirrors simulator/bucket_model.py: 1024 slots, stride 4096, 15-bit
+    // enemy count, pool 20480, motion writeback and the candidate list.
     if (control & 0x40000000u) {
         std::memset(bucket_used, 0, sizeof(bucket_used));
         return;
     }
     if (!(control & 0x80000000u)) return;
     const unsigned buffer = control & 1u;
-    const uint32_t table = 0x04800000u + buffer * (96u*4096u);
-    unsigned counts[96] = {}, drops = 0;
+    const uint32_t table = 0x04800000u + buffer * (96u * 4096u);
+    const unsigned EB_CAP = 20480u, FRONT = EB_CAP - 32u, SLOTS = 1024u;
+    const uint32_t cand_base = 0x01675400u + EB_CAP * 8u + (EB_CAP - 512u) * 2u;
+    unsigned counts[96] = {}, drops = 0, live = 0;
+    const bool motion = (control & 0x20000000u) != 0;
+    const unsigned eb = std::min((((control >> 16) & 0x1FFFu) | ((control & 0xC000u) >> 1)), FRONT);
+    const unsigned pb = std::min((control >> 4) & 1023u, 512u);
+    const int px = (int16_t)bucket_player_xy, py = (int16_t)(bucket_player_xy >> 16);
     const unsigned rows[27] = {647,647,710,742,742,742,710,647,647,647,677,676,676,676,677,647,832,481,832,768,768,768,768,768,768,768,768};
+    std::vector<unsigned> candidates;
     auto aim = [](int dx, int dy) {
         int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
         int q = 5*ay <= ax ? 0 : 3*ay <= 2*ax ? 1 : 2*ay <= 3*ax ? 2 : ay <= 5*ax ? 3 : 4;
@@ -264,40 +274,55 @@ void SapphireSoCVM::bucket_accel(uint32_t control) {
         if (dx < 0) q = 8-q;
         return (dy < 0 ? -q : q) & 15;
     };
-    auto emit = [&](uint32_t address, bool player) {
-        const auto *b = scratch.data() + address - SCRATCH_BASE;
-        int16_t x,y; std::memcpy(&x,b,2); std::memcpy(&y,b+2,2);
-        const int vx = (int8_t)b[4], vy = (int8_t)b[5];
-        const unsigned flags = b[6], color = b[7];
-        if (!(flags & 1) || (!player && (flags & 8))) return;
-        int slot, width, row, bx;
-        if (player) { slot = flags&2 ? 18 : 16; width=slot==18?13:7; row=y; bx=x; }
-        else if (flags & 64) { slot=17; width=16; row=y-8; bx=x-8; }
-        else {
-            if (flags & 4) slot=aim((int16_t)bucket_player_xy-x,(int16_t)(bucket_player_xy>>16)-y);
-            else if (color & 128) slot=(color>>3)&15;
-            else if (vx==0 && vy==0) slot=aim((int16_t)bucket_player_xy-x,(int16_t)(bucket_player_xy>>16)-y);
-            else slot=aim(vx,vy);
-            width=26; row=y-13; bx=x-13;
+    auto emit = [&](uint32_t address, unsigned index, bool player, bool tail) {
+        auto *b = scratch.data() + address - SCRATCH_BASE;
+        int16_t x, y; std::memcpy(&x, b, 2); std::memcpy(&y, b + 2, 2);
+        int vx = (int8_t)b[4], vy = (int8_t)b[5];
+        unsigned flags = b[6], color = b[7];
+        if (!(flags & 1)) return;
+        if (!player && motion && !tail && !(flags & 8)) {
+            x = (int16_t)(x + vx); y = (int16_t)(y + vy);
+            if (x < 182 || x > 1169 || y < 1 || y > 767) {
+                store(address + 6, flags & ~1u, 1);
+                return;
+            }
+            store(address, (uint16_t)x | ((uint32_t)(uint16_t)y << 16), 4);
+            if (std::abs(x - px) <= 15 && std::abs(y - py) <= 15) candidates.push_back(index);
         }
-        const int lo=std::max(row+(int)(rows[slot]&31),0);
-        const int hi=std::min(row+(int)(rows[slot]>>5),768);
-        if (lo>=hi) return;
-        for (int g=lo/8; g<=(hi-1)/8; ++g) {
-            if (counts[g]>=128) { ++drops; continue; }
-            const uint32_t word=((color&7)<<29)|(width<<24)|(slot<<17)|(((g*8-row+8)&63)<<11)|(bx&2047);
-            store(table+g*512+counts[g]++*4,word);
+        if (!player) ++live;
+        int slot, width, row, bx;
+        if (player) { slot = flags & 2 ? 18 : 16; width = slot == 18 ? 13 : 7; row = y; bx = x; }
+        else if (flags & 8) { slot = 19 + (aim(vx, vy) >> 1); width = 24; row = y - 12; bx = x - 12; }
+        else if (flags & 64) { slot = 17; width = 16; row = y - 8; bx = x - 8; }
+        else {
+            if (flags & 4 || !(vx || vy)) slot = aim(px - x, py - y);
+            else if (color & 128) slot = (color >> 3) & 15;
+            else slot = aim(vx, vy);
+            width = 26; row = y - 13; bx = x - 13;
+        }
+        const int lo = std::max(row + (int)(rows[slot] & 31), 0);
+        const int hi = std::min(row + (int)(rows[slot] >> 5), 768);
+        if (lo >= hi) return;
+        for (int g = lo / 8; g <= (hi - 1) / 8; ++g) {
+            if (counts[g] >= SLOTS) { ++drops; continue; }
+            const uint32_t word = ((color & 7) << 29) | (width << 24) | (slot << 17) | (((g * 8 - row + 8) & 63) << 11) | (bx & 2047);
+            store(table + g * 4096u + counts[g]++ * 4u, word);
         }
     };
-    for (unsigned i=0; i<std::min((control>>4)&1023u,512u); ++i) emit(0x01620000+i*8,true);
-    for (unsigned i=0; i<std::min((control>>16)&8191u,4064u); ++i) emit(0x01675400+i*8,false);
-    for (unsigned i=4064; i<4096; ++i) emit(0x01675400+i*8,false);
-    for (unsigned g=0; g<96; ++g) {
-        for (unsigned k=counts[g]; k<bucket_used[buffer][g]; ++k) store(table+g*512+k*4,0);
-        bucket_used[buffer][g]=(uint8_t)counts[g];
-        store(0x048C1000+buffer*96+g,counts[g],1);
+    for (unsigned i = 0; i < pb; ++i) emit(0x01620000u + i * 8u, i, true, false);
+    for (unsigned i = 0; i < eb; ++i) emit(0x01675400u + i * 8u, i, false, false);
+    for (unsigned i = FRONT; i < EB_CAP; ++i) emit(0x01675400u + i * 8u, i, false, true);
+    for (unsigned g = 0; g < 96; ++g) {
+        for (unsigned k = counts[g]; k < bucket_used[buffer][g]; ++k) store(table + g * 4096u + k * 4u, 0);
+        bucket_used[buffer][g] = (uint16_t)counts[g];
+        store(0x048C1000u + buffer * 192u + g * 2u, counts[g], 2);
     }
-    bucket_status=0x20000000u|std::min(drops,65535u);
+    if (motion) {
+        const unsigned n = std::min<unsigned>(candidates.size(), 512u);
+        for (unsigned i = 0; i < n; ++i) store(cand_base + i * 2u, candidates[i], 2);
+        bucket_info = (std::min<unsigned>(candidates.size(), 65535u) << 16) | (live & 65535u);
+    }
+    bucket_status = 0x20000000u | std::min(drops, 65535u);
 }
 
 void SapphireSoCVM::store(uint32_t addr, uint32_t val, int size) {

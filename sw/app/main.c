@@ -187,15 +187,16 @@ static const uint8_t eb_halo_a[BROLE_EB_HALO_N] = {
  *   SPD_STORM           the storm's shot speed.  3, so a shot that survives
  *                       the crossing stays on screen for ~250 frames - the
  *                       barrage is TOPPED UP, never rebuilt.
- *   STRESS_STORM_TARGET starts at the board-verified 192. Y cycles the
- *                       supplemental storm through 256/320/384/448/192.
- *                       The live population includes boss patterns, so it
- *                       can exceed this target. The HUD records row drops;
- *                       FPS alone cannot prove every bullet was displayed.
- *   STRESS_STORM_BUDGET how many shots one frame may add.  Trickling them in
- *                       is the point - 192 born together would all leave the
- *                       boss's muzzle as one ring, and this stage wants a
- *                       screen that is saturated everywhere.
+ *   STRESS_STORM_TARGET starts at the board-verified 192. Y adds 128 and
+ *                       wraps back to 192 once the target reaches
+ *                       STRESS_STORM_MAX (20000). The live population includes
+ *                       boss patterns, so it can exceed this target. The HUD
+ *                       records row drops; FPS alone cannot prove every
+ *                       bullet was displayed.
+ *   STRESS_STORM_BUDGET how many shots one frame may add. 224 is enough for
+ *                       births to replace a 20000-bullet field as it drains,
+ *                       and small enough that one frame does not dump the
+ *                       whole pool onto one scanline group.
  *   STRESS_FIRE_CD      frames between salvos of the three-stream shot.  The
  *                       card asks for ??????? and FIRE_CD_MIN is what ???
  *                       means in this build, so the stage uses it verbatim
@@ -204,8 +205,8 @@ static const uint8_t eb_halo_a[BROLE_EB_HALO_N] = {
 #define SPD_LOCKON_MISSILE   7
 #define SPD_STORM            3
 #define STRESS_STORM_TARGET  192
-#define STRESS_STORM_MAX     10000
-#define STRESS_STORM_BUDGET  96
+#define STRESS_STORM_MAX     20000
+#define STRESS_STORM_BUDGET  224
 #define STRESS_FIRE_CD       FIRE_CD_MIN
 
 /* Bullet sub-stepping: a fast player shot or a fast bullet would otherwise
@@ -2840,11 +2841,21 @@ static int count_active(void)
     return n;
 }
 
+/* The campaign pool walk never allocates past the historical 10240 front
+ * slots. Clearing all 20480 flag bytes inside game_init() adds tens of
+ * thousands of instructions while the workbench is still inside a fixed
+ * step slice, which moves every later frame relative to that input and
+ * makes the campaign boss kill the craft during the scripted pickup.
+ * The extended front run is cleared when the stress stage is entered.
+ * The orb tail sits at the new end of the pool, so it is cleared here. */
+#define EBULLET_CAMPAIGN_CLEAR 10240
+
 static void pool_clear(void)
 {
     for (int i = 0; i < MAX_ENEMIES; i++)  enemies[i].flags  = 0;
     for (int i = 0; i < MAX_PBULLETS; i++) pbullets[i].flags = 0;
-    for (int i = 0; i < MAX_EBULLETS; i++) ebullets[i].flags = 0;
+    for (int i = 0; i < EBULLET_CAMPAIGN_CLEAR; i++) ebullets[i].flags = 0;
+    for (int i = ORB_FIRST; i < MAX_EBULLETS; i++) ebullets[i].flags = 0;
     /* Emptied, so the walks can start from nothing again.  See the bound
      * comment above: only these two lines are allowed to LOWER it. */
     pb_hi = 0;
@@ -3041,7 +3052,8 @@ static void spawn_lance(int x, int y, int vx, int vy)
     bullet_t *b = alloc_ebullet();
     if (!b) return;
     int idx = (int)(b - ebullets);
-    eb_lances[eb_lance_count++] = (uint16_t)idx;
+    if (eb_lance_count < MM_LANCE_INDEX_MAX)
+        eb_lances[eb_lance_count++] = (uint16_t)idx;
     /* Born on the boss's muzzle, which can be close enough to a wall that
      * half the shaft would be drawn over the HUD gutter before the first
      * bounce could turn it back. */
@@ -3390,11 +3402,13 @@ static void laser_tick(uint8_t held)
  *
  * The budget cap is what keeps those three APART on screen.  Filling the pool
  *
- * SPAWN GEOMETRY (balanced mix): Ring/Cone/Wall balanced to equal on-screen
- * presence. In every 24 steps: 10 Ring (hue 5), 8 Cone (hue 3), 6 Wall (hue 4:
- * 3 left, 3 right). Per 48-shot cycle: 20 Ring, 16 Cone, 12 Wall (6 left, 6 right).
- * Interleaved pattern prevents clustering and disperses vertical row density across
- * 94 groups with coprime strides (29, 37, 31). */
+ * SPAWN GEOMETRY: the 24-step schedule is ring / cone / wall-left / wall-right,
+ * 25% each. Every shot is born on a coprime lattice of the 96 scanline groups
+ * (step * 5), and the walls drift one pixel vertically. A 26 px sprite covers
+ * about three groups, and 20000 of them only stay under the 1024-entry group
+ * cap when no band is allowed to sit still on the row it was born on. Wall X
+ * is the coprocessor's playfield (x in [182, 1169], bound_x in ti60_top.v);
+ * GAME_RIGHT-11 is already outside that box. */
 static uint16_t stress_storm_step;
 
 /* 24-entry pattern table: high 2 bits = kind (0:Ring, 1:Cone, 2:Wall L, 3:Wall R),
@@ -3407,17 +3421,6 @@ static const uint8_t storm_sched[24] = {
     3, 131, 67, 201,
     4, 132, 68, 202,
     5, 133, 69, 203
-};
-
-static const uint8_t storm_wall_g[128] = {
-     0, 45, 72,  7, 50, 76, 17, 54, 79, 23, 58, 84, 29, 62, 89, 36,
-    67, 95, 43, 71,  2, 48, 74, 14, 52, 78, 21, 56, 81, 26, 61, 87,
-    33, 65, 93, 40, 69,  0, 46, 73,  9, 50, 76, 18, 55, 79, 23, 59,
-    84, 30, 64, 91, 37, 68, 95, 43, 71,  4, 49, 75, 15, 53, 78, 21,
-    58, 82, 27, 62, 88, 34, 66, 93, 41, 70,  0, 47, 73, 11, 51, 77,
-    19, 56, 80, 24, 60, 86, 31, 64, 91, 38, 68, 95, 45, 72,  6, 49,
-    75, 17, 54, 79, 22, 58, 83, 28, 62, 89, 35, 66, 95, 42, 70,  2,
-    47, 74, 13, 52, 77, 20, 56, 81, 25, 60, 86, 32, 64, 91, 39, 69,
 };
 
 static void stress_storm_update(void)
@@ -3434,7 +3437,6 @@ static void stress_storm_update(void)
     int base_aim = aim_index(player_x - cx, player_y - cy);
 
     unsigned cur_step = (unsigned)stress_storm_step;
-    unsigned q = cur_step / 24u;
     unsigned rem = cur_step % 24u;
 
     for (int i = 0; i < room; i++) {
@@ -3442,37 +3444,33 @@ static void stress_storm_update(void)
         uint8_t entry = storm_sched[rem];
         unsigned kind = entry >> 6;
         unsigned sub = entry & 0x3Fu;
+        /* (step * 5) mod 96 visits every scanline group before it repeats. */
+        int y = (int)((((step * 5u) % 96u) << 3) + 4u);
 
         if (kind == 0u) {
-            /* Ring: emitted radially from the boss */
             int a = (int)((step * 2u) & 15u);
-            spawn_ebullet(cx, cy,
+            int x = GAME_LEFT + 8 + (int)((step * 17u) % 960u);
+            spawn_ebullet(x, y,
                           (dir16_x[a] * SPD_STORM) >> 4,
                           (dir16_y[a] * SPD_STORM) >> 4, 5);
         } else if (kind == 1u) {
-            /* Cone: targeted spray towards player */
             int off = ((int)(step & 12u) >> 2) - 1;   /* -1..+2 */
             int a = (base_aim + off + ((sub & 1u) ? 8 : 0)) & 15;
-            spawn_ebullet(cx, cy,
+            int x = GAME_LEFT + 8 + (int)(((step * 17u) + 400u) % 960u);
+            spawn_ebullet(x, y,
                           (dir16_x[a] * SPD_STORM) >> 4,
                           (dir16_y[a] * SPD_STORM) >> 4, 3);
         } else {
-            /* Wall: crossing shots from side walls covering full 768-height screen */
-            unsigned idx = q * 12u + sub;
-            uint8_t g = storm_wall_g[idx & 127u];
-            int y = (int)((g << 3) + 6u);
-            if (y > GAME_BOTTOM - 26) y = GAME_BOTTOM - 26;
+            int vy = (step & 1u) ? 1 : -1;
+            if ((unsigned)(y + vy - 1) > 766u) vy = -vy;
             if (kind == 2u)
-                spawn_ebullet(GAME_LEFT + 2, y, SPD_STORM, 0, 4);
+                spawn_ebullet(GAME_LEFT + 1, y, SPD_STORM, vy, 4);
             else
-                spawn_ebullet(GAME_RIGHT - 11, y, -SPD_STORM, 0, 4);
+                spawn_ebullet(GAME_RIGHT - 16, y, -SPD_STORM, vy, 4);
         }
 
         rem++;
-        if (rem == 24u) {
-            rem = 0;
-            q++;
-        }
+        if (rem == 24u) rem = 0;
     }
     stress_storm_step = (uint16_t)(stress_storm_step + (unsigned)room);
 }
@@ -4692,9 +4690,8 @@ static void bullets_update(void)
                 b->vx = (int8_t)bvx;
                 b->vy = (int8_t)bvy;
                 b->flags = flags;
-                if (_i < ORB_FIRST) {
+                if (_i < ORB_FIRST && eb_lance_count < MM_LANCE_INDEX_MAX)
                     eb_lances[eb_lance_count++] = (uint16_t)_i;
-                }
             }
 
             if (check_hit &&
@@ -6641,7 +6638,7 @@ static void __attribute__((used, retain, noinline)) bucket_build_start(unsigned 
     eb_motion_job = eb_motion_pending && is_stress_stage && !paused;
     eb_motion_pending = 0;
     GPU2D_REG_BUCKET_ACCEL = 0x80000000u | (eb_motion_job ? 0x20000000u : 0u)
-                           | ((uint32_t)(eb_hi & 0x1FFFu) << 16) | ((uint32_t)(eb_hi & 0x2000u) << 1)
+                           | GPU2D_BUCKET_EB(eb_hi)
                            | ((uint32_t)pb_hi << 4) | bt_buf;
     bt_started = GPU2D_REG_CORE_TICKS;
 }
@@ -7830,6 +7827,10 @@ static void stress_stage_init(void)
 {
     game_init();
     is_stress_stage = 1;
+    /* game_init() only wipes the campaign prefix and the orb tail. The storm
+     * allocates the whole front run, so the gap has to be empty too. */
+    for (int i = EBULLET_CAMPAIGN_CLEAR; i < ORB_FIRST; i++)
+        ebullets[i].flags = 0;
     stress_target = STRESS_STORM_TARGET;
     stress_prev_y = 0xFFu;    /* release the entry chord before changing load */
 
