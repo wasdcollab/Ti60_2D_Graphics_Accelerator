@@ -34,7 +34,6 @@ static const uint8_t r_reimu_0[] = {
 33,67,33,163,1,128,1,101,1,32,1,69,224,19,0,227,9,0,65,128,8,101,1,32,
 97,224,20,0,97,32,33,224,41,0,1,224,40,0,
 };
-static const uint32_t p_reimu_1[] = {0x00FF00FFu,0x00000000u,0x00CA1515u,0x00FFFFFFu,0x001F1E1Eu,0x00F6E0C8u,0x00E3ED03u,0x005C3000u,0x001F1B2Du};
 static const uint8_t r_reimu_1[] = {
 224,133,0,225,8,0,224,12,0,225,12,0,224,12,0,97,66,3,66,33,224,9,0,33,
 3,226,11,0,97,160,65,130,3,98,33,128,97,2,3,226,16,0,1,34,33,226,8,0,
@@ -69,7 +68,6 @@ static const uint8_t r_reimu_1[] = {
 133,1,224,17,0,33,35,65,131,33,96,1,101,32,1,69,1,224,20,0,227,8,0,65,
 128,8,1,69,32,97,224,22,0,65,32,33,224,83,0,
 };
-static const uint32_t p_reimu_2[] = {0x00FF00FFu,0x00000000u,0x00CA1515u,0x00FFFFFFu,0x001F1E1Eu,0x00F6E0C8u,0x00E3ED03u,0x005C3000u,0x001F1B2Du};
 static const uint8_t r_reimu_2[] = {
 224,131,0,225,8,0,224,14,0,225,11,0,224,12,0,97,34,35,66,1,224,11,0,33,
 3,226,10,0,97,192,33,98,35,98,1,192,97,2,3,226,15,0,33,34,1,226,8,0,
@@ -300,38 +298,17 @@ static const uint8_t r_bullet_0[] = {
 225,11,0,34,161,34,161,34,225,27,0,0,161,0,
 };
 static const uint32_t p_bullet_1[] = {0x00FF00FFu,0x005AFFA0u,0x00FFFFFFu};
-static const uint8_t r_bullet_1[] = {
-225,11,0,34,161,34,161,34,225,27,0,0,161,0,
-};
 static const uint32_t p_bullet_2[] = {0x00FF00FFu,0x006EA0FFu,0x00FFFFFFu};
-static const uint8_t r_bullet_2[] = {
-225,11,0,34,161,34,161,34,225,27,0,0,161,0,
-};
 static const uint32_t p_bullet_3[] = {0x00FF00FFu,0x00FFEB64u,0x00FFFFFFu};
-static const uint8_t r_bullet_3[] = {
-225,11,0,34,161,34,161,34,225,27,0,0,161,0,
-};
 static const uint32_t p_bullet_4[] = {0x00FF00FFu,0x00EB78FFu,0x00FFFFFFu};
-static const uint8_t r_bullet_4[] = {
-225,11,0,34,161,34,161,34,225,27,0,0,161,0,
-};
 static const uint32_t p_bullet_5[] = {0x00FF00FFu,0x005AEBFFu,0x00FFFFFFu};
-static const uint8_t r_bullet_5[] = {
-225,11,0,34,161,34,161,34,225,27,0,0,161,0,
-};
 static const uint32_t p_bullet_6[] = {0x00FF00FFu,0x00FFAA4Bu,0x00FFFFFFu};
-static const uint8_t r_bullet_6[] = {
-225,11,0,34,161,34,161,34,225,27,0,0,161,0,
-};
 static const uint32_t p_bullet_7[] = {0x00FF00FFu,0x00F5F5FFu,0x00FFFFFFu};
-static const uint8_t r_bullet_7[] = {
-225,11,0,34,161,34,161,34,225,27,0,0,161,0,
-};
 const visual_asset_t visual_assets[] = {
 {p_reimu_0,r_reimu_0,758u,0x01610000u,48,48,1},
-{p_reimu_1,r_reimu_1,759u,0x01612400u,48,48,1},
-{p_reimu_2,r_reimu_2,749u,0x01614800u,48,48,1},
-{p_reimu_1,r_reimu_1,759u,0x01616C00u,48,48,1},
+{p_reimu_0,r_reimu_1,759u,0x01612400u,48,48,1},
+{p_reimu_0,r_reimu_2,749u,0x01614800u,48,48,1},
+{p_reimu_0,r_reimu_1,759u,0x01616C00u,48,48,1},
 {p_fairy,r_fairy,195u,0x01606C00u,24,24,1},
 {p_shard,r_shard,262u,0x01607500u,24,24,1},
 {p_boss,r_boss,1229u,0x01608000u,64,64,1},
@@ -345,13 +322,13 @@ const visual_asset_t visual_assets[] = {
 {p_burst_2,r_burst_2,75u,0x018B3000u,32,32,1},
 {p_burst_3,r_burst_3,151u,0x018B4000u,32,32,1},
 {p_bullet_0,r_bullet_0,14u,0x018B5000u,8,8,1},
-{p_bullet_1,r_bullet_1,14u,0x018B5100u,8,8,1},
-{p_bullet_2,r_bullet_2,14u,0x018B5200u,8,8,1},
-{p_bullet_3,r_bullet_3,14u,0x018B5300u,8,8,1},
-{p_bullet_4,r_bullet_4,14u,0x018B5400u,8,8,1},
-{p_bullet_5,r_bullet_5,14u,0x018B5500u,8,8,1},
-{p_bullet_6,r_bullet_6,14u,0x018B5600u,8,8,1},
-{p_bullet_7,r_bullet_7,14u,0x018B5700u,8,8,1},
+{p_bullet_1,r_bullet_0,14u,0x018B5100u,8,8,1},
+{p_bullet_2,r_bullet_0,14u,0x018B5200u,8,8,1},
+{p_bullet_3,r_bullet_0,14u,0x018B5300u,8,8,1},
+{p_bullet_4,r_bullet_0,14u,0x018B5400u,8,8,1},
+{p_bullet_5,r_bullet_0,14u,0x018B5500u,8,8,1},
+{p_bullet_6,r_bullet_0,14u,0x018B5600u,8,8,1},
+{p_bullet_7,r_bullet_0,14u,0x018B5700u,8,8,1},
 {p_reimu_0,r_reimu_0,758u,0x01CA8000u,48,48,2},
 {p_reimu_0,r_reimu_0,758u,0x01CB1000u,48,48,3},
 };

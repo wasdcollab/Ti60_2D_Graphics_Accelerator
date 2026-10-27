@@ -206,6 +206,10 @@ def build():
     # it at boot (reimu_bob_build) instead of carrying a second 48x48 stream.
     shared = {'reimu_hud_small': 'reimu_0', 'reimu_hud_large': 'reimu_0',
               'reimu_3': 'reimu_1'}
+    # Identical palette words or identical RLE bytes are emitted once.  The
+    # three Reimu poses share one 9-colour palette, and the eight 8x8 bullets
+    # share one 14-byte run (only the middle colour changes).  Pointing the
+    # later assets at the first copy does not change a decoded pixel.
     # laser_glow is the one asset whose pixels the firmware does NOT take from
     # this stream: laser_glow_build() (sw/app/main.c) fills all 768 rows of it
     # at boot and overwrites row 0.  This used to be an empty set, so every
@@ -218,19 +222,36 @@ def build():
         # the firmware, so the branch that used to give it 8 tones is gone.
         # Measured when it existed: 8 -> 4118 B, 4 -> 4099 B.
         return 32
+    pal_owner = {}
+    rle_owner = {}
+    pal_sym = {}
+    rle_sym = {}
     for idx, (name, im, addr, scale) in enumerate(assets):
         im.save(OUT / (name+'.png'))
         cols, runs = quantize(im, color_limit(name), name == 'laser_glow')
+        encoded = 0
         if name not in shared:
-            body += ['static const uint32_t p_%s[] = {%s};'%(name, ','.join('0x%08Xu'%c for c in cols)),
-                     'static const uint8_t r_%s[] = {'%name]
-            body += [','.join(str(r) for r in runs[j:j+24])+',' for j in range(0,len(runs),24)]
-            body += ['};']
+            pkey, rkey = tuple(cols), tuple(runs)
+            if pkey not in pal_owner:
+                pal_owner[pkey] = name
+                body += ['static const uint32_t p_%s[] = {%s};'%(name, ','.join('0x%08Xu'%c for c in cols))]
+                encoded += 4*len(cols)
+            if rkey not in rle_owner:
+                rle_owner[rkey] = name
+                body += ['static const uint8_t r_%s[] = {'%name]
+                body += [','.join(str(r) for r in runs[j:j+24])+',' for j in range(0,len(runs),24)]
+                body += ['};']
+                encoded += len(runs)
+            pal_sym[name] = pal_owner[pkey]
+            rle_sym[name] = rle_owner[rkey]
         header += ['#define ART_%s %d'%(name.upper(), idx)]
         meta.append(dict(name=name,dst=addr,width=im.width*scale,height=im.height*scale,
                          bytes=4*im.width*im.height*scale*scale,
-                         encoded_bytes=0 if name in shared else 4*len(cols)+len(runs),
-                         palette_colors=color_limit(name), shared=shared.get(name),
+                         encoded_bytes=encoded,
+                         palette_colors=color_limit(name),
+                         shared=shared.get(name),
+                         palette=None if name in shared else pal_sym[name],
+                         rle=None if name in shared else rle_sym[name],
                          runtime_overlay=name in runtime_overlay))
     body += ['const visual_asset_t visual_assets[] = {']
     # A shared asset points at another one's stream, so it must also take that
@@ -245,7 +266,7 @@ def build():
     for n, im, a, s in assets:
         src = shared.get(n, n)
         body += ['{p_%s,r_%s,%du,0x%08Xu,%d,%d,%d},'
-                 % (src, src, stream_words(src), a,
+                 % (pal_sym[src], rle_sym[src], stream_words(src), a,
                     im.width, im.height, s)]
     body += ['};']
     header += ['#define ART_COUNT %d'%len(assets), 'extern const visual_asset_t visual_assets[ART_COUNT];', '#endif']
