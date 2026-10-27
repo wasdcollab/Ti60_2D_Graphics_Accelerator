@@ -76,19 +76,23 @@ enum {
      * 两个角色的 alpha 不同（190 / BPAL_ADD），于是同一个弹的前半段走乘法
      * alpha、后半段走加法。两者都不随色相变，见 brole_color()。 */
     BROLE_MS_BODY  = 27,    /* 弹体：乘法 alpha，透出背后的雪山 */
-    BROLE_MS_TRAIL = 28     /* 拖尾：加法，亮到过曝 */
+    BROLE_MS_TRAIL = 28,    /* 拖尾：加法，亮到过曝 */
+    /* 敌弹翼片。角色 1/2 是白尖、霓虹，自机弹和大玉也在用，不能改它们的
+     * alpha。31 是 5 位角色号里还空着的一格，只标在敌弹翼片上。 */
+    BROLE_EB_WING  = 31
 };
 #define BROLE_EB_HALO_N  18u                                       /* 实测 18 级 */
-/* 26 -> 28：27/28 原本就是空的（角色位 0..31，用到 26）。 */
-#define BROLE_MAX        30u
+/* 26 -> 28：27/28 原本就是空的（角色位 0..31，用到 26）。长枪占 29/30，
+ * 翼片占 31。 */
+#define BROLE_MAX        31u
 #define BPAL_PAGE        32u                                       /* 色相页大小 */
+#define EB_WING_ALPHA    210u   /* 翼片乘法 alpha；白尖和电脊仍是 255 */
 
-/* 敌弹光晕那 18 级的 a。公式是 a = 180 - 7*dist，dist 从 1 到 20 本该有 20 级，
- * 但 13x13 的整数网格上 t16 - w_core 取不到 96 和 68 这两个值：在真实固件
- * 数据上数出来就是下面这 18 个（scratch/recon_color_split.py）。 */
+/* 敌弹光晕那 18 级的 a。原先是 13x13 网格上实测的 173..40。满屏加法会叠到
+ * 发白，这里按约 60% 压暗，级距仍严格递减，扫描端的选级比较不用改。 */
 static const uint8_t eb_halo_a[BROLE_EB_HALO_N] = {
-    173u, 166u, 159u, 152u, 145u, 138u, 131u, 124u, 117u,
-    110u, 103u,  89u,  82u,  75u,  61u,  54u,  47u,  40u
+    104u, 100u,  95u,  91u,  87u,  83u,  79u,  74u,  70u,
+     66u,  62u,  53u,  49u,  45u,  37u,  32u,  28u,  24u
 };
 
 /* ---- tile store 里的 slot 号 ---------------------------------------------
@@ -2735,7 +2739,10 @@ static void ebullet_dirtile_build(void)
                 if (l <= 144 && l >= -120) {
                     int w_core = (l >= 0) ? ((68 * (144 - l)) / 144)
                                           : ((68 * (120 + l)) / 120);
-                    int w_halo = w_core + 40;
+                    /* +20, not +40: the outer band was as wide as the body and
+                     * a full screen of it read as one sheet. 20 is also the
+                     * span the tier formula below was written for. */
+                    int w_halo = w_core + 20;
 
                     if (t <= 8 && l >= 56) {
                         /* Needle-sharp pure white hot tip (micro pinpoint spark) */
@@ -2744,15 +2751,14 @@ static void ebullet_dirtile_build(void)
                         /* Blazing electric spine along the trajectory */
                         role = BROLE_EB_CORE;
                     } else if (t <= w_core) {
-                        /* Saturated neon body/wings */
-                        role = BROLE_NEON;
-                    } else if (t <= w_halo) {
-                        /* Smooth feathered halo.  The tier is the first entry of
-                         * eb_halo_a that is no brighter than a: the table runs
-                         * brightest-first, and the old "equal" comparison no
-                         * longer holds - the formula's 20 steps reach values the
-                         * 13x13 grid never produced (96 and 68), and a 26-wide
-                         * bullet lands between two of them as well. */
+                        /* Wings only.  Role 31, so this alpha does not touch
+                         * the shared neon role (player shots and orbs). */
+                        role = BROLE_EB_WING;
+                    } else if (t <= w_halo && (((unsigned)x ^ (unsigned)y) & 1u)) {
+                        /* Feathered halo, checkerboard holes.  A zero role
+                         * does not write the line store, so the bullet drawn
+                         * earlier stays visible through the hole.  The core
+                         * above is never punched. */
                         uint32_t a = 180u - ((uint32_t)(t - w_core) * 140u) / 20u;
                         unsigned k = 0u;
                         while (k + 1u < BROLE_EB_HALO_N && eb_halo_a[k] > a) k++;
@@ -6098,6 +6104,8 @@ static uint32_t brole_color(unsigned role, unsigned hue)
         return 0x0066DDFFu;     /* 亮青：alpha 190，乘法 alpha，透出背景 */
     case BROLE_MS_TRAIL:
         return 0x00FF9020u;     /* 橙：alpha 254 = BPAL_ADD，加法会往黄白过曝 */
+    case BROLE_EB_WING:
+        return n;               /* 与霓虹同色；alpha 在下面单独写成 210 */
     default:
         break;
     }
@@ -6392,6 +6400,7 @@ static void bullet_store_build(void)
             if (r == (uint32_t)BROLE_NONE)          a = 0u;
             else if (r == (uint32_t)BROLE_MS_BODY)  a = 190u;
             else if (r == (uint32_t)BROLE_MS_TRAIL) a = BPAL_ADD;
+            else if (r == (uint32_t)BROLE_EB_WING)  a = EB_WING_ALPHA;
             /* The 18 enemy halo tiers.  Written as a range off BROLE_EB_HALO
              * and its count rather than as the literal 9..26, so that adding
              * or removing a tier cannot silently leave the new one opaque -
@@ -7485,6 +7494,12 @@ static uint8_t bloom_style_sel = 0u;
  * the power-on default and the tuning cannot drift apart. */
 #define BLOOM_THRESHOLD  120u
 #define BLOOM_INTENSITY  255u
+/* Pressure stage only.  Every visible bullet pixel is a full bloom emitter,
+ * so 255 turns a 20000-bullet field into one white veil.  140 keeps the
+ * tight kernel and lets the cores separate.  Campaign frames stay at 255. */
+#define BLOOM_INTENSITY_STRESS 140u
+#define bloom_intensity() \
+    ((uint8_t)(is_stress_stage ? BLOOM_INTENSITY_STRESS : BLOOM_INTENSITY))
 static uint8_t bloom_fx_on = 1u;
 
 static const char * const settings_labels[SET_ITEMS] = {
@@ -7632,7 +7647,7 @@ static int settings_input(gamepad_state_t *pad)
             break;
         case 6:
             bloom_fx_on ^= 1u;
-            gpu2d_set_bloom(bloom_fx_on, BLOOM_THRESHOLD, BLOOM_INTENSITY);
+            gpu2d_set_bloom(bloom_fx_on, BLOOM_THRESHOLD, bloom_intensity());
             break;
         default: return ACT_STAY;
         }
@@ -7739,7 +7754,7 @@ static void game_init(void)
     /* Task 05 & Task 07: Scanout Bloom for zero-bandwidth glow on all bullets and lasers.
      * Threshold 120 and intensity 255 with emissive extraction ensures rich radiant halos
      * on bullets, lasers, and sparks with zero background fogging/graying. */
-    gpu2d_set_bloom(bloom_fx_on, BLOOM_THRESHOLD, BLOOM_INTENSITY);
+    gpu2d_set_bloom(bloom_fx_on, BLOOM_THRESHOLD, bloom_intensity());
     gpu2d_set_bloom_style(bloom_style_sel);
     gpu2d_set_color_matrix(COLOR_MATRIX_BYPASS, 0);
     gpu2d_set_alpha(1, 255);
@@ -7827,6 +7842,11 @@ static void stress_stage_init(void)
 {
     game_init();
     is_stress_stage = 1;
+    /* game_init() ran while the flag was still clear, so it armed the
+     * campaign intensity.  Put the stress value on now and leave the kernel
+     * on the tight style. */
+    gpu2d_set_bloom(bloom_fx_on, BLOOM_THRESHOLD, BLOOM_INTENSITY_STRESS);
+    gpu2d_set_bloom_style(0u);
     /* game_init() only wipes the campaign prefix and the orb tail. The storm
      * allocates the whole front run, so the gap has to be empty too. */
     for (int i = EBULLET_CAMPAIGN_CLEAR; i < ORB_FIRST; i++)

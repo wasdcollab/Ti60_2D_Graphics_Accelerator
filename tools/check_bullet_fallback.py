@@ -19,7 +19,11 @@ def main():
     assert max(tiles) <= 31, "tile roles no longer fit the five-bit RAM contract"
     for hue in range(8):
         for role in (1, 2, 3):
-            assert pal[hue * 32 + role] >> 24 == 255, "enemy body must be opaque"
+            assert pal[hue * 32 + role] >> 24 == 255, "tip and spine stay opaque"
+        wing = pal[hue * 32 + 31]
+        neon = pal[hue * 32 + 2]
+        assert wing >> 24 == 210, "enemy wings blend at 210"
+        assert (wing & 0xFFFFFF) == (neon & 0xFFFFFF), "wings share the neon hue"
         for role in range(9, 27):
             assert pal[hue * 32 + role] >> 24 == 254, "enemy halo must add"
     rng = random.Random(20261010)
@@ -47,7 +51,10 @@ def main():
         ready = case % 13 != 0
         mx = (1 << 31) | 709 | (712 << 11) if case % 4 == 0 else 0
         my = 2 | (5 << 11)
-        scratch = [0] * (256 + 128)
+        # One group is MM_BUCKET_STRIDE bytes (1024 slots).  The old 384-word
+        # buffer made Scanout.bucket_ok false, so the model drew the backdrop
+        # and every overlapping bullet failed the compare.
+        scratch = [0] * (256 + 1024)
         for idx, entry in zip((0, 126, 127), entries):
             scratch[256 + idx] = entry
         params = {0xF0: SCRATCH_BASE + 1024 if ready else 0,
