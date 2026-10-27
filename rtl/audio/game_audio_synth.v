@@ -26,68 +26,93 @@ module game_audio_synth #(
     localparam [3:0] EVT_BOSS  = 4'd4;
     localparam [3:0] EVT_HIT   = 4'd5;
 
-    reg [23:0] melody_phase, bass_phase, sfx_phase;
-    reg [15:0] step_timer;
-    reg [3:0]  step;
+    // Melody, bass and the step counter exist only for the original chiptune
+    // (PCM_BGM==0).  The shipping top streams BGM (PCM_BGM==2) and the PCM
+    // bench uses the ROM (PCM_BGM==1); bgm_wave never reads those accumulators
+    // in either case, so they are not elaborated.  Every armed event plays
+    // the SFX ROM: nothing writes a nonzero square-wave increment or selects
+    // the noise LFSR, so that oscillator is not in the netlist either.
     reg [3:0]  pending_event;
     reg [15:0] sfx_left;
-    reg [23:0] sfx_inc;
-    reg        sfx_noise_mode;
     reg        sfx_rom_mode;
     reg        sfx_rom_boost;
-    reg [15:0] noise_lfsr;
     reg [12:0] sfx_rom_addr, sfx_rom_left;
     reg signed [7:0] sfx_rom_sample;
     reg [4:0] sfx_rom_div;
 reg [7:0] sfx_rom [0:8191];
     initial $readmemh("rtl/audio/sfx_rom.hex", sfx_rom);
 
-    function [23:0] melody_inc;
-        input [3:0] n;
-        begin
-            // 16-step original chiptune loop, C4..D5 at 48.828125 ksample/s.
-            case (n)
-                4'd0:  melody_inc = 24'd180224; // C5
-                4'd1:  melody_inc = 24'd151684; // A4
-                4'd2:  melody_inc = 24'd135086; // G4
-                4'd3:  melody_inc = 24'd151684;
-                4'd4:  melody_inc = 24'd202316; // D5
-                4'd5:  melody_inc = 24'd180224;
-                4'd6:  melody_inc = 24'd151684;
-                4'd7:  melody_inc = 24'd135086;
-                4'd8:  melody_inc = 24'd113568; // E4
-                4'd9:  melody_inc = 24'd135086;
-                4'd10: melody_inc = 24'd151684;
-                4'd11: melody_inc = 24'd180224;
-                4'd12: melody_inc = 24'd151684;
-                4'd13: melody_inc = 24'd135086;
-                4'd14: melody_inc = 24'd113568;
-                default: melody_inc = 24'd101158; // D4
-            endcase
+    wire signed [15:0] melody_wave;
+    wire signed [15:0] bass_wave;
+    generate
+        if (PCM_BGM == 0) begin : g_chiptune
+            reg [23:0] melody_phase, bass_phase;
+            reg [15:0] step_timer;
+            reg [3:0]  step;
+            function [23:0] melody_inc;
+                input [3:0] n;
+                begin
+                    // 16-step original chiptune loop, C4..D5 at 48.828125 ksample/s.
+                    case (n)
+                        4'd0:  melody_inc = 24'd180224; // C5
+                        4'd1:  melody_inc = 24'd151684; // A4
+                        4'd2:  melody_inc = 24'd135086; // G4
+                        4'd3:  melody_inc = 24'd151684;
+                        4'd4:  melody_inc = 24'd202316; // D5
+                        4'd5:  melody_inc = 24'd180224;
+                        4'd6:  melody_inc = 24'd151684;
+                        4'd7:  melody_inc = 24'd135086;
+                        4'd8:  melody_inc = 24'd113568; // E4
+                        4'd9:  melody_inc = 24'd135086;
+                        4'd10: melody_inc = 24'd151684;
+                        4'd11: melody_inc = 24'd180224;
+                        4'd12: melody_inc = 24'd151684;
+                        4'd13: melody_inc = 24'd135086;
+                        4'd14: melody_inc = 24'd113568;
+                        default: melody_inc = 24'd101158; // D4
+                    endcase
+                end
+            endfunction
+            function [23:0] bass_inc;
+                input [3:0] n;
+                begin
+                    case (n[3:2])
+                        2'd0: bass_inc = 24'd45056;  // C3
+                        2'd1: bass_inc = 24'd56784;  // E3
+                        2'd2: bass_inc = 24'd67543;  // G3
+                        default: bass_inc = 24'd75842; // A3
+                    endcase
+                end
+            endfunction
+            always @(posedge clk or negedge rst_n) begin
+                if (!rst_n) begin
+                    melody_phase <= 24'd0;
+                    bass_phase   <= 24'd0;
+                    step_timer   <= 16'd0;
+                    step         <= 4'd0;
+                end else if (sample_tick) begin
+                    melody_phase <= melody_phase + melody_inc(step);
+                    bass_phase   <= bass_phase + bass_inc(step);
+                    if (step_timer == 16'd5959) begin
+                        step_timer <= 16'd0;
+                        step <= step + 4'd1;
+                    end else begin
+                        step_timer <= step_timer + 16'd1;
+                    end
+                end
+            end
+            assign melody_wave = melody_phase[23] ? -16'sd2400 : 16'sd2400;
+            assign bass_wave   = bass_phase[23]   ? -16'sd1300 : 16'sd1300;
+        end else begin : g_no_chiptune
+            assign melody_wave = 16'sd0;
+            assign bass_wave   = 16'sd0;
         end
-    endfunction
-
-    function [23:0] bass_inc;
-        input [3:0] n;
-        begin
-            case (n[3:2])
-                2'd0: bass_inc = 24'd45056;  // C3
-                2'd1: bass_inc = 24'd56784;  // E3
-                2'd2: bass_inc = 24'd67543;  // G3
-                default: bass_inc = 24'd75842; // A3
-            endcase
-        end
-    endfunction
-
-    wire signed [15:0] melody_wave = melody_phase[23] ? -16'sd2400 : 16'sd2400;
-    wire signed [15:0] bass_wave   = bass_phase[23]   ? -16'sd1300 : 16'sd1300;
-    wire signed [15:0] noise_wave  = {{3{noise_lfsr[15]}}, noise_lfsr[15:3]};
+    endgenerate
     wire signed [15:0] rom_wave    = sfx_rom_boost ?
                                       {{1{sfx_rom_sample[7]}}, sfx_rom_sample, 7'b0} :
                                       {{2{sfx_rom_sample[7]}}, sfx_rom_sample, 6'b0};
-    wire signed [15:0] sfx_wave    = (sfx_left != 16'd0) ?
-                                      (sfx_rom_mode ? (sfx_rom_left != 13'd0 ? rom_wave : 16'sd0) : sfx_noise_mode ? noise_wave :
-                                       (sfx_phase[23] ? -16'sd7000 : 16'sd7000)) : 16'sd0;
+    wire signed [15:0] sfx_wave    = (sfx_left != 16'd0 && sfx_rom_mode &&
+                                       sfx_rom_left != 13'd0) ? rom_wave : 16'sd0;
     wire signed [15:0] pcm_bgm_wave;
     generate
         if (PCM_BGM == 1) begin : g_pcm_bgm
@@ -118,18 +143,10 @@ reg [7:0] sfx_rom [0:8191];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            melody_phase <= 24'd0;
-            bass_phase   <= 24'd0;
-            sfx_phase    <= 24'd0;
-            step_timer   <= 16'd0;
-            step         <= 4'd0;
             pending_event <= EVT_NONE;
             sfx_left     <= 16'd0;
-            sfx_inc      <= 24'd0;
-            sfx_noise_mode <= 1'b0;
             sfx_rom_mode   <= 1'b0;
             sfx_rom_boost  <= 1'b0;
-            noise_lfsr    <= 16'hA5C3;
             sfx_rom_addr  <= 13'd0;
             sfx_rom_left  <= 13'd0;
             sfx_rom_sample <= 8'sd0;
@@ -151,10 +168,6 @@ reg [7:0] sfx_rom [0:8191];
                     sample_right <= 16'sd0;
                 end
 
-                melody_phase <= melody_phase + melody_inc(step);
-                bass_phase   <= bass_phase + bass_inc(step);
-                sfx_phase    <= sfx_phase + sfx_inc;
-                noise_lfsr   <= {noise_lfsr[14:0], noise_lfsr[15] ^ noise_lfsr[13] ^ noise_lfsr[12] ^ noise_lfsr[10]};
                 if (sfx_rom_mode && sfx_rom_left != 13'd0) begin
                     if (sfx_rom_div == 5'd29) begin
                         sfx_rom_div <= 5'd0;
@@ -165,26 +178,18 @@ reg [7:0] sfx_rom [0:8191];
                         sfx_rom_div <= sfx_rom_div + 5'd1;
                     end
                 end
-                if (step_timer == 16'd5959) begin
-                    step_timer <= 16'd0;
-                    step <= step + 4'd1;
-                end else begin
-                    step_timer <= step_timer + 16'd1;
-                end
-
                 if (sfx_left != 16'd0)
                     sfx_left <= sfx_left - 16'd1;
 
                 if (pending_event != EVT_NONE) begin
                     case (pending_event)
-                        EVT_SHOT:  begin sfx_rom_addr <= SFX_SHOT_START;  sfx_rom_left <= SFX_SHOT_LEN;  sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b0; sfx_noise_mode <= 1'b0; end
-                        EVT_LASER: begin sfx_rom_addr <= SFX_LASER_START; sfx_rom_left <= SFX_LASER_LEN; sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; sfx_noise_mode <= 1'b0; end
-                        EVT_KILL:  begin sfx_rom_addr <= SFX_KILL_START;  sfx_rom_left <= SFX_KILL_LEN;  sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; sfx_noise_mode <= 1'b0; end
-                        EVT_BOSS:  begin sfx_rom_addr <= SFX_BOSS_START;  sfx_rom_left <= SFX_BOSS_LEN;  sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; sfx_noise_mode <= 1'b0; end
-                        EVT_HIT:   begin sfx_rom_addr <= SFX_HIT_START;   sfx_rom_left <= SFX_HIT_LEN;   sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; sfx_noise_mode <= 1'b0; end
-                        default:   begin sfx_inc <= 24'd0; sfx_left <= 16'd0; sfx_rom_mode <= 1'b0; sfx_rom_boost <= 1'b0; sfx_noise_mode <= 1'b0; end
+                        EVT_SHOT:  begin sfx_rom_addr <= SFX_SHOT_START;  sfx_rom_left <= SFX_SHOT_LEN;  sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b0; end
+                        EVT_LASER: begin sfx_rom_addr <= SFX_LASER_START; sfx_rom_left <= SFX_LASER_LEN; sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; end
+                        EVT_KILL:  begin sfx_rom_addr <= SFX_KILL_START;  sfx_rom_left <= SFX_KILL_LEN;  sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; end
+                        EVT_BOSS:  begin sfx_rom_addr <= SFX_BOSS_START;  sfx_rom_left <= SFX_BOSS_LEN;  sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; end
+                        EVT_HIT:   begin sfx_rom_addr <= SFX_HIT_START;   sfx_rom_left <= SFX_HIT_LEN;   sfx_rom_div <= 0; sfx_left <= 16'hffff; sfx_rom_mode <= 1'b1; sfx_rom_boost <= 1'b1; end
+                        default:   begin sfx_left <= 16'd0; sfx_rom_mode <= 1'b0; sfx_rom_boost <= 1'b0; end
                     endcase
-                    sfx_phase <= 24'd0;
                     pending_event <= EVT_NONE;
                 end
             end
