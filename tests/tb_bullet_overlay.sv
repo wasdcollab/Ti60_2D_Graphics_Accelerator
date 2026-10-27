@@ -381,6 +381,39 @@ module tb_bullet_overlay;
         $display("  enemy halo: role %0d at row %0d col %0d comes out ADDED",
                  hs_role, hs_row, hs_col);
 
+        // ---- 1e. enemy wings are role 31 at alpha 210; roles 1 and 2 stay
+        // opaque.  The wing used to be role 2, which player shots and orbs
+        // share, so a body alpha written there would have washed those out.
+        for (hue = 0; hue < 8; hue = hue + 1) begin
+            chk(pal[1 + hue*32][31:24] === 8'd255,
+                "role 1 stays opaque on every hue page");
+            chk(pal[2 + hue*32][31:24] === 8'd255,
+                "role 2 stays opaque on every hue page");
+            chk(pal[3 + hue*32][31:24] === 8'd255,
+                "the electric spine stays opaque on every hue page");
+            chk(pal[31 + hue*32][31:24] === 8'd210,
+                "role 31 blends at 210 on every hue page");
+            chk(pal[31 + hue*32][23:0] === pal[2 + hue*32][23:0],
+                "role 31 carries the same neon colour as role 2");
+        end
+        hs_role = -1;
+        for (row = 0; row < 26 && hs_role < 0; row = row + 1)
+            for (col = 0; col < 26 && hs_role < 0; col = col + 1)
+                if (tiles[tile_off(0) + row*32 + col] == 31) begin
+                    hs_role = 31;
+                    hs_row  = row;
+                    hs_col  = col;
+                end
+        chk(hs_role == 31, "sanity: the enemy tile holds a wing cell");
+        Y = 11'd0;
+        put_bucket_hue(820, hs_row, 0, 26, 4);
+        X = 12'd820 + hs_col; DE = 1'b1;
+        repeat (8) @(posedge clk);
+        chk(visible === 1'b1 && bullet_add === 1'b0 && alpha === 8'd210,
+            "an enemy wing pixel must blend at 210, not add or replace");
+        $display("  enemy wing: role 31 at row %0d col %0d blends at 210",
+                 hs_row, hs_col);
+
         // ---- 2. the range compare: one column each side must stay empty ---
         // Row 12, not row 0: tile 0 is a 26x26 enemy shape flying along +x, so
         // its middle row is the one that is actually full of pixels.  Row 0 of
