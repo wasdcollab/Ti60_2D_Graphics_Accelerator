@@ -1,2 +1,0 @@
-PASS alpha fade: 8192 pixels, alpha 0..255, global 255/70, key holes and stalls
-tests/tb_alpha_fade.sv:65: $finish called at 24700000 (1ps)

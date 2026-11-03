@@ -21,7 +21,7 @@ def snapshot(vm, sym, T):
     Assert exact agreement with the firmware's current ledger and DROP count.
     """
     occupied = []
-    for slot in range(27):
+    for slot in range(37):
         if slot < 16:
             base = T.mm_value("MM_EBULLET_DIRTILE") + slot * 832
             pitch, width, height = 32, 26, 26
@@ -32,7 +32,7 @@ def snapshot(vm, sym, T):
             base = T.mm_value(key)
         else:
             base = 14368 + (slot - 19) * 832
-            pitch, width, height = 32, 24, 26
+            pitch, width, height = 32, 26 if slot >= 29 else 16 if slot >= 27 else 24, 26
         if slot >= 19:
             live = [y for y in range(height) if any(vm.btile[base+y*pitch:base+y*pitch+width])]
         else:
@@ -40,12 +40,17 @@ def snapshot(vm, sym, T):
             live = [y for y in range(height)
                     if any(vm.scratch[off + y * pitch:off + y * pitch + width])]
         bounds = min(live), max(live) + 1
-        if slot >= 19:
+        if 19 <= slot < 27:
             assert 0 <= bounds[0] < bounds[1] <= 24
             bounds = (0, 24)
+        if slot >= 29: bounds = (0, 26)  # conservative spark/tail bounds
         packed = vm.load(sym["bt_tile_rows"] + slot * 2, 2)
-        assert bounds == (packed & 31, packed >> 5), (slot, bounds, packed)
-        occupied.append(bounds)
+        # The hardware row interval may conservatively include transparent
+        # padding (lances and glow tails do this deliberately). Demand must
+        # use that declared interval, while ensuring it clips no live texels.
+        declared = (packed & 31, packed >> 5)
+        assert declared[0] <= bounds[0] < bounds[1] <= declared[1], (slot, bounds, packed)
+        occupied.append(declared)
 
     rows, group = T.mm_value("MM_BUCKET_ROWS"), T.mm_value("MM_BUCKET_GROUP_ROWS")
     slots = T.mm_value("MM_BUCKET_SLOTS")
@@ -63,10 +68,16 @@ def snapshot(vm, sym, T):
                 continue
             if not enemy:
                 slot, top = (18 if flags & 2 else 16), y
+            elif flags & 128:
+                slot, top = (28 if color & 128 else 27), y - 8
             elif flags & 8:
                 slot, top = 19 + (aim_index(vx, vy) >> 1), y - 12
+            elif flags & 32:
+                slot, top = 29 + (aim_index(vx, vy) >> 1), y - 13
             elif flags & 64:
                 slot, top = 17, y - 8
+            elif color & 192 == 64:
+                slot, top = 29 + ((aim_index(px-x, py-y) if flags & 4 or vx == vy == 0 else aim_index(vx, vy)) >> 1), y - 13
             else:
                 slot = (aim_index(px - x, py - y) if flags & 4 or vx == vy == 0 else
                         (color >> 3) & 15 if color & 128 else aim_index(vx, vy))

@@ -1,2 +1,0 @@
-PASS write_guard RTL: stalled AW preserved, accepted write drains, B limits outstanding writes
-tests/tb_step3_write_guard.sv:27: $finish called at 371000 (1ps)

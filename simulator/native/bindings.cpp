@@ -60,6 +60,12 @@ PYBIND11_MODULE(_socvm, m) {
         .def("step", &SapphireSoCVM::step)
         .def("step_n", &SapphireSoCVM::step_n, py::arg("n"))
         .def("drain", &SapphireSoCVM::drain)
+        .def("load", [](SapphireSoCVM& s, uint32_t addr, int size) {
+            return s.load(addr, size, false);
+        }, py::arg("addr"), py::arg("size") = 4)
+        .def("store", [](SapphireSoCVM& s, uint32_t addr, uint32_t val, int size) {
+            s.store(addr, val, size);
+        }, py::arg("addr"), py::arg("val"), py::arg("size") = 4)
         .def("in_scratch", [](SapphireSoCVM& s, uint32_t a, uint64_t n) {
             return s.in_scratch(a, n);
         }, py::arg("addr"), py::arg("size") = 1)

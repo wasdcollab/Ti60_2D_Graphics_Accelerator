@@ -10,14 +10,14 @@ module video_dual_hud (
  output wire visible,
  output wire [23:0] rgb
 );
-wire right_half = x >= 640;
-wire [11:0] local_x = x - (right_half ? 12'd656 : 12'd16);
+wire right_half = x >= 684;
+wire [11:0] local_x = x - (right_half ? 12'd700 : 12'd16);
 wire [10:0] local_y = y - 11'd8;
 wire [3:0] cell_index = local_x[7:4];
 wire [3:0] row = local_y[4:1];
 wire [2:0] col = local_x[3:1];
 wire [7:0] fps = right_half ? fpga_fps_bcd : cpu_fps_bcd;
-assign visible = (y>=8 && y<32) && (right_half ? (x>=656 && x<848) : (x>=16 && x<192));
+assign visible = (y>=8 && y<32) && (right_half ? (x>=700 && x<892) : (x>=16 && x<192));
 reg [4:0] character;
 always @* begin
  character=14;

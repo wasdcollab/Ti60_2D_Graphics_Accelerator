@@ -1,0 +1,13 @@
+{
+  "boss": 3,
+  "skill": 2,
+  "name": "彼岸花开",
+  "density": 1.5,
+  "speed": 1,
+  "glow": true,
+  "auto": true,
+  "practice": true,
+  "hitbox": true,
+  "logic_hz": 75,
+  "preview_only": true
+}

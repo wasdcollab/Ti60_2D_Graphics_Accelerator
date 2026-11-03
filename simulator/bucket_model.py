@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 from mm import mm_eval
 
 CAPACITY = mm_eval('MM_EBULLET_COUNT')
-FRONT = CAPACITY - 32
+FRONT = CAPACITY - 128
 CAND_BASE = mm_eval('EB_CAND_LIST_BASE')
 
 
@@ -21,7 +21,7 @@ def run(vm, control):
     buf = control & 1
     table = 0x04800000 + buf*96*4096
     counts, drops, live, candidates = [0]*96, 0, 0, []
-    spans = [647,647,710,742,742,742,710,647,647,647,677,676,676,676,677,647,832,481,832] + [768]*8
+    spans = [647,647,710,742,742,742,710,647,647,647,677,676,676,676,677,647,832,481,832] + [768]*8 + [295,389] + [832]*8
     xy = vm.params.get(0x124, 0x020002AB)
     px, py = xy & 65535, xy >> 16
     motion = bool(control & 0x20000000)
@@ -44,7 +44,7 @@ def run(vm, control):
             x,y,vx,vy,flags,color = struct.unpack_from('<hhbbBB', vm.scratch, off)
             if not flags & 1:
                 continue
-            if not pb and motion and i < FRONT and not flags & 8:
+            if not pb and motion and i < FRONT and not flags & (8|32|128):
                 x = ((x+vx+32768) & 65535)-32768
                 y = ((y+vy+32768) & 65535)-32768
                 if not (182 <= x <= 1169 and 1 <= y <= 767):
@@ -58,10 +58,16 @@ def run(vm, control):
             if pb:
                 slot = 18 if flags & 2 else 16
                 width, row, bx = (13 if slot == 18 else 7), y, x
+            elif flags & 128:
+                slot, width, row, bx = (28 if color & 128 else 27), 16, y-8, x-8
             elif flags & 8:
                 slot, width, row, bx = 19 + (aim(vx, vy) >> 1), 24, y-12, x-12
+            elif flags & 32:
+                slot, width, row, bx = 29 + (aim(vx, vy) >> 1), 26, y-13, x-13
             elif flags & 64:
                 slot, width, row, bx = 17, 16, y-8, x-8
+            elif color & 192 == 64:
+                slot, width, row, bx = 29 + ((aim(px-x, py-y) if flags & 4 or not (vx or vy) else aim(vx, vy)) >> 1), 26, y-13, x-13
             else:
                 slot = aim(px-x, py-y) if flags & 4 or not (vx or vy) else ((color >> 3) & 15) if color & 128 else aim(vx, vy)
                 width, row, bx = 26, y-13, x-13

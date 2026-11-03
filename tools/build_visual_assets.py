@@ -280,6 +280,9 @@ def build():
     body += ['const uint8_t visual_font[95][8] = {']+['{'+','.join(map(str,row))+'},' for row in glyphs]+['};']
     (ROOT/'sw/app/visual_assets.h').write_text('\n'.join(header)+'\n',encoding='ascii')
     (ROOT/'sw/app/visual_assets.c').write_text('\n'.join(body)+'\n',encoding='ascii')
+    canonical = ROOT/'sw/build/visual_assets_rom_source.c'
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text('\n'.join(body)+'\n', encoding='ascii')
     (OUT/'manifest.json').write_text(json.dumps(meta,indent=2)+'\n',encoding='utf-8')
     (OUT/'hud_labels.json').write_text(json.dumps(HUD_LABELS, indent=2) + '\n',
                                        encoding='utf-8')

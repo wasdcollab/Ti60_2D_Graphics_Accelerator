@@ -8,6 +8,8 @@
     "encoded_bytes": 794,
     "palette_colors": 32,
     "shared": null,
+    "palette": "reimu_0",
+    "rle": "reimu_0",
     "runtime_overlay": false
   },
   {
@@ -16,9 +18,11 @@
     "width": 48,
     "height": 48,
     "bytes": 9216,
-    "encoded_bytes": 795,
+    "encoded_bytes": 759,
     "palette_colors": 32,
     "shared": null,
+    "palette": "reimu_0",
+    "rle": "reimu_1",
     "runtime_overlay": false
   },
   {
@@ -27,9 +31,11 @@
     "width": 48,
     "height": 48,
     "bytes": 9216,
-    "encoded_bytes": 785,
+    "encoded_bytes": 749,
     "palette_colors": 32,
     "shared": null,
+    "palette": "reimu_0",
+    "rle": "reimu_2",
     "runtime_overlay": false
   },
   {
@@ -41,6 +47,8 @@
     "encoded_bytes": 0,
     "palette_colors": 32,
     "shared": "reimu_1",
+    "palette": null,
+    "rle": null,
     "runtime_overlay": false
   },
   {
@@ -52,6 +60,8 @@
     "encoded_bytes": 223,
     "palette_colors": 32,
     "shared": null,
+    "palette": "fairy",
+    "rle": "fairy",
     "runtime_overlay": false
   },
   {
@@ -63,6 +73,8 @@
     "encoded_bytes": 306,
     "palette_colors": 32,
     "shared": null,
+    "palette": "shard",
+    "rle": "shard",
     "runtime_overlay": false
   },
   {
@@ -74,6 +86,8 @@
     "encoded_bytes": 1273,
     "palette_colors": 32,
     "shared": null,
+    "palette": "boss",
+    "rle": "boss",
     "runtime_overlay": false
   },
   {
@@ -85,6 +99,8 @@
     "encoded_bytes": 863,
     "palette_colors": 32,
     "shared": null,
+    "palette": "boss_cirno",
+    "rle": "boss_cirno",
     "runtime_overlay": false
   },
   {
@@ -96,6 +112,8 @@
     "encoded_bytes": 293,
     "palette_colors": 32,
     "shared": null,
+    "palette": "shade",
+    "rle": "shade",
     "runtime_overlay": false
   },
   {
@@ -107,6 +125,8 @@
     "encoded_bytes": 13,
     "palette_colors": 32,
     "shared": null,
+    "palette": "laser_glow",
+    "rle": "laser_glow",
     "runtime_overlay": true
   },
   {
@@ -118,6 +138,8 @@
     "encoded_bytes": 81,
     "palette_colors": 32,
     "shared": null,
+    "palette": "heart",
+    "rle": "heart",
     "runtime_overlay": false
   },
   {
@@ -129,6 +151,8 @@
     "encoded_bytes": 85,
     "palette_colors": 32,
     "shared": null,
+    "palette": "star",
+    "rle": "star",
     "runtime_overlay": false
   },
   {
@@ -140,6 +164,8 @@
     "encoded_bytes": 171,
     "palette_colors": 32,
     "shared": null,
+    "palette": "burst_0",
+    "rle": "burst_0",
     "runtime_overlay": false
   },
   {
@@ -151,6 +177,8 @@
     "encoded_bytes": 251,
     "palette_colors": 32,
     "shared": null,
+    "palette": "burst_1",
+    "rle": "burst_1",
     "runtime_overlay": false
   },
   {
@@ -162,6 +190,8 @@
     "encoded_bytes": 87,
     "palette_colors": 32,
     "shared": null,
+    "palette": "burst_2",
+    "rle": "burst_2",
     "runtime_overlay": false
   },
   {
@@ -173,6 +203,8 @@
     "encoded_bytes": 159,
     "palette_colors": 32,
     "shared": null,
+    "palette": "burst_3",
+    "rle": "burst_3",
     "runtime_overlay": false
   },
   {
@@ -184,6 +216,8 @@
     "encoded_bytes": 26,
     "palette_colors": 32,
     "shared": null,
+    "palette": "bullet_0",
+    "rle": "bullet_0",
     "runtime_overlay": false
   },
   {
@@ -192,9 +226,11 @@
     "width": 8,
     "height": 8,
     "bytes": 256,
-    "encoded_bytes": 26,
+    "encoded_bytes": 12,
     "palette_colors": 32,
     "shared": null,
+    "palette": "bullet_1",
+    "rle": "bullet_0",
     "runtime_overlay": false
   },
   {
@@ -203,9 +239,11 @@
     "width": 8,
     "height": 8,
     "bytes": 256,
-    "encoded_bytes": 26,
+    "encoded_bytes": 12,
     "palette_colors": 32,
     "shared": null,
+    "palette": "bullet_2",
+    "rle": "bullet_0",
     "runtime_overlay": false
   },
   {
@@ -214,9 +252,11 @@
     "width": 8,
     "height": 8,
     "bytes": 256,
-    "encoded_bytes": 26,
+    "encoded_bytes": 12,
     "palette_colors": 32,
     "shared": null,
+    "palette": "bullet_3",
+    "rle": "bullet_0",
     "runtime_overlay": false
   },
   {
@@ -225,9 +265,11 @@
     "width": 8,
     "height": 8,
     "bytes": 256,
-    "encoded_bytes": 26,
+    "encoded_bytes": 12,
     "palette_colors": 32,
     "shared": null,
+    "palette": "bullet_4",
+    "rle": "bullet_0",
     "runtime_overlay": false
   },
   {
@@ -236,9 +278,11 @@
     "width": 8,
     "height": 8,
     "bytes": 256,
-    "encoded_bytes": 26,
+    "encoded_bytes": 12,
     "palette_colors": 32,
     "shared": null,
+    "palette": "bullet_5",
+    "rle": "bullet_0",
     "runtime_overlay": false
   },
   {
@@ -247,9 +291,11 @@
     "width": 8,
     "height": 8,
     "bytes": 256,
-    "encoded_bytes": 26,
+    "encoded_bytes": 12,
     "palette_colors": 32,
     "shared": null,
+    "palette": "bullet_6",
+    "rle": "bullet_0",
     "runtime_overlay": false
   },
   {
@@ -258,9 +304,11 @@
     "width": 8,
     "height": 8,
     "bytes": 256,
-    "encoded_bytes": 26,
+    "encoded_bytes": 12,
     "palette_colors": 32,
     "shared": null,
+    "palette": "bullet_7",
+    "rle": "bullet_0",
     "runtime_overlay": false
   },
   {
@@ -272,6 +320,8 @@
     "encoded_bytes": 0,
     "palette_colors": 32,
     "shared": "reimu_0",
+    "palette": null,
+    "rle": null,
     "runtime_overlay": false
   },
   {
@@ -283,6 +333,8 @@
     "encoded_bytes": 0,
     "palette_colors": 32,
     "shared": "reimu_0",
+    "palette": null,
+    "rle": null,
     "runtime_overlay": false
   }
 ]

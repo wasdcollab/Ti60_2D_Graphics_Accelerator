@@ -1,4 +1,0 @@
-PASS read drain: 1 outstanding, stalled FIFO, correct streams, busy until last response
-PASS read drain: 2 outstanding, stalled FIFO, correct streams, busy until last response
-PASS read drain: 3 outstanding, stalled FIFO, correct streams, busy until last response
-tests/tb_read_drain_busy.sv:44: $finish called at 510000 (1ps)

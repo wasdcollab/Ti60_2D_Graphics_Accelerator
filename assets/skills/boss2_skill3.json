@@ -1,0 +1,13 @@
+{
+  "boss": 2,
+  "skill": 3,
+  "name": "熔核禁域",
+  "density": 1.5,
+  "speed": 1,
+  "glow": true,
+  "auto": true,
+  "practice": true,
+  "hitbox": true,
+  "logic_hz": 75,
+  "preview_only": true
+}

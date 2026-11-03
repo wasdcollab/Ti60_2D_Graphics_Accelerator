@@ -43,7 +43,7 @@ CORRESPONDENCE
 PLAY_LEFT = 181          # video_weather.v PLAY_LEFT  == main.c GAME_LEFT
 PLAY_RIGHT = 1185        # video_weather.v PLAY_RIGHT == main.c GAME_RIGHT
 
-HALF_PIXELS = 512
+HALF_PIXELS = 684
 
 BUCKET_STRIDE = 4096      # bytes per bucket (MM_BUCKET_STRIDE)
 BUCKET_SLOTS = 1024       # MM_BUCKET_SLOTS
@@ -63,7 +63,7 @@ BUCKET_SWAP_OFFSET = 0x00060000
 # The orb run is 26 rows now, not 16: bullet_store_build() pads it with ten
 # transparent rows so that every slot's tile is TILE_ROWS tall and the scanout
 # can reject an out-of-range tile row with one constant comparison.
-N_TILES = 27
+N_TILES = 37
 EB_BYTES = 832
 TILE_ROWS = 26
 PB_BASE = 13312
@@ -129,6 +129,42 @@ def _composite(base, fg, add, alpha):
     return (_blend8((fg >> 16) & 0xFF, (base >> 16) & 0xFF, alpha) << 16 |
             _blend8((fg >> 8) & 0xFF, (base >> 8) & 0xFF, alpha) << 8 |
             _blend8(fg & 0xFF, base & 0xFF, alpha))
+def _ring_descriptor(a, b, c):
+    """Decode the scanout's ring/disc geometry, including the soft-disc flag."""
+    ro, ri = (a >> 21) & 511, (b >> 16) & 511
+    if not (a & 0x80000000) or not ro or ri > ro:
+        return None
+    add, alpha = bool(a & 0x40000000), b & 255
+    if not add and not alpha:
+        return None
+    return (a & 2047, (a >> 11) & 1023, ro, ri, add, alpha, c & 0xFFFFFF,
+            ro * ro, (ro + 4) ** 2, ri * ri, max(0, ri - 4) ** 2,
+            bool(c & 0x1000000) and ri == 0, (ro + 2) ** 2, max(0, ri - 2) ** 2)
+
+
+def _ring_sample(rg, d2):
+    """Return (RGB, ADD, alpha), or None for an actual transparent hole."""
+    if d2 > rg[8] or d2 < rg[10]:
+        return None
+    if rg[11]:
+        if d2 >= rg[7]:
+            return None
+        gain = min(255, ((rg[7] - d2) << 8) >> (rg[7].bit_length() - 1)) + 1
+        colour = rg[6]
+        if rg[4]:
+            colour = sum(((((colour >> sh) & 255) * gain) >> 8) << sh for sh in (0, 8, 16))
+        return colour, rg[4], (rg[5] * gain) >> 8
+    level = (0 if rg[9] <= d2 <= rg[7] else
+             2 if (rg[7] < d2 <= rg[12] or rg[13] <= d2 < rg[9]) else 3)
+
+    def attenuate(value):
+        return (value if level == 0 else value - value // 4 if level == 1 else
+                value >> level - 1)
+
+    rgb = rg[6]
+    if rg[4]:
+        rgb = sum(attenuate((rgb >> sh) & 255) << sh for sh in (0, 8, 16))
+    return rgb, rg[4], attenuate(rg[5])
 # ---------------------------------------------------------------------------
 # video_weather.v -- the snow layer
 # ---------------------------------------------------------------------------
@@ -309,14 +345,18 @@ class Scanout(object):
             if not (a >> 31):
                 continue
             wb = get(o + 4, 0)
-            ro = (a >> 21) & 0x1FF
-            ri = (wb >> 16) & 0x1FF
-            self.rings.append((a & 0x7FF, (a >> 11) & 0x3FF, ro, ri,
-                               (a >> 30) & 1, wb & 0xFF,
-                               get(o + 8, 0) & 0xFFFFFF,
-                               ro * ro, ro * ro + 4 * ro + 4,
-                               ri * ri,
-                               (ri * ri - 4 * ri + 4) if ri > 2 else 0))
+            descriptor = _ring_descriptor(a, wb, get(o + 8, 0))
+            if descriptor is not None:
+                self.rings.append(descriptor)
+
+        self.spell_beams = []
+        for i in range(6):
+            o=0x400+16*i;a=get(o,0);v=get(o+4,0);q=get(o+12,0)
+            if not a>>31:continue
+            nx=(v&1023);nx=nx-1024 if nx&512 else nx
+            ny=((v>>16)&1023);ny=ny-1024 if ny&512 else ny
+            if (nx or ny) and (q>>8)&15:
+                self.spell_beams.append((a&2047,(a>>11)&1023,nx,ny,get(o+8,0)&0xffffff,(q>>8)&15,q&255,bool(a&(1<<30))))
 
         # ---- the bucket table for THIS framebuffer --------------------------
         # Double buffered, and which table is live follows bit 22 of the scanned
@@ -412,11 +452,11 @@ class Scanout(object):
             return None
         right = x >= HALF_PIXELS
         if right:
-            if not (656 <= x < 848):
+            if not (700 <= x < 892):
                 return None
         elif x >= 192:
             return None
-        lx = x - (656 if right else 16)
+        lx = x - (700 if right else 16)
         ly = y - 8
         cell = (lx >> 4) & 0xF
         fps = self.fpga_fps if right else self.cpu_fps
@@ -636,22 +676,34 @@ class Scanout(object):
                 # stage 2b blends it.  Slot 0 wins, and a ring is drawn once:
                 # the hardware selects one slot per pixel, so this breaks after
                 # the first ring that covers it.
-                if rings_here:
+                spell_pixel=None
+                if PLAY_LEFT<=x<PLAY_RIGHT:
+                    for cx,cy,nx,ny,color,width,gain,warning in self.spell_beams:
+                        distance=abs((x-cx)*ny-(y-cy)*nx)
+                        half=width*128
+                        if warning:
+                            if distance>256 or not ((x if abs(nx)>=abs(ny) else y)&8):continue
+                            additive,opacity=False,210
+                        else:
+                            if distance>half+3072:continue
+                            additive,opacity=True,255
+                            if distance<=half//2:color=0xffffff
+                            elif distance>half:
+                                shift=1 if distance<=half+1024 else 2 if distance<=half+2048 else 3
+                                color=(((color>>16)&255)>>shift)<<16|(((color>>8)&255)>>shift)<<8|((color&255)>>shift)
+                        color=((((color>>16)&255)*gain>>8)<<16)|((((color>>8)&255)*gain>>8)<<8)|((color&255)*gain>>8)
+                        spell_pixel=(color,additive,opacity);break
+                if spell_pixel is not None:
+                    r=_composite(r,*spell_pixel)
+                elif rings_here:
                     for cx_r, d2y, rg in rings_here:
                         dx = x - cx_r
                         d2 = d2y + dx * dx
-                        if d2 > rg[8]:
+                        sample = _ring_sample(rg, d2)
+                        if sample is None:
                             continue
-                        if d2 <= rg[7]:
-                            if d2 >= rg[9]:
-                                a_use = rg[5]
-                            elif rg[9] and d2 >= rg[10]:
-                                a_use = rg[5] >> 1
-                            else:
-                                continue
-                        else:
-                            a_use = rg[5] >> 1
-                        r = _composite(r, rg[6], bool(rg[4]), a_use)
+                        colour, additive, opacity = sample
+                        r = _composite(r, colour, additive, opacity)
                         break
 
                 # ---- L2: the craft's beam, and the warning hairlines ----------

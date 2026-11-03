@@ -15,8 +15,8 @@
 //   Four slots, each a ring or a disc:
 //       covered  = r_in^2 <= (x-cx)^2 + (y-cy)^2 <= r_out^2
 //   r_in = 0 makes it a disc (the bright core of an impact).  Each edge is
-//   feathered by 2 px at alpha/2 so the ring does not alias into a hard
-//   staircase edge; (r+-2)^2 is expanded as r^2 +- 4r + 4, so the feather costs
+//   feathered over 4 px at half/quarter energy so the ring does not alias into a hard
+//   staircase edge; (r+-k)^2 expands to r^2 +- 2kr + k^2, so the feather costs
 //   an adder, not another multiplier.
 //
 //   Slots are prioritised: slot 0 wins over slot 1 and so on.  The compositor
@@ -39,7 +39,9 @@
 // Field packing (4 slots x 32 bits in each of the three buses)
 //   p_a[i] : {en, add, r_out[8:0], cy[9:0], cx[10:0]}
 //   p_b[i] : {15'd0, r_in[8:0], alpha[7:0]}
-//   p_c[i] : {8'd0, rgb[23:0]}
+//   p_c[i] : {7'd0, soft_disc, rgb[23:0]}
+//   soft_disc selects continuous radial falloff for luminous impact cores and
+//   spell orbs. ADD scales RGB itself; changing only alpha cannot soften light.
 // =============================================================================
 module video_fx_ring (
     input  wire         pixel_clk,
@@ -91,12 +93,15 @@ module video_fx_ring (
     // pure compare tree.
     reg  [23:0] sa_d2   [0:3];
     reg  [17:0] sa_ro2  [0:3];
-    reg  [17:0] sa_ro2p [0:3];
+    reg  [18:0] sa_ro2p [0:3];
+    reg  [18:0] sa_ro2h [0:3];
     reg  [17:0] sa_ri2  [0:3];
     reg  [17:0] sa_ri2m [0:3];
+    reg  [17:0] sa_ri2h [0:3];
     reg  [ 7:0] sa_alpha[0:3];
     reg         sa_add  [0:3];
     reg         sa_en   [0:3];
+    reg         sa_soft [0:3];
     reg  [23:0] sa_rgb  [0:3];
 
     genvar i;
@@ -117,24 +122,29 @@ module video_fx_ring (
             wire signed [25:0] dx2 = dx * dx;
             wire signed [25:0] dy2 = dy * dy;
 
-            // (r+2)^2 = r^2 + 4r + 4 and (r-2)^2 = r^2 - 4r + 4 : no extra
-            // multiplier for the feather, and the inner one is clamped so a
-            // 0- or 1-pixel inner radius cannot wrap.
+            // Two- and four-pixel edge thresholds need shifts/adds only.
+            // The outer threshold has 19 bits: (511+4)^2 exceeds 18 bits.
             wire [17:0] ro2  = ro * ro;
             wire [17:0] ri2  = ri * ri;
-            wire [17:0] ro2p = ro2 + {9'd0, ro, 2'b00} + 18'd4;
-            wire [17:0] ri2m = (ri > 9'd2) ? (ri2 - {9'd0, ri, 2'b00} + 18'd4)
+            wire [18:0] ro2p = {1'b0, ro2} + {7'd0, ro, 3'b000} + 19'd16;
+            wire [18:0] ro2h = {1'b0, ro2} + {8'd0, ro, 2'b00} + 19'd4;
+            wire [17:0] ri2m = (ri > 9'd4) ? (ri2 - {6'd0, ri, 3'b000} + 18'd16)
+                                           : 18'd0;
+            wire [17:0] ri2h = (ri > 9'd2) ? (ri2 - {7'd0, ri, 2'b00} + 18'd4)
                                            : 18'd0;
 
             always @(posedge pixel_clk) begin
                 sa_d2[i]    <= dx2[23:0] + dy2[23:0];
                 sa_ro2[i]   <= ro2;
                 sa_ro2p[i]  <= ro2p;
+                sa_ro2h[i]  <= ro2h;
                 sa_ri2[i]   <= ri2;
                 sa_ri2m[i]  <= ri2m;
+                sa_ri2h[i]  <= ri2h;
                 sa_alpha[i] <= al;
                 sa_add[i]   <= ad;
-                sa_en[i]    <= en;
+                sa_en[i]    <= en && (ro != 9'd0) && (ri <= ro) && (ad || al != 8'd0);
+                sa_soft[i]  <= p_c[i*32 + 24] && (ri == 9'd0);
                 sa_rgb[i]   <= p_c[i*32 + 0 +: 24];
             end
         end
@@ -147,7 +157,7 @@ module video_fx_ring (
     generate
         for (i = 0; i < 4; i = i + 1) begin : g_verdict
             // inside the outer feather's outer edge
-            wire inside_outer = (sa_d2[i] <= {6'd0, sa_ro2p[i]});
+            wire inside_outer = (sa_d2[i] <= {5'd0, sa_ro2p[i]});
             // inside the solid band
             wire in_band      = (sa_d2[i] <= {6'd0, sa_ro2[i]}) &&
                                 (sa_d2[i] >= {6'd0, sa_ri2[i]});
@@ -157,7 +167,9 @@ module video_fx_ring (
                                 (sa_d2[i] <  {6'd0, sa_ri2[i]}) &&
                                 (sa_d2[i] >= {6'd0, sa_ri2m[i]});
             assign solid[i] = sa_en[i] && in_band;
-            assign cov[i]   = sa_en[i] && (inside_outer || in_inner);
+            assign cov[i]   = sa_en[i] &&
+                              (sa_soft[i] ? (sa_d2[i] < {6'd0, sa_ro2[i]}) :
+                               (inside_outer && ((sa_d2[i] >= {6'd0, sa_ri2[i]}) || in_inner)));
         end
     endgenerate
 
@@ -172,10 +184,57 @@ module video_fx_ring (
                          win[1] ? 2'd1 :
                          win[2] ? 2'd2 : 2'd3;
 
-    wire [7:0] win_alpha = solid[win_idx] ? sa_alpha[win_idx]
-                                          : {1'b0, sa_alpha[win_idx][7:1]};
+    reg [2:0] energy;
+    always @* begin
+        energy = 3'd0;
+        if (!solid[win_idx]) begin
+            if ((sa_d2[win_idx] > {6'd0, sa_ro2[win_idx]} &&
+                 sa_d2[win_idx] <= {5'd0, sa_ro2h[win_idx]}) ||
+                (sa_d2[win_idx] < {6'd0, sa_ri2[win_idx]} &&
+                 sa_d2[win_idx] >= {6'd0, sa_ri2h[win_idx]})) energy = 3'd2;
+            else energy = 3'd3;
+        end
+    end
+    function [7:0] attenuate;
+        input [7:0] value;
+        input [2:0] level;
+        begin
+            case (level)
+                3'd0: attenuate = value;
+                3'd1: attenuate = value - {2'b00, value[7:2]};
+                3'd2: attenuate = {1'b0, value[7:1]};
+                3'd3: attenuate = {2'b00, value[7:2]};
+                3'd4: attenuate = {3'b000, value[7:3]};
+                default: attenuate = {4'b0000, value[7:4]};
+            endcase
+        end
+    endfunction
+    // Normalize remaining squared radius by the largest power of two <= r^2.
+    // This is a shift, not a divider. The saturated centre and continuously
+    // falling rim stay within the requested radius even between powers of two.
+    function [4:0] radius_shift;
+        input [17:0] radius2;
+        integer bit_index;
+        begin
+            radius_shift = 5'd0;
+            for (bit_index = 0; bit_index < 18; bit_index = bit_index + 1)
+                if (radius2[bit_index]) radius_shift = bit_index[4:0];
+        end
+    endfunction
+    wire [17:0] soft_remaining = sa_d2[win_idx] < {6'd0, sa_ro2[win_idx]} ?
+                                 sa_ro2[win_idx] - sa_d2[win_idx][17:0] : 18'd0;
+    wire [25:0] soft_scaled = {soft_remaining, 8'd0} >> radius_shift(sa_ro2[win_idx]);
+    wire [8:0] soft_gain = soft_scaled >= 26'd255 ? 9'd256 : {1'b0, soft_scaled[7:0]} + 9'd1;
+    wire [16:0] soft_alpha = sa_alpha[win_idx] * soft_gain;
+    wire [7:0] win_alpha = sa_soft[win_idx] ? soft_alpha[15:8] : attenuate(sa_alpha[win_idx], energy);
     wire       win_add   = sa_add[win_idx];
-    wire [23:0] win_rgb  = sa_rgb[win_idx];
+    wire [23:0] raw_rgb = sa_rgb[win_idx];
+    wire [16:0] soft_r = raw_rgb[23:16] * soft_gain;
+    wire [16:0] soft_g = raw_rgb[15:8] * soft_gain;
+    wire [16:0] soft_b = raw_rgb[7:0] * soft_gain;
+    wire [23:0] win_rgb = win_add && sa_soft[win_idx] ? {soft_r[15:8], soft_g[15:8], soft_b[15:8]} : win_add ? {
+        attenuate(raw_rgb[23:16], energy), attenuate(raw_rgb[15:8], energy),
+        attenuate(raw_rgb[7:0], energy)} : raw_rgb;
 
     wire any = |win;
 
@@ -185,7 +244,7 @@ module video_fx_ring (
             add     <= 1'b0;
             alpha   <= 8'd0;
             rgb     <= 24'd0;
-        end else if (de_d1 && !in_box && any) begin
+        end else if (de_d1 && x_d1 >= 12'd181 && x_d1 < 12'd1185 && !in_box && any) begin
             visible <= 1'b1;
             add     <= win_add;
             alpha   <= win_alpha;

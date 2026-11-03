@@ -82,7 +82,7 @@ module video_bullet_scanline #(
         end else begin
             issue_d <= issuing;
             draw_d <= issue_d && entry_ready && tile_row >= 0 && tile_row < 26
-                      && entry_data[23:17] < 27;
+                      && entry_data[23:17] < 37;
             bx_d <= entry_data[10:0];
             width_d <= entry_data[28:24];
             hue_d <= entry_data[31:29];

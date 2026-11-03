@@ -1,2 +1,0 @@
-FATAL: tests/tb_write_guard_liveness.sv:24: pending AW was never admitted with priority held high
-       Time: 2650000  Scope: tb_write_guard_liveness

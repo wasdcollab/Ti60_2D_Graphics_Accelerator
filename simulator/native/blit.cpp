@@ -332,7 +332,8 @@ void SapphireSoCVM::blit_add(uint32_t dst, uint32_t src, uint32_t w, uint32_t h,
 void SapphireSoCVM::apb_store(uint32_t off, uint32_t val) {
     switch (off) {
         case 4: case 8: case 12: case 16: case 24: case 28:
-        case 48: case 72: case 0x60: case 0x64: case 0x68: case 0x6C:
+        case 48: case 72: case 0x4C: case 0x60: case 0x64: case 0x68: case 0x6C:
+        case 0x100: case 0x104: case 0x130: case 0x13C: case 0x140:
             params[py::int_(off)] = py::int_(val);
             return;
         default: break;

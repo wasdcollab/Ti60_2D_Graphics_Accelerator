@@ -85,6 +85,9 @@ module display_engine_top #(
     input  wire [127:0]               fx_a,
     input  wire [127:0]               fx_b,
     input  wire [127:0]               fx_c,
+    input  wire [767:0]               spell_beams,
+    input  wire                      spell_commit,
+    output wire                      spell_ack,
 
     // HUD & FPS Telemetry
     input  wire                       hud_enable,
@@ -174,6 +177,10 @@ module display_engine_top #(
     reg [127:0] fxa_s1, fxa_s2, fxa_latched;
     reg [127:0] fxb_s1, fxb_s2, fxb_latched;
     reg [127:0] fxc_s1, fxc_s2, fxc_latched;
+    wire [767:0] sp_latched;
+    spell_beam_cdc u_spell_cdc(.pixel_clk(pixel_clk),.pixel_rst_n(pixel_rst_n),
+        .vblank(v_cnt==V_ACT && h_cnt==0),.commit(spell_commit),
+        .parameters(spell_beams),.acknowledge(spell_ack),.latched(sp_latched));
 
     always @(posedge pixel_clk or negedge pixel_rst_n) begin
         if (!pixel_rst_n) begin
@@ -399,6 +406,19 @@ module display_engine_top #(
     wire        f_add;
     wire [7:0]  f_alpha;
     wire [23:0] f_rgb;
+    wire r_visible,r_add,s_visible,s_add;
+    wire [7:0] r_alpha,s_alpha;
+    wire [23:0] r_rgb,s_rgb;
+    assign f_visible=s_visible||r_visible;
+    assign f_add=s_visible?s_add:r_add;
+    assign f_alpha=s_visible?s_alpha:r_alpha;
+    assign f_rgb=s_visible?s_rgb:r_rgb;
+    video_spell_beams u_spell (
+        .pixel_clk(pixel_clk),.pixel_rst_n(pixel_rst_n),
+        .x(pixel_x_d1),.y(pixel_y_d1),.de(t_de_d1),.p(sp_latched),
+        .mask_x(wbox_x_latched),.mask_y(wbox_y_latched),
+        .visible(s_visible),.add(s_add),.alpha(s_alpha),.rgb(s_rgb)
+    );
     video_fx_ring u_fx (
         .pixel_clk   (pixel_clk),
         .pixel_rst_n (pixel_rst_n),
@@ -410,10 +430,10 @@ module display_engine_top #(
         .p_c         (fxc_latched),
         .mask_x      (wbox_x_latched),
         .mask_y      (wbox_y_latched),
-        .visible     (f_visible),
-        .add         (f_add),
-        .alpha       (f_alpha),
-        .rgb         (f_rgb)
+        .visible     (r_visible),
+        .add         (r_add),
+        .alpha       (r_alpha),
+        .rgb         (r_rgb)
     );
 
     // Layer 5: HUD OSD

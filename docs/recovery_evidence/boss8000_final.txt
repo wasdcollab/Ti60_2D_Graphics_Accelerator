@@ -1,4 +1,0 @@
-  firmware: firmware.bin (64252 bytes, ends at 0xf900fafc, bss (4177591028, 4177591536))
-  boot snapshot: boot_firmware-menu-v2-a5a49d32828e.pkl (81.9 MB, boot step skipped)
-frame=0 sprites=8080 pattern=1 drop=0 peak_drop=0 patterns=[1]
-RESULT patterns=2 min_sprites=7498 max_drop=0 report=work_sim\boss8000_final.json

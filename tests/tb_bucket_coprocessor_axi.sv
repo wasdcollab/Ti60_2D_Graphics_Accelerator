@@ -464,6 +464,8 @@ module tb_bucket_coprocessor_axi;
             10,14:bounds=677;11,12,13:bounds=676;
             16,18:bounds=832;17:bounds=481;
             19,20,21,22,23,24,25,26:bounds=768;default:bounds=647;
+            27:bounds=295;28:bounds=389;
+            29,30,31,32,33,34,35,36:bounds=832;
         endcase
     endfunction
     task reference_bullet(input reg [63:0] b,input integer player);
@@ -473,8 +475,11 @@ module tb_bucket_coprocessor_axi;
             f=b[55:48];c=b[63:56];
             if((f&1)!=0) begin
                 if(player) begin s=(f&2)!=0?18:16;w=s==18?13:7;row=y;bx=x;end
+                else if((f&128)!=0) begin s=(c&128)!=0?28:27;w=16;row=y-8;bx=x-8;end
                 else if((f&8)!=0) begin s=19+(heading(vx,vy)>>1);w=24;row=y-12;bx=x-12;end
+                else if((f&32)!=0) begin s=29+(heading(vx,vy)>>1);w=26;row=y-13;bx=x-13;end
                 else if((f&64)!=0) begin s=17;w=16;row=y-8;bx=x-8;end
+                else if((c&192)==64) begin s=29+(((f&4)!=0 || (vx==0&&vy==0) ? heading(683-x,512-y) : heading(vx,vy))>>1);w=26;row=y-13;bx=x-13;end
                 else begin
                     if((f&4)!=0) s=heading(683-x,512-y);
                     else if((c&128)!=0) s=(c>>3)&15;
@@ -500,8 +505,8 @@ module tb_bucket_coprocessor_axi;
             expected_live=0;expected_kill=0;expected_nc=0;
             for(k=0;k<ECAP;k=k+1) begin
                 expected_eb[k]=eb[k];
-                if(motion && ((k<ne && k<ECAP-32)||k>=ECAP-32) && eb[k][48]) begin
-                    if(k<ECAP-32 && !eb[k][51]) begin
+                if(motion && ((k<ne && k<ECAP-128)||k>=ECAP-128) && eb[k][48]) begin
+                    if(k<ECAP-128 && !(eb[k][51] || eb[k][53] || eb[k][55])) begin
                         x=$signed(eb[k][15:0])+$signed(eb[k][39:32]);
                         y=$signed(eb[k][31:16])+$signed(eb[k][47:40]);
                         if(x<182||x>1169||y<1||y>767) begin
@@ -518,8 +523,8 @@ module tb_bucket_coprocessor_axi;
                 end
             end
             for(k=0;k<np&&k<512;k=k+1)reference_bullet(pb[k],1);
-            for(k=0;k<ne&&k<ECAP-32;k=k+1)reference_bullet(expected_eb[k],0);
-            for(k=ECAP-32;k<ECAP;k=k+1)reference_bullet(expected_eb[k],0);
+            for(k=0;k<ne&&k<ECAP-128;k=k+1)reference_bullet(expected_eb[k],0);
+            for(k=ECAP-128;k<ECAP;k=k+1)reference_bullet(expected_eb[k],0);
             @(negedge clk);buffer_sel=target;pb_count=np;eb_count=ne;start=1;
             player_xy={16'd512,16'd683};
             @(negedge clk);start=0;
@@ -584,20 +589,39 @@ module tb_bucket_coprocessor_axi;
         // the next frame inside the playfield. 20000 is a multiple of 32, so
         // the last read chunk is full and the 15-bit index is past 16383.
         for(i=0;i<20000;i=i+1)
+`ifdef BUCKET_TEST_GLOW
+            eb[i]=bullet(300+(i%800), 4+((i%96)*8), 1, (i[0]?1:-1), 1, 64|i[2:0]);
+`else
             eb[i]=bullet(300+(i%800), 4+((i%96)*8), 1, (i[0]?1:-1), 1, i[2:0]);
+`endif
         run_frame(0,0,20000);
         if(drops!=0) $fatal(1,"20000 stratified field dropped %0d",drops);
         // The direct slave is the frame-budget measurement. The mux and the
         // board guard add a competing master, so they only have to finish.
 `ifndef BUCKET_TEST_MUX
+`ifdef BUCKET_TEST_GLOW
+        // The full 26-row glow writes more bucket entries than the rice mask.
+        // Bound this distinct workload to 10 ms at 100 MHz, leaving 3.33 ms
+        // of a 75 Hz frame for other work (not a board-level FPS assertion).
+        if(cycles>1000000) $fatal(1,"20000 glow job exceeded 10 ms: %0d",cycles);
+`else
         if(cycles>750000) $fatal(1,"20000 motion job exceeded 7.5 ms: %0d",cycles);
+`endif
 `endif
         run_frame(1,0,20000);
         if(drops!=0) $fatal(1,"20000 second buffer dropped %0d",drops);
 `ifndef BUCKET_TEST_MUX
+`ifdef BUCKET_TEST_GLOW
+        if(cycles>1000000) $fatal(1,"20000 glow job exceeded 10 ms: %0d",cycles);
+`else
         if(cycles>750000) $fatal(1,"20000 motion job exceeded 7.5 ms: %0d",cycles);
 `endif
+`endif
+`ifdef BUCKET_TEST_GLOW
+        $display("PASS 20000 GLOW MOTION: both buffers, drops=0, cycles=%0d",cycles);
+`else
         $display("PASS 20000 MOTION: both buffers, drops=0, cycles=%0d",cycles);
+`endif
         $finish;
 `elsif BUCKET_TEST_BOARD
         motion=1;
@@ -634,6 +658,17 @@ module tb_bucket_coprocessor_axi;
 `endif
 `else
         run_frame(0,0,0);
+        // All eight HTML spark orientations, including slots > 31.
+        for(i=0;i<8;i=i+1) eb[i]=bullet(500+i*30,300,
+            i==0?90:i==1?64:i==2?0:i==3?-64:i==4?-90:i==5?-64:i==6?0:64,
+            i==0?0:i==1?64:i==2?90:i==3?64:i==4?0:i==5?-64:i==6?-90:-64,33,i);
+        run_frame(0,0,8);run_frame(1,0,8);
+        for(i=0;i<8;i=i+1) eb[i]=0;
+        eb[0]=bullet(500,300,98,0,129,6);
+        eb[1]=bullet(600,400,62,0,129,133);
+        run_frame(0,0,2); run_frame(1,0,2);
+        eb[0]=0;eb[1]=0;
+        $display("PASS skill laser warning/fire tiles, both buffers");
         for(i=0;i<512;i=i+1)pb[i]=bullet(300+i%800,(i*23)%820-26,0,-5,i%2?3:1,i%8);
         for(i=0;i<ECAP;i=i+1)eb[i]=bullet(181+i%1000,(i*37)%820-26,i%15-7,i%13-6,
             i%17==0?0:i%23==0?9:i%19==0?65:i%29==0?5:1,(i%2?128:0)|((i%16)<<3)|(i%8));
@@ -672,6 +707,30 @@ module tb_bucket_coprocessor_axi;
 `endif
         run_frame(1,0,0);
         motion=1;
+        // Integer-speed glow uses the same atlas as Q4 skills, but remains
+        // DMA-owned. All eight orientations must retain colour[6] on writeback.
+        for(i=0;i<8;i=i+1)eb[i]=bullet(500+i*30,300,2-i%5,i%3-1,1,64|i);
+        run_frame(0,0,8);run_frame(1,0,8);
+        for(i=0;i<8;i=i+1) begin
+            if(eb[i][15:0]!=500+i*30+2*(2-i%5) ||
+               eb[i][31:16]!=300+2*(i%3-1) || eb[i][63:56]!=(64|i))
+                $fatal(1,"integer glow motion/colour mismatch at %0d",i);
+            eb[i]=0;
+        end
+        $display("PASS integer glow sparks: atlas selection and DMA motion, both buffers");
+        // CPU already advanced Q4 shots and timed lasers. DMA must bucket
+        // them without interpreting fractional velocity or lifetime as pixels.
+        eb[0]=bullet(500,300,24,-8,33,0);
+        eb[1]=bullet(600,400,97,0,129,6);
+        eb[ECAP-128]=bullet(700,500,3,2,65,0);
+        eb[ECAP-1]=bullet(800,600,-3,2,65,0);
+        run_frame(0,0,2);run_frame(1,0,2);
+        if(eb[0]!=bullet(500,300,24,-8,33,0) ||
+           eb[1]!=bullet(600,400,97,0,129,6) ||
+           eb[ECAP-128]!=bullet(700,500,3,2,65,0) ||
+           eb[ECAP-1]!=bullet(800,600,-3,2,65,0))
+            $fatal(1,"DMA moved CPU-owned shots or reserved orb slots");
+        $display("PASS motion ownership: Q4, timer lasers and both ends of 128-orb tail");
         for(i=0;i<ECAP;i=i+1) eb[i]=bullet(182+i%988,1+(i*37)%767,i%15-7,i%13-6,
             i%17==0?0:i%23==0?9:i%19==0?65:1,i%8);
         // Full scan, odd count, untouched tail, candidate saturation and empty pool.

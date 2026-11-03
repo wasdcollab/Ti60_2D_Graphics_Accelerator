@@ -31,6 +31,7 @@
 #include "asset_rom.h"
 #include "visual_assets.h"
 #include "stage_bg.h"
+#include "asset_rom_extra.h"
 
 /* ===================================================================== */
 /* shared helpers                                                        */
@@ -116,7 +117,7 @@ static const uint8_t eb_halo_a[BROLE_EB_HALO_N] = {
  * rest of that half showing the PREVIOUS frame, which is what the two garbage
  * strips down the sides of the 1366x768 screen were.  These two must always
  * add up to SCREEN_WIDTH. */
-#define SCAN_HALF_PIXELS   512u
+#define SCAN_HALF_PIXELS   684u
 #define SCAN_HALF_BYTES    (SCAN_HALF_PIXELS * 4u)
 #define SCAN_RIGHT_PIXELS  (SCREEN_WIDTH - SCAN_HALF_PIXELS)
 /* ---- 1366x768 native playfield ----------------------------------------
@@ -209,8 +210,8 @@ static const uint8_t eb_halo_a[BROLE_EB_HALO_N] = {
 #define SPD_LOCKON_MISSILE   7
 #define SPD_STORM            3
 #define STRESS_STORM_TARGET  192
-#define STRESS_STORM_MAX     20000
-#define STRESS_STORM_BUDGET  224
+#define STRESS_STORM_MAX     30000
+#define STRESS_STORM_BUDGET  320
 #define STRESS_FIRE_CD       FIRE_CD_MIN
 
 /* Bullet sub-stepping: a fast player shot or a fast bullet would otherwise
@@ -360,6 +361,7 @@ static void cpu_software_fill(uint32_t dst_base, int x, int y, int w, int h,
 static int is_stress_stage = 0;
 static uint16_t stress_target;
 static uint8_t stress_prev_y;
+static uint8_t stress_prev_a;
 static uint8_t stress_load_hold;
 
 /* v6's boot menu: TWO cards, not a list.  Row 0 is the BitBlt bench (CPU on
@@ -589,6 +591,7 @@ static void score_award(uint32_t points, int x, int y)
     combo_timer = COMBO_WINDOW;
     if (combo_count > 255u) combo_count = 255u;
 
+    if (is_stress_stage) return;
     popup_t *p = &popups[popup_cursor++ & (POPUP_SLOTS - 1u)];
     p->x = (int16_t)x;
     p->y = (int16_t)y;
@@ -609,17 +612,23 @@ static void popup_step(void)
 
 static void popup_render(uint32_t fb)
 {
+    int rendered_popups = 0;
     for (int i = 0; i < POPUP_SLOTS; i++) {
         popup_t *p = &popups[i];
         if (!p->age) continue;
+        if (++rendered_popups > 4) break;
         /* Blink over the last third of the life, so a popup reads as
          * "expiring" instead of simply vanishing. */
         if (p->age > (POPUP_LIFE * 2 / 3) && (p->age & 2u)) continue;
         int rise = 4 + (int)p->age / 4;         /* a slow drift upward */
         int px = (int)p->x - 8;
         int py = (int)p->y - rise;
-        if (px < GAME_LEFT + 2 || py < GAME_TOP + 2) continue;
-        if (px > GAME_RIGHT - 42 || py > GAME_BOTTOM - 14) continue;
+        int max_w = (p->combo >= 3u) ? 96 : 84;
+        /* Keep popup strictly inside playfield [GAME_LEFT, GAME_RIGHT] so digits never
+         * bleed into unrefreshed side HUD gutters */
+        if (px + max_w > GAME_RIGHT) px = GAME_RIGHT - max_w;
+        if (px < GAME_LEFT + 2) px = GAME_LEFT + 2;
+        if (py < GAME_TOP + 2 || py > GAME_BOTTOM - 26) continue;
         uint32_t col = (p->combo >= 3u) ? 0x00FFE45Cu : 0x00FFFFFFu;
         draw_number(fb, px, py, p->value, 4, col);
         if (p->combo >= 3u) {
@@ -746,12 +755,6 @@ static void draw_menu(uint32_t base, int sel)
     /* ---- footer --------------------------------------------------------- */
     menu_bar(base, 0, SCREEN_HEIGHT - 40, SCREEN_WIDTH, 40, 0x00081020u);
     menu_bar(base, 0, SCREEN_HEIGHT - 40, SCREEN_WIDTH, 2, 0x00486078u);
-    draw_text(base, 300, SCREEN_HEIGHT - 28,
-              "(C) 2026 DSH WHALE-CHAN   ALL RIGHTS RESERVED", 2, 0x008098B0u);
-    draw_text(base, 1060, SCREEN_HEIGHT - 28, "VER 7.0", 2, 0x008098B0u);
-    draw_text(base, 1230, SCREEN_HEIGHT - 28, "1366x768", 2, 0x00607890u);
-    draw_text(base, 24, SCREEN_HEIGHT - 28, bgm_ready ? "BGM READY" :
-              bgm_size ? "BGM LOADING" : "BGM WAITING", 1, 0x0090C8C8u);
     menu_sample();
 }
 
@@ -764,6 +767,13 @@ static void bucket_clear(void);
  * sampling REG_RIGHT_ACTIVE to pick "the other" buffer races with the flip the
  * display is about to perform.  Publishing one buffer and waiting until the
  * scanout really reports it removes the race. */
+static int spell_packet_ready(void)
+{
+    unsigned spin=20000;
+    while((GPU2D_REG_SPELL_STATUS&1u) && --spin){}
+    return spin!=0;
+}
+
 static void resync_scanout(uint32_t *lback, uint32_t *rback, int leaving)
 {
     uint32_t guard = 4000000u;
@@ -791,6 +801,11 @@ static void resync_scanout(uint32_t *lback, uint32_t *rback, int leaving)
      * the tables are already empty (this clear emptied them, or the boot
      * sequence did) and the run's first frame refills them. */
     if (leaving) {
+        if(spell_packet_ready()) {
+            for(unsigned i=0;i<6;i++)GPU2D_REG_SPELL(i,0)=0;
+            GPU2D_REG_SPELL(5,3)=0;
+        }
+        for(unsigned i=0;i<4;i++)GPU2D_REG_FX_RING(i,0)=0;
         bucket_clear();
         /* The scanout's beam layer and its three warning hairlines are APB
          * registers, not framebuffer pixels: the hardware holds whatever the
@@ -954,6 +969,23 @@ static void tilt_poses_build(void)
                 dst[y * 48 + x] = (sx < 0 || sx >= 48)
                                 ? MAGENTA_KEY : src[y * 48 + sx];
             }
+        }
+    }
+}
+
+static void asset_unpack_boot(void)
+{
+    const uint8_t *r=(const uint8_t *)MM_STAGE_RLE;
+    uint8_t *d=(uint8_t *)MM_ASSET_UNPACK;
+    uint8_t *end=d+ASSET_UNPACK_BYTES;
+    while(d<end) {
+        unsigned flags=*r++;
+        for(unsigned k=0;k<8 && d<end;k++) {
+            if(flags&(1u<<k)) {
+                unsigned v=r[0]|((unsigned)r[1]<<8);r+=2;
+                unsigned n=(v&15u)+3u;uint8_t *p=d-(v>>4)-1u;
+                while(n--)*d++=*p++;
+            } else *d++=*r++;
         }
     }
 }
@@ -1393,10 +1425,9 @@ static void stage_bg_boot(void)
      * the decoder at the DDR copy.  Doing it in this order means the ROM is
      * walked once, linearly, and the (much more branchy) decode then runs
      * against memory the CPU can actually address as ordinary data. */
-    gpu2d_asset_copy(MM_STAGE_RLE, SB_RLE_TOTAL);
-    stage_rle[SB_STAGE_ICE]   = (const uint8_t *)(MM_STAGE_RLE + SB_RLE_OFF_STAGE_ICE);
-    stage_rle[SB_STAGE_LAVA]  = (const uint8_t *)(MM_STAGE_RLE + SB_RLE_OFF_STAGE_LAVA);
-    stage_rle[SB_STAGE_DREAM] = (const uint8_t *)(MM_STAGE_RLE + SB_RLE_OFF_STAGE_DREAM);
+    stage_rle[SB_STAGE_ICE]   = (const uint8_t *)(MM_ASSET_UNPACK + SB_RLE_OFF_STAGE_ICE);
+    stage_rle[SB_STAGE_LAVA]  = (const uint8_t *)(MM_ASSET_UNPACK + SB_RLE_OFF_STAGE_LAVA);
+    stage_rle[SB_STAGE_DREAM] = (const uint8_t *)(MM_ASSET_UNPACK + SB_RLE_OFF_STAGE_DREAM);
 
     for (unsigned s = 0; s < SB_STAGE_COUNT; s++)
         stage_bg_decode(s, STAGE_BG_BUF(s));
@@ -1680,7 +1711,9 @@ static void sprites_build(void)
 /* ===================================================================== */
 
 #define MAX_ENEMIES        MM_ENEMY_COUNT
-#define MAX_ACTIVE_ENEMY   9            /* campaign adds 0..2 to this cap */
+#define MAX_ACTIVE_ENEMY   MM_ENEMY_COUNT
+#define CAMPAIGN_ROUNDS 2
+#define STRESS_MINIONS 50
 #define MAX_PBULLETS      MM_PBULLET_COUNT
 #define MAX_EBULLETS      MM_EBULLET_COUNT
 #define MAX_ITEMS         MM_ITEM_COUNT
@@ -1701,9 +1734,10 @@ static void sprites_build(void)
  * front when its own tail is busy - so no slot is wasted while no orb wants it.
  * stress_storm_update() counts every live shot whatever kind it is, so the
  * storm still fills the pool to its target either way. */
-#define ORB_RESERVE       32
+#define ORB_RESERVE       128
 #define ORB_FIRST        (MAX_EBULLETS - ORB_RESERVE)
 
+#define BCOLOR_GLOW       0x40u /* colour[7:6]=01: BOSS spark, integer motion */
 #define EF_ACTIVE         0x01u
 #define EF_HELD           0x04u         /* laid out and holding station */
 #define EF_LANCE          0x08u         /* 8.5: a shaft, and it bounces     */
@@ -1713,8 +1747,9 @@ static void sprites_build(void)
 #define EF_BOUNCE_SHIFT     4
 #define EF_BOUNCE_MASK   0x30u
 #define EF_ORB           0x40u          /* Phase 2: high-tier Big Orb / Spell Card projectile (OP_ADD) */
-/* Bit 7 is free.  Bit 1 is NOT free, and it has three names depending on which
- * pool the record belongs to - the pools never mix, so one bit is enough:
+/* Bit 7 is EF_FORMATION on an enemy record (campaign rank). Bullets do not use
+ * it.  Bit 1 is NOT free, and it has three names depending on which pool the
+ * record belongs to - one bit is enough:
  *
  *   EF_GRAZED  (enemy bullets) marks a shot that has already thrown its graze
  *              spark, so the spark fires once per bullet instead of every
@@ -1728,6 +1763,11 @@ static void sprites_build(void)
  * allocated to it would have collided with the missiles, or with EF_GRAZED -
  * and dropping EF_GRAZED makes the graze spark fire on every frame instead of
  * once. */
+#define EF_FORMATION     0x80u
+#define EF_FREE         0x40u  /* enemy records: free flight after entry */
+#define EF_SKILL_LASER  0x80u  /* bullet records: stationary timed laser sample */
+#define EF_EMBER        0x10u /* non-lance: fall, suspend, then split */
+#define EF_SUBPIXEL     0x20u  /* bullet records, without EF_LANCE: Q4 velocity */
 #define EF_GRAZED        0x02u
 #define PF_LOCKON        0x02u
 
@@ -1801,6 +1841,7 @@ static inline int item_is_debuff(uint8_t type)
     /* ---- left gutter (x 0..180): the stage block owns the top -------- */ \
     X(STAGE_TAG,   8,  20, 120,  22) \
     X(WAVE_BAR,    8,  58, 156,  16) \
+    X(ROUND,      96,  44,  21,   7) \
     X(PLAYER,      8, 104, 164,  64) \
     X(LIVES,       8, 194, 156,  40) \
     X(SCORE,       8, 274, 164,  26) \
@@ -1924,6 +1965,15 @@ typedef struct {
 static enemy_rec_t * const enemies = (enemy_rec_t *)MM_ENEMY_BASE;
 static bullet_t    * const pbullets = (bullet_t *)MM_PBULLET_BASE;
 static bullet_t    * const ebullets = (bullet_t *)MM_EBULLET_BASE;
+typedef struct {
+    uint16_t age;
+    uint8_t kind, reserved;
+    int16_t x, y;
+    int8_t vx, vy;
+} boss1_cast_t;
+static boss1_cast_t * const boss1_cast = (boss1_cast_t *)MM_BOSS1_CAST;
+static uint8_t * const bullet_frac = (uint8_t *)MM_BULLET_FRAC;
+#include "boss23_state.h"
 
 /* ------------------------------------------------------------------------
  * HOW FAR A WALK OVER A POOL HAS TO GO  (the pools are 512 slots wide)
@@ -2042,9 +2092,12 @@ static uint8_t  hit_blink;
 static uint8_t  weapon_level;
 static uint16_t fire_timer;
 /* moved up with the other run state; see score_award() above */
-static uint16_t kills, wave, spawn_timer, wave_max;
+static uint16_t kills, wave, spawn_timer;
+static uint8_t campaign_round, round_spawned;
+static uint8_t boss_signature_timer, boss_signature_used;
 
-static uint8_t  boss_state, boss_pattern, boss_prev_pat, boss_pat_timer;
+static uint8_t  boss_state, boss_pattern, boss_prev_pat;
+static uint8_t  __attribute__((used)) boss_pat_timer;
 static uint8_t  boss_fire_timer, boss_dead_timer, boss_since_summon;
 static int16_t  boss_x, boss_y, boss_target_x, boss_target_y;
 
@@ -2071,7 +2124,7 @@ static uint8_t  boss_spell_vfx_timer;/* Climax shockwave ring + flash timer on s
 static int16_t  beam_x[CUT_SLOTS];   /* the column each beam is aimed down */
 static uint8_t  beam_timer[CUT_SLOTS];
 static uint8_t  beam_phase[CUT_SLOTS];
-static uint8_t  cut_phase;           /* 0 idle, 1 preview, 2 firing (slot 0) */
+static uint8_t  __attribute__((used)) cut_phase;           /* 0 idle, 1 preview, 2 firing (slot 0) */
 static uint8_t  lockon_timer;        /* 6.2: frames left in the phase        */
 static uint8_t  lockon_arm;          /* 6.2: 0 idle, 1 laying out, 2 holding  */
 static uint8_t  dialog_was_active;  /* dialog stood last frame; restore backdrop when it ends */
@@ -2080,6 +2133,29 @@ static uint8_t  pause_was_active;   /* pause card stood last frame; restore back
 #define SET_CARD_H  392
 static int16_t  boss_hp_shown;      /* the bar's lagging "damage trail" */          /* frames the boss's laser columns stay up */
 static uint8_t  boss_opener_stage;   /* how many spell cards this boss has spent */
+static uint8_t  boss_hp_locked;      /* 1 when boss HP is locked at 2/3 or 1/3 threshold */
+
+static void boss_take_damage(int16_t dmg)
+{
+    if (boss_state != BOSS_FIGHT || is_stress_stage || boss_hp <= 0) return;
+
+    if (boss_opener_stage < 2u) {
+        int16_t mark = (int16_t)((int32_t)boss_hp_max * (int16_t)(2 - boss_opener_stage) / 3);
+        if (boss_hp_locked) {
+            boss_hp = mark;
+            return;
+        }
+        boss_hp = (int16_t)(boss_hp - dmg);
+        if (boss_hp <= mark) {
+            boss_hp = mark;
+            boss_hp_locked = 1;
+        }
+    } else {
+        boss_hp = (int16_t)(boss_hp - dmg);
+        if (boss_hp < 0) boss_hp = 0;
+    }
+}
+
 static uint16_t dialog_timer, slow_timer, jam_timer;
 static uint32_t laser_hits;
 static uint8_t  game_clear;
@@ -2098,6 +2174,7 @@ static uint8_t  clear_pending;          /* frames that still need a full wipe */
 #define BOMB_MAX_CHARGE    8
 #define BOMB_FLASH_FRAMES  36
 static uint8_t  bomb_charge;            /* kills banked, capped at the max   */
+static int16_t bomb_x, bomb_y;
 static uint8_t  bomb_flash;             /* frames the shockwave is on screen */
 static uint8_t  bomb_prev_center;       /* last frame's centre button        */
 static uint16_t bomb_kills_seen;        /* kill counter at the previous frame */
@@ -2257,9 +2334,11 @@ static void particles_render(uint32_t fb)
             src += (2u * MM_PARTICLE_TILE_STRIDE) + 8u;
         }
         if (px >= GAME_LEFT && px + pw <= GAME_RIGHT && py >= 0 && py + ph <= SCREEN_HEIGHT) {
+            rendered++;
             r_add(fb + (uint32_t)(py * SCREEN_STRIDE) + (uint32_t)(px * 4),
                   src, (uint32_t)pw, (uint32_t)ph,
                   MM_PARTICLE_TILE_STRIDE, SCREEN_STRIDE);
+            if (rendered >= 20) break;
         }
     }
     r_add_end();
@@ -2337,33 +2416,33 @@ static void particle_tile_build(void)
         base[i] = MAGENTA_KEY;
     }
 
-    /* Type 0: PARTICLE_HIT (golden hit spark, 8x8 diamond star) */
-    volatile uint32_t *t0 = base;
-    t0[1 * pitch + 3] = t0[1 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF8000u;
-    t0[2 * pitch + 3] = t0[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFCC00u;
-    t0[3 * pitch + 1] = t0[3 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FF8000u;
-    t0[3 * pitch + 2] = t0[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
-    t0[3 * pitch + 3] = t0[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
-    t0[4 * pitch + 1] = t0[4 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FF8000u;
-    t0[4 * pitch + 2] = t0[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
-    t0[4 * pitch + 3] = t0[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
-    t0[5 * pitch + 3] = t0[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFCC00u;
-    t0[6 * pitch + 3] = t0[6 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF8000u;
+    /* Types 0, 3, 4: 8x8 diamond star (golden hit, crimson crit, cyan graze) */
+    static const uint32_t star_cols[3][3] = {
+        { MM_EMISSIVE_TAG | 0x00FF8000u, MM_EMISSIVE_TAG | 0x00FFCC00u, MM_EMISSIVE_TAG | 0x00FFD700u },
+        { MM_EMISSIVE_TAG | 0x00FF3050u, MM_EMISSIVE_TAG | 0x00FF6080u, MM_EMISSIVE_TAG | 0x00FF80A0u },
+        { MM_EMISSIVE_TAG | 0x000070D0u, MM_EMISSIVE_TAG | 0x0000C0FFu, MM_EMISSIVE_TAG | 0x0000E0FFu },
+    };
+    static const uint8_t star_off[3] = { 0u, 24u, 32u };
+    for (unsigned k = 0; k < 3u; k++) {
+        volatile uint32_t *t = base + pitch * star_off[k];
+        uint32_t co = star_cols[k][0], cm = star_cols[k][1], ci = star_cols[k][2];
+        t[1 * pitch + 3] = t[1 * pitch + 4] = t[6 * pitch + 3] = t[6 * pitch + 4] = co;
+        t[2 * pitch + 3] = t[2 * pitch + 4] = t[5 * pitch + 3] = t[5 * pitch + 4] = cm;
+        for (unsigned r = 3u; r <= 4u; r++) {
+            t[r * pitch + 1] = t[r * pitch + 6] = co;
+            t[r * pitch + 2] = t[r * pitch + 5] = ci;
+            t[r * pitch + 3] = t[r * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+        }
+    }
 
     /* Type 1: PARTICLE_ITEM (Phase 2: glowing golden dust mote, 8x8) */
     volatile uint32_t *t1 = base + pitch * 8u;
-    t1[1 * pitch + 3] = t1[1 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFA500u;
-    t1[2 * pitch + 2] = t1[2 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
-    t1[2 * pitch + 3] = t1[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
-    t1[3 * pitch + 1] = t1[3 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FFA500u;
-    t1[3 * pitch + 2] = t1[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
-    t1[3 * pitch + 3] = t1[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
-    t1[4 * pitch + 1] = t1[4 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FFA500u;
-    t1[4 * pitch + 2] = t1[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
-    t1[4 * pitch + 3] = t1[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
-    t1[5 * pitch + 2] = t1[5 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
-    t1[5 * pitch + 3] = t1[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
-    t1[6 * pitch + 3] = t1[6 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFA500u;
+    t1[1 * pitch + 3] = t1[1 * pitch + 4] = t1[6 * pitch + 3] = t1[6 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFA500u;
+    for (unsigned r = 2u; r <= 5u; r++) {
+        if (r == 3u || r == 4u) t1[r * pitch + 1] = t1[r * pitch + 6] = MM_EMISSIVE_TAG | 0x00FFA500u;
+        t1[r * pitch + 2] = t1[r * pitch + 5] = MM_EMISSIVE_TAG | 0x00FFD700u;
+        t1[r * pitch + 3] = t1[r * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+    }
 
     /* Type 2: PARTICLE_MOTE (magical pink/white circular rising mote) */
     volatile uint32_t *t2 = base + pitch * 16u;
@@ -2372,68 +2451,27 @@ static void particle_tile_build(void)
         for (int x = 1; x <= 6; x++) {
             int dx = x * 2 - 7;
             int d2 = dx * dx + dy * dy;
-            if (d2 <= 8) {
-                t2[y * pitch + x] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
-            } else if (d2 <= 20) {
-                t2[y * pitch + x] = MM_EMISSIVE_TAG | 0x00FFA0E0u;
-            } else if (d2 <= 32) {
-                t2[y * pitch + x] = MM_EMISSIVE_TAG | 0x00602050u;
-            }
+            if (d2 <= 8)       t2[y * pitch + x] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
+            else if (d2 <= 20) t2[y * pitch + x] = MM_EMISSIVE_TAG | 0x00FFA0E0u;
+            else if (d2 <= 32) t2[y * pitch + x] = MM_EMISSIVE_TAG | 0x00602050u;
         }
     }
 
-    /* Type 3: PARTICLE_CRIT (crimson star, 8x8) */
-    volatile uint32_t *t3 = base + pitch * 24u;
-    t3[1 * pitch + 3] = t3[1 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF3050u;
-    t3[2 * pitch + 3] = t3[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF6080u;
-    t3[3 * pitch + 1] = t3[3 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FF3050u;
-    t3[3 * pitch + 2] = t3[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FF80A0u;
-    t3[3 * pitch + 3] = t3[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
-    t3[4 * pitch + 1] = t3[4 * pitch + 6] = MM_EMISSIVE_TAG | 0x00FF3050u;
-    t3[4 * pitch + 2] = t3[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00FF80A0u;
-    t3[4 * pitch + 3] = t3[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
-    t3[5 * pitch + 3] = t3[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF6080u;
-    t3[6 * pitch + 3] = t3[6 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FF3050u;
-
-    /* Type 4: PARTICLE_CYAN (electric cyan / graze spark, 8x8) */
-    volatile uint32_t *t4 = base + pitch * 32u;
-    t4[1 * pitch + 3] = t4[1 * pitch + 4] = MM_EMISSIVE_TAG | 0x000070D0u;
-    t4[2 * pitch + 3] = t4[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x0000C0FFu;
-    t4[3 * pitch + 1] = t4[3 * pitch + 6] = MM_EMISSIVE_TAG | 0x000070D0u;
-    t4[3 * pitch + 2] = t4[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x0000E0FFu;
-    t4[3 * pitch + 3] = t4[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
-    t4[4 * pitch + 1] = t4[4 * pitch + 6] = MM_EMISSIVE_TAG | 0x000070D0u;
-    t4[4 * pitch + 2] = t4[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x0000E0FFu;
-    t4[4 * pitch + 3] = t4[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00FFFFFFu;
-    t4[5 * pitch + 3] = t4[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x0000C0FFu;
-    t4[6 * pitch + 3] = t4[6 * pitch + 4] = MM_EMISSIVE_TAG | 0x000070D0u;
-
-    /* Type 5: PARTICLE_DIM_GOLD (decaying golden ember, 8x8) */
-    volatile uint32_t *t5 = base + pitch * 40u;
-    t5[2 * pitch + 3] = t5[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00704008u;
-    t5[3 * pitch + 2] = t5[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00704008u;
-    t5[3 * pitch + 3] = t5[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00D09010u;
-    t5[4 * pitch + 2] = t5[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00704008u;
-    t5[4 * pitch + 3] = t5[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00D09010u;
-    t5[5 * pitch + 3] = t5[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00704008u;
-
-    /* Type 6: PARTICLE_DIM_MOTE (decaying cyan/soft mote ember, 8x8) */
-    volatile uint32_t *t6 = base + pitch * 48u;
-    t6[2 * pitch + 3] = t6[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00203050u;
-    t6[3 * pitch + 2] = t6[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00203050u;
-    t6[3 * pitch + 3] = t6[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x004080A0u;
-    t6[4 * pitch + 2] = t6[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00203050u;
-    t6[4 * pitch + 3] = t6[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x004080A0u;
-    t6[5 * pitch + 3] = t6[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00203050u;
-
-    /* Type 7: PARTICLE_DIM_FIRE (decaying crimson ember, 8x8) */
-    volatile uint32_t *t7 = base + pitch * 56u;
-    t7[2 * pitch + 3] = t7[2 * pitch + 4] = MM_EMISSIVE_TAG | 0x00401018u;
-    t7[3 * pitch + 2] = t7[3 * pitch + 5] = MM_EMISSIVE_TAG | 0x00401018u;
-    t7[3 * pitch + 3] = t7[3 * pitch + 4] = MM_EMISSIVE_TAG | 0x00902030u;
-    t7[4 * pitch + 2] = t7[4 * pitch + 5] = MM_EMISSIVE_TAG | 0x00401018u;
-    t7[4 * pitch + 3] = t7[4 * pitch + 4] = MM_EMISSIVE_TAG | 0x00902030u;
-    t7[5 * pitch + 3] = t7[5 * pitch + 4] = MM_EMISSIVE_TAG | 0x00401018u;
+    /* Types 5, 6, 7: decaying embers (gold, cyan/mote, crimson fire) */
+    static const uint32_t dim_cols[3][2] = {
+        { MM_EMISSIVE_TAG | 0x00704008u, MM_EMISSIVE_TAG | 0x00D09010u },
+        { MM_EMISSIVE_TAG | 0x00203050u, MM_EMISSIVE_TAG | 0x004080A0u },
+        { MM_EMISSIVE_TAG | 0x00401018u, MM_EMISSIVE_TAG | 0x00902030u },
+    };
+    for (unsigned k = 0; k < 3u; k++) {
+        volatile uint32_t *t = base + pitch * (40u + k * 8u);
+        uint32_t co = dim_cols[k][0], ci = dim_cols[k][1];
+        t[2 * pitch + 3] = t[2 * pitch + 4] = t[5 * pitch + 3] = t[5 * pitch + 4] = co;
+        for (unsigned r = 3u; r <= 4u; r++) {
+            t[r * pitch + 2] = t[r * pitch + 5] = co;
+            t[r * pitch + 3] = t[r * pitch + 4] = ci;
+        }
+    }
 
     gpu2d_flush_dcache();
 }
@@ -2858,6 +2896,7 @@ static int count_active(void)
 
 static void pool_clear(void)
 {
+    boss23_clear();spell->age=0;spell->kind=0;spell->burst_count=0;
     for (int i = 0; i < MAX_ENEMIES; i++)  enemies[i].flags  = 0;
     for (int i = 0; i < MAX_PBULLETS; i++) pbullets[i].flags = 0;
     for (int i = 0; i < EBULLET_CAMPAIGN_CLEAR; i++) ebullets[i].flags = 0;
@@ -2876,7 +2915,10 @@ static void pool_clear(void)
 
 static bullet_t *alloc_bullet_range(bullet_t *pool, int lo, int hi)
 {
-    for (bullet_t *b = pool + lo, *end = pool + hi; b < end; b++)
+    bullet_t *b = pool + lo, *end = pool + hi;
+    while (b + 4 <= end && (b[0].flags & b[1].flags & b[2].flags & b[3].flags & EF_ACTIVE))
+        b += 4;
+    for (; b < end; b++)
         if (!(b->flags & EF_ACTIVE)) return b;
     return (bullet_t *)0;
 }
@@ -2904,6 +2946,7 @@ static bullet_t *alloc_pbullet(void)
 /* Every enemy shot that is not an orb: the front of the pool only. */
 static bullet_t *alloc_ebullet(void)
 {
+    if (eb_free_hint > ORB_FIRST) return (bullet_t *)0;
     bullet_t *b = (bullet_t *)0;
     if (eb_free_hint < ORB_FIRST && !(ebullets[eb_free_hint].flags & EF_ACTIVE)) {
         b = &ebullets[eb_free_hint++];
@@ -2911,7 +2954,7 @@ static bullet_t *alloc_ebullet(void)
         b = alloc_bullet_range(ebullets, eb_free_hint, ORB_FIRST);
         if (!b && eb_free_hint > 0)
             b = alloc_bullet_range(ebullets, 0, eb_free_hint);
-        if (b) eb_free_hint = (int)(b - ebullets) + 1;
+        eb_free_hint = b ? (int)(b - ebullets) + 1 : ORB_FIRST + 1;
     }
 
     if (b) {
@@ -2927,12 +2970,12 @@ static bullet_t *alloc_ebullet(void)
  * See ORB_RESERVE for what this is for. */
 static bullet_t *alloc_orb(void)
 {
-    /* The orb tail is a FIXED 32 slots and is walked in full every time (see
+    /* The orb tail is a FIXED 128 slots and is walked in full every time (see
      * FOR_EACH_EBULLET), so a slot taken here needs no bound update.  A slot
      * BORROWED from the front run does. */
     bullet_t *b = alloc_bullet_range(ebullets, ORB_FIRST, MAX_EBULLETS);
 
-    if (!b) {
+    if (!b && eb_free_hint <= ORB_FIRST) {
         b = alloc_bullet_range(ebullets, eb_free_hint, ORB_FIRST);
         if (!b && eb_free_hint > 0)
             b = alloc_bullet_range(ebullets, 0, eb_free_hint);
@@ -2940,6 +2983,8 @@ static bullet_t *alloc_orb(void)
             int i = (int)(b - ebullets);
             eb_free_hint = i + 1;
             if (i + 1 > eb_hi) eb_hi = i + 1;
+        } else {
+            eb_free_hint = ORB_FIRST + 1;
         }
     }
     if (b) {
@@ -3012,6 +3057,7 @@ static void spawn_ebullet(int x, int y, int vx, int vy, uint8_t color)
     if (y < PLAYFIELD_TOP + 1)  y = PLAYFIELD_TOP + 1;
     if (y > GAME_BOTTOM - 2)    y = GAME_BOTTOM - 2;
     b->x = (int16_t)x; b->y = (int16_t)y;
+    if(!(vx|vy))vy=1;
     b->vx = (int8_t)vx; b->vy = (int8_t)vy;
     b->color = color;  b->flags = EF_ACTIVE;
 }
@@ -3026,6 +3072,7 @@ static void spawn_ebullet_orb(int x, int y, int vx, int vy, uint8_t color)
     if (y > GAME_BOTTOM - 16)   y = GAME_BOTTOM - 16;
     b->x     = (int16_t)x;
     b->y     = (int16_t)y;
+    if(!(vx|vy))vy=1;
     b->vx    = (int8_t)vx;
     b->vy    = (int8_t)vy;
     b->color = color;
@@ -3053,7 +3100,7 @@ static void spawn_held_ebullet(int x, int y, uint8_t color)
  * because bullets_update() has to turn it at the walls, and its facing is
  * read back out of the velocity when it is drawn - so nothing extra has to
  * be stored in a record that is exactly eight bytes wide. */
-static void spawn_lance(int x, int y, int vx, int vy)
+static void __attribute__((unused)) spawn_lance(int x, int y, int vx, int vy)
 {
     bullet_t *b = alloc_ebullet();
     if (!b) return;
@@ -3098,7 +3145,6 @@ static enemy_rec_t *spawn_enemy(int type, int x, int y)
         if (e->flags & EF_ACTIVE) continue;
         e->x = (int16_t)x;  e->y = (int16_t)y;
         e->vx = 0;          e->vy = 0;
-        e->phase = 0;
         e->type = (uint8_t)type;
         e->flags = EF_ACTIVE;
         switch (type) {
@@ -3135,6 +3181,17 @@ static enemy_rec_t *spawn_enemy(int type, int x, int y)
     return (enemy_rec_t *)0;
 }
 
+static void stress_minions_refill(void)
+{
+    if (count_active()) return;
+    for (int i = 0; i < STRESS_MINIONS; i++) {
+        enemy_rec_t *e = spawn_enemy(i & 3, GAME_LEFT + 32 + (i % 10) * 96, 80);
+        if (!e) break;
+        e->y = (int16_t)(80 + (i / 10) * 42);
+        e->vy = 0; /* no escaping: all 50 must be killed before the next batch */
+    }
+}
+
 static void spawn_item(int x, int y, int type)
 {
     for (int i = 0; i < MAX_ITEMS; i++) {
@@ -3156,7 +3213,7 @@ static void spawn_item(int x, int y, int type)
  * power-up system is actually visible during a short play test. */
 static void maybe_drop(int x, int y)
 {
-    if (rand_percent() >= 60u) return;
+    if (is_stress_stage || rand_percent() >= 60u) return;
     uint32_t k = rand_percent();
     if (k < 15u)      spawn_item(x, y, ITEM_HEAL);
     else if (k < 40u) spawn_item(x, y, ITEM_RATE);
@@ -3198,15 +3255,8 @@ static void player_fire(void)
 
     case W_FAN: {
         /* 3 -> 5 -> 7 -> 9 shots, always centred and symmetric.
-         *
-         * Written as a table because the arithmetic this replaced did not do
-         * what its comment said: -(lv / 2 + 1) .. +(lv / 2 + 1) with integer
-         * division gives 3, 5, 5, 7 - level 3 fired exactly what level 2 did,
-         * so the third SHOT pickup changed nothing on screen and only the
-         * fourth did.  The spread also runs to +-24 px at level 4; the craft's
-         * silhouette is 48 px wide. */
-        static const int fan_span[4] = { 1, 2, 3, 4 };   /* lv 1..4 */
-        int span = fan_span[(lv < 1) ? 0 : ((lv > 4) ? 3 : (lv - 1))];
+         * The span equals the clamped level; no lookup table is needed. */
+        int span = (lv < 1) ? 1 : ((lv > 4) ? 4 : lv);
         for (int k = -span; k <= span; k++)
             spawn_pbullet(cx + k * 6, cy + ((k & 1) ? 6 : 4), k * 3,
                           -SPD_PBULLET_S, (uint8_t)(3 + ((k + 4) & 1)));
@@ -3299,6 +3349,7 @@ static void player_bomb(void)
 
     bomb_charge = 0;
     bomb_flash  = BOMB_FLASH_FRAMES;
+    bomb_x = (int16_t)cx; bomb_y = (int16_t)cy;
 
     /* Task 12: in the pressure stage the spell card is a WEAPON, not a reset.
      *
@@ -3311,6 +3362,7 @@ static void player_bomb(void)
      * shockwave ring, so the button still does something visible and useful -
      * it just no longer deletes the field. */
     if (!is_stress_stage) {
+        boss23_clear();spell->burst_count=0;
         bullet_t *eb;
 
         FOR_EACH_EBULLET(eb) {
@@ -3327,7 +3379,6 @@ static void player_bomb(void)
         eb_free_hint = 0;
         active_ebullets_count = 0;
         active_count = 0;
-        color_matrix_flash_timer = CM_FLASH_FRAMES;
     }
 
     for (int i = 0; i < MAX_ENEMIES; i++) {
@@ -3341,8 +3392,7 @@ static void player_bomb(void)
                         e->x + 12, e->y + 12);
         }
     }
-    if (boss_state == BOSS_FIGHT)
-        boss_hp = (int16_t)(boss_hp - (int16_t)(atk * 20));
+    boss_take_damage((int16_t)(atk * 20));
 
     for (int k = 0; k < 16; k++)
         spawn_pbullet(cx + ((dir16_x[k] * 20) >> 4),
@@ -3384,101 +3434,67 @@ static void laser_tick(uint8_t held)
     if (boss_state == BOSS_FIGHT &&
         boss_x + 64 >= player_x - 8 && boss_x <= player_x + 8 &&
         boss_y + 64 >= GAME_TOP && boss_y <= player_y - 18) {
-        boss_hp = (int16_t)(boss_hp - (int16_t)atk);
+        boss_take_damage((int16_t)atk);
         laser_hits++;
     }
 }
 
-/* ---- Task 12: the continuous barrage -----------------------------------
- *
- * The stage holds STRESS_STORM_TARGET shots in the air, and it does that by
- * ASKING THE POOL how full it is and topping it up - not by firing on a
- * schedule.  A schedule would have to be tuned against the cull rate (a shot
- * leaves at the playfield edge, or on the frame it reaches the craft), and any
- * such tuning is wrong the moment the player moves or stops shooting.  Counting
- * costs one pass over MAX_EBULLETS flag bytes and needs no constant at all.
- *
- * Three sources, mixed ring/cone/wall = 1/3, 1/6, 1/2:
- *
- *   ring - one arm per step around the boss, i.e. a slow multi-petal rose as
- *          the boss drifts across its move targets
- *   cone - four aim offsets on the craft, so standing still is punished
- *   wall - a crossing shot from alternating edges, so the walls are not the
- *          safe place the other two can leave them
- *
- * The budget cap is what keeps those three APART on screen.  Filling the pool
- *
- * SPAWN GEOMETRY: the 24-step schedule is ring / cone / wall-left / wall-right,
- * 25% each. Every shot is born on a coprime lattice of the 96 scanline groups
- * (step * 5), and the walls drift one pixel vertically. A 26 px sprite covers
- * about three groups, and 20000 of them only stay under the 1024-entry group
- * cap when no band is allowed to sit still on the row it was born on. Wall X
- * is the coprocessor's playfield (x in [182, 1169], bound_x in ti60_top.v);
- * GAME_RIGHT-11 is already outside that box. */
+/* Free-flight pressure fill. Keep scanline groups balanced, but decorrelate
+ * X, sub-row, direction and speed so fill shots cannot form marching walls.
+ * Colour bit 6 selects the BOSS spark atlas without CPU-owned Q4 movement. */
 static uint16_t stress_storm_step;
-
-/* 24-entry pattern table: high 2 bits = kind (0:Ring, 1:Cone, 2:Wall L, 3:Wall R),
- * low 6 bits = sub-index within that kind.
- * 50% Wall (6 Left, 6 Right), 25% Ring, 25% Cone. Interleaved every other step. */
-static const uint8_t storm_sched[24] = {
-    0, 128, 64, 198,
-    1, 129, 65, 199,
-    2, 130, 66, 200,
-    3, 131, 67, 201,
-    4, 132, 68, 202,
-    5, 133, 69, 203
-};
 
 static void stress_storm_update(void)
 {
-    int active = active_ebullets_count;
-
-    /* Real live reserve covers the DMA culls at the end of this frame. */
-    int room = (int)stress_target + (stress_target >= 4000u ? 64 : 0) - active;
+    int room = (int)stress_target + (stress_target >= 4000u ? 224 : 0) - active_ebullets_count;
     if (room <= 0) return;
     if (room > STRESS_STORM_BUDGET) room = STRESS_STORM_BUDGET;
-
-    int cx = boss_x + 32;
-    int cy = boss_y + 28;
-    int base_aim = aim_index(player_x - cx, player_y - cy);
-
-    unsigned cur_step = (unsigned)stress_storm_step;
-    unsigned rem = cur_step % 24u;
-
     for (int i = 0; i < room; i++) {
-        unsigned step = cur_step + (unsigned)i;
-        uint8_t entry = storm_sched[rem];
-        unsigned kind = entry >> 6;
-        unsigned sub = entry & 0x3Fu;
-        /* (step * 5) mod 96 visits every scanline group before it repeats. */
-        int y = (int)((((step * 5u) % 96u) << 3) + 4u);
-
-        if (kind == 0u) {
-            int a = (int)((step * 2u) & 15u);
-            int x = GAME_LEFT + 8 + (int)((step * 17u) % 960u);
-            spawn_ebullet(x, y,
-                          (dir16_x[a] * SPD_STORM) >> 4,
-                          (dir16_y[a] * SPD_STORM) >> 4, 5);
-        } else if (kind == 1u) {
-            int off = ((int)(step & 12u) >> 2) - 1;   /* -1..+2 */
-            int a = (base_aim + off + ((sub & 1u) ? 8 : 0)) & 15;
-            int x = GAME_LEFT + 8 + (int)(((step * 17u) + 400u) % 960u);
-            spawn_ebullet(x, y,
-                          (dir16_x[a] * SPD_STORM) >> 4,
-                          (dir16_y[a] * SPD_STORM) >> 4, 3);
-        } else {
-            int vy = (step & 1u) ? 1 : -1;
-            if ((unsigned)(y + vy - 1) > 766u) vy = -vy;
-            if (kind == 2u)
-                spawn_ebullet(GAME_LEFT + 1, y, SPD_STORM, vy, 4);
-            else
-                spawn_ebullet(GAME_RIGHT - 16, y, -SPD_STORM, vy, 4);
+        unsigned step = stress_storm_step++;
+        unsigned col = (step * 3u + (step >> 4)) & 15u;
+        int x = GAME_LEFT + 38 + (int)col * 62 + (int)(((step >> 4) ^ col) & 3u) * 4;
+        unsigned g = (step * 5u) % 96u;
+        unsigned sub_y = (step ^ (step >> 4)) & 7u;
+        unsigned a = (step + (step >> 4) * 3u) & 15u;
+        int speed = SPD_STORM - 1 + (int)(((step >> 3) ^ (step >> 7)) & 1u);
+        uint8_t color = (uint8_t)(BCOLOR_GLOW | ((col + (step >> 5)) & 7u));
+        if (active_ebullets_count >= 256) {
+            const uint16_t *used = (const uint16_t *)MM_BUCKET_USED + bt_buf * MM_BUCKET_ROWS;
+            unsigned bg = (unsigned)(boss_y + 28) >> 3;
+            sub_y = (step & 1u) ? 7u : 0u;
+            unsigned best_g = g, best_c = 65535u, best_max_u = 0u;
+            for (unsigned k = 0u; k < 16u; k++) {
+                unsigned cg = (g + k * 11u) % 96u;
+                unsigned g0 = cg < 2u ? 0u : (cg > 92u ? 92u : (sub_y ? cg - 1u : cg - 2u));
+                unsigned u0 = used[g0], u1 = used[g0 + 1u], u2 = used[g0 + 2u], u3 = used[g0 + 3u];
+                unsigned mu = u0 > u1 ? u0 : u1;
+                if (u2 > mu) mu = u2;
+                if (u3 > mu) mu = u3;
+                unsigned metric = (mu << 3) + u0 + u1 + u2 + u3 +
+                              (active_ebullets_count >= 12000 && cg + 10u >= bg && cg <= bg + 10u ? 800u : 0u);
+                if (metric < best_c) {
+                    best_c = metric;
+                    best_g = cg;
+                    best_max_u = mu;
+                }
+            }
+            g = best_g;
+            static const uint8_t sym_a[8] = { 1, 7, 9, 15, 0, 8, 2, 14 };
+            unsigned mcol = col < 8u ? col : 15u - col;
+            unsigned wdir = sym_a[(mcol + (step >> 6)) & 7u];
+            a = (col < 8u) ? wdir : ((8u - wdir) & 15u);
+            speed = SPD_STORM + (int)((mcol ^ (step >> 5)) & 1u);
+            uint8_t hue = (uint8_t)((mcol + (step >> 6)) & 7u);
+            int is_glow = ((step % 5u) != 0u);
+            if (is_glow && best_max_u >= 680u) {
+                is_glow = 0;
+            }
+            color = is_glow ? (uint8_t)(BCOLOR_GLOW | hue) : hue;
         }
-
-        rem++;
-        if (rem == 24u) rem = 0;
+        int y = (int)(g * 8u + sub_y);
+        spawn_ebullet(x, y, (dir16_x[a] * speed) >> 4,
+                      (dir16_y[a] * speed) >> 4, color);
     }
-    stress_storm_step = (uint16_t)(stress_storm_step + (unsigned)room);
 }
 
 /* Phase 2 Task 02: a hit is a screen-clearing event now, not a cosmetic blink.
@@ -3532,32 +3548,7 @@ static void take_hit(void)
     hit_ring_timer = HIT_RING_FRAMES;
     hitstop = HITSTOP_HIT;
 
-    /* Clear the field.  The pool is DDR so the flags byte is the only write,
-     * and one mote per shot is what sells "the curtain was blown apart" -
-     * particle_cursor wraps over the 48-slot ring, so a 192-shot screen simply
-     * keeps the newest 48 of them.
-     *
-     * Task 12: not in the pressure stage.  "????????????" is the whole
-     * premise of the stage - the barrage has to survive the player being hit,
-     * or the continuous-load measurement restarts every time it lands. */
-    if (!is_stress_stage) {
-        bullet_t *eb;
-
-        FOR_EACH_EBULLET(eb) {
-            int bx = eb->x;
-            int by = eb->y;
-            eb->flags = 0;
-            spawn_particle(bx, by,
-                           (int)(xorshift32() % 3u) - 1,
-                           -2 - (int)(xorshift32() % 2u),
-                           PARTICLE_MOTE, 24);
-        }
-        eb_hi = 0;
-        eb_lance_count = 0;
-        eb_free_hint = 0;
-        active_ebullets_count = 0;
-        active_count = 0;
-    }
+    /* Hit field clear removed per requirement: barrage is preserved on player hit. */
 
     /* Back to the classic spawn point: centred, on the bottom third of the
      * field.  Same expression game_init() uses, so a fresh run and a respawn
@@ -3638,34 +3629,7 @@ static void apply_item(uint8_t type)
 
 /* ---------------------------------------------------------------- boss  */
 
-/* The book is drawn at random and the old rule only refused to repeat the
- * pattern that is up RIGHT NOW.  Measured over 200 forced changes, that
- * leaves the median gap between two sightings of the same attack at five
- * changes - around ten seconds of play - which is exactly what "the boss
- * keeps doing the same thing" describes.  Remember the last few and draw
- * around them instead.  SUMMON is forced by the counter below, never
- * drawn, so it does not take a slot here. */
-/* The stage-1 book.  Twelve of the eighteen, so one fight can deal every
- * skill the build has bar the ones only the later stages open with.  A
- * table rather than the old `r & 7` mask: eighteen is not a power of two,
- * and a mask can only ever name a contiguous range anyway. */
-static const uint8_t pat_book1[12] = {
-    PAT_FAN, PAT_RING, PAT_AIMED, PAT_TWIN,
-    PAT_CUT, PAT_LOCKON, PAT_BURST, PAT_VOLLEY,
-    PAT_SWAY, PAT_BEAM, PAT_TORNADO, PAT_LANCE
-};
-
-/* Stage 2's book.  It was RAIN and the spiral family - three patterns in all -
- * so PAT_CUT and PAT_BEAM were not in the table and its boss could never show
- * a laser: a player who reached stage 2 fought a laser-less boss.  The two
- * laser skills join the table here, and the rest of it stays the spiral stage
- * it always was. */
-static const uint8_t pat_book2[12] = {
-    PAT_RAIN, PAT_SPIRAL, PAT_CROSS, PAT_AIMED,
-    PAT_RAIN, PAT_SPIRAL, PAT_CROSS, PAT_TWIN,
-    PAT_BURST, PAT_SWAY, PAT_CUT, PAT_BEAM
-};
-
+/* Campaign bosses own their casts; this book belongs to the pressure stage. */
 /* Deterministic coverage of every non-summon attack in a sustained load run.
  * Keep collision, lock-on, lance, impact FX and laser workloads enabled. */
 static const uint8_t pat_book_stress[] = {
@@ -3675,73 +3639,15 @@ static const uint8_t pat_book_stress[] = {
     PAT_AIMED, PAT_LOCKON, PAT_SWAY, PAT_VOLLEY, PAT_CURTAIN
 };
 
-#define PAT_RECENT 5
-static uint8_t pat_recent[PAT_RECENT];
-static uint8_t pat_recent_n;
-
-static int pat_recent_has(uint8_t p)
-{
-    for (unsigned i = 0; i < (unsigned)pat_recent_n; i++)
-        if (pat_recent[i] == p) return 1;
-    return 0;
-}
-
-static void pat_recent_push(uint8_t p)
-{
-    if (p == PAT_SUMMON) return;
-    for (unsigned i = PAT_RECENT - 1u; i > 0u; i--)
-        pat_recent[i] = pat_recent[i - 1u];
-    pat_recent[0] = p;
-    if (pat_recent_n < PAT_RECENT) pat_recent_n++;
-}
-
 static void boss_next_pattern(void)
 {
-    /* The summon pattern is guaranteed to come round at least every fourth
-     * change: the boss always reinforces, and the behaviour stays testable
-     * instead of depending on a lucky random draw. */
-    if (is_stress_stage) {
-        boss_pattern = pat_book_stress[(pattern_changes + 1u) % sizeof(pat_book_stress)];
-        boss_prev_pat = boss_pattern;
-    } else if (boss_since_summon >= 3) {
-        boss_pattern     = PAT_SUMMON;
-        boss_prev_pat    = PAT_SUMMON;
-        boss_since_summon = 0;
-    } else {
-        boss_since_summon++;
-        int pick = -1;
-        for (int t = 0; t < 8; t++) {
-            uint8_t p;
-            uint32_t r = xorshift32();
-            /* Each stage opens more of the book than the last.  Stage 1 used
-             * to cycle fan / ring / aimed and nothing else, which is why the
-             * first boss felt thin next to the later ones. */
-            /* Every book carries both laser skills: stage 1's table always
-             * did, stage 2's did not, and the pressure stage has one of its
-             * own with the lasers at twice the density. */
-            if (wave == 0) {
-                p = pat_book1[r % 12u];
-            }
-            else if (wave == 1) p = pat_book2[r % 12u];
-            else p = (uint8_t)(r % PAT_COUNT);
-            if (p == PAT_SUMMON || p == boss_prev_pat) continue;
-            pick = p;
-            if (!pat_recent_has(p)) break;   /* not seen lately: take it */
-        }
-        /* Fall back to the first legal candidate: an eight-draw miss must
-         * never leave the boss holding its old pattern. */
-        if (pick >= 0) {
-            boss_pattern  = (uint8_t)pick;
-            boss_prev_pat = (uint8_t)pick;
-        }
-    }
-    pat_recent_push(boss_pattern);
+    boss_pattern=pat_book_stress[(pattern_changes+1u)%sizeof(pat_book_stress)];
     pattern_changes++;
-    boss_pat_timer  = (uint8_t)(105 + (xorshift32() & 31u));
-    boss_fire_timer = 12;
+    boss_pat_timer=(uint8_t)(105+(xorshift32()&31u));
+    boss_fire_timer=12;
 }
 
-static void boss_fire(void)
+static void __attribute__((unused)) boss_fire(void)
 {
     int cx = boss_x + 32;
     int cy = boss_y + 28;
@@ -3959,6 +3865,7 @@ static void boss_fire(void)
         break;
 
     default:                                        /* PAT_SUMMON */
+        if (is_stress_stage) break; /* pressure minions belong to the fixed batch */
         for (int k = 0; k < 3; k++) {
             int mx = GAME_LEFT + 60 + (int)(xorshift32() % 500u);
             if (spawn_enemy(ENEMY_MINION, mx, 60)) summons++;
@@ -3966,6 +3873,7 @@ static void boss_fire(void)
         break;
     }
 }
+
 
 /* ---- the boss's own spell card ----------------------------------------
  * Fired the instant the freeze releases: a double ring of shots, four laser
@@ -3995,10 +3903,120 @@ static void boss_fire(void)
 #define BOSS_LASER_X(k) \
     (GAME_LEFT + (GAME_RIGHT - GAME_LEFT) * (2 * (k) + 1) / 8)
 
+/* Q4 velocities preserve the HTML's 420 px/s without floating point. */
+static void skill1_shot(int x, int y, int vx, int vy, unsigned hue, unsigned flags)
+{
+    if (is_stress_stage && active_ebullets_count >= ORB_FIRST - 128) return;
+    bullet_t *b = alloc_ebullet();
+    if (!b) return;
+    if (is_stress_stage && active_ebullets_count >= 4000) {
+        vx = (vx + 8) >> 4;
+        vy = (vy + 8) >> 4;
+        if (!vy) vy = ((b - ebullets) & 1) ? 1 : -1;
+        if (active_ebullets_count >= 12000 && (unsigned)(y - 64) < 640u) {
+            int s = (int)(b - ebullets) & 7;
+            x += vx * s;
+            y += vy * s;
+        }
+        hue = BCOLOR_GLOW | (hue & 7u);
+        flags = 0;
+    } else if (is_stress_stage && eb_lance_count < MM_LANCE_INDEX_MAX) {
+        eb_lances[eb_lance_count++] = (uint16_t)(b - ebullets);
+    }
+    b->x = (int16_t)x; b->y = (int16_t)y;
+    b->vx = (int8_t)vx; b->vy = (int8_t)vy;
+    b->color = (uint8_t)hue;
+    bullet_frac[b - ebullets] = 0;
+    b->flags = (uint8_t)(EF_ACTIVE | flags);
+}
+
+#include "boss23_skills.h"
+
+static void boss1_tick(void)
+{
+    boss1_cast_t *c = boss1_cast;
+    unsigned age = c->age;
+    int x = boss_x + 32;
+    int y = boss_y + 28;
+
+    if (!age) {
+        c->x = x; c->y = y;
+        boss_pattern = c->kind == 0 ? PAT_SPIRAL : c->kind == 1 ? PAT_CUT : PAT_FAN;
+        pattern_changes++;
+        if (c->kind == 0) {
+            spell_ring(x, y, 20, 220, 60, 4, 0, 0);
+        } else if (c->kind == 1) {
+            spell_ring(x, y, 30, 240, 50, 6, 1, 0);
+        } else {
+            spell_ring(x, y, 15, 260, 70, 2, 2, 0);
+        }
+        audio_event(AUDIO_EVENT_BOSS);
+    }
+
+    if (c->kind == 0) {
+        /* Skill 0: 冰魄霜华 · 双旋极光星核阵 (Aurora Frost Dual Spiral & Orbs) */
+        if (age < 210u && (age % 6u) == 0u) {
+            unsigned a1 = age * 720u;
+            unsigned a2 = 0u - age * 720u;
+            for (int k = 0; k < 3; k++) {
+                unsigned a = a1 + (unsigned)k * 21845u;
+                spell_shot(x, y, a, 140, 4);
+            }
+            for (int k = 0; k < 3; k++) {
+                unsigned a = a2 + (unsigned)k * 21845u;
+                spell_shot(x, y, a, 140, 2);
+            }
+            if ((age % 18u) == 0u) {
+                for (int k = 0; k < 3; k++) {
+                    unsigned a = a1 + (unsigned)k * 21845u;
+                    int vx = (spell_sin(a + 16384u) * 3) >> 14;
+                    int vy = (spell_sin(a) * 3) >> 14;
+                    spawn_ebullet_orb(x, y, vx, vy, 4);
+                }
+                audio_event(AUDIO_EVENT_BOSS);
+            }
+        }
+    } else if (c->kind == 1) {
+        /* Skill 1: 18方向定点旋转激光 (18-Direction Timed Rotating Laser) */
+        if (age < 162u && (age % 9u) == 0u) {
+            unsigned i = age / 9u;
+            for (int t = -320; t <= 320; t++) {
+                int lx = player_x + ((skill1_laser[i][0] * t) >> 6);
+                int ly = player_y + ((skill1_laser[i][1] * t) >> 6);
+                if (lx < GAME_LEFT + 8 || lx > GAME_RIGHT - 8 || ly < 8 || ly > GAME_BOTTOM - 8)
+                    continue;
+                skill1_shot(lx, ly, 98, 0, 6, EF_SKILL_LASER);
+            }
+            audio_event(AUDIO_EVENT_BOSS);
+        }
+    } else {
+        /* Skill 2: 绝对零度 · 寒晶十字圣域 (Absolute Zero Cross Domain) */
+        if (age < 210u && (age % 12u) == 0u) {
+            int row_offset = (int)((age / 12u) & 3u) * 60;
+            spawn_ebullet_orb(GAME_LEFT + 20, 140 + row_offset, 3, 0, 2);
+            spawn_ebullet_orb(GAME_RIGHT - 20, 170 + row_offset, -3, 0, 2);
+            for (int k = 0; k < 12; k++) {
+                unsigned a = (unsigned)k * 65536u / 12u + age * 120u;
+                spell_shot(x, y, a, 100, 4);
+            }
+            audio_event(AUDIO_EVENT_BOSS);
+        }
+    }
+
+    if (++c->age >= 270u) { c->age = 0; c->kind = (c->kind + 1u) % 3u; }
+}
+
 static void boss_clear_lasers(void)
 {
+    boss1_cast->age = 0;
+    spell->age=0;boss23_clear();spell->burst_count=0;
+    bullet_t *b;
+    FOR_EACH_EBULLET(b) {
+        if (b->flags & EF_SKILL_LASER) b->flags = 0;
+    }
     boss_laser = 0;
     boss_spell_vfx_timer = 0;
+    boss_signature_timer = 0;
     for (int k = 0; k < CUT_SLOTS; k++) {
         beam_phase[k] = 0;
         beam_timer[k] = 0;
@@ -4048,6 +4066,57 @@ static void boss_opener(int wipe)
         visual_burst(boss_x + 4 + k * 22, boss_y + 12 + (k & 1) * 36);
 
     boss_laser = BOSS_LASER_FRAMES;
+}
+
+static void boss_signature_tick(void)
+{
+    unsigned age = 192u - boss_signature_timer--;
+    int cx = boss_x + 32, cy = boss_y + 28;
+    if (age == 0u) {
+        audio_event(AUDIO_EVENT_BOSS);
+        if (stage_bg_active == SB_STAGE_LAVA) {
+            for (int k = 0; k < CUT_SLOTS; k++) {
+                beam_x[k] = (int16_t)(GAME_LEFT + 167 + k * 335);
+                beam_phase[k] = 1;
+                beam_timer[k] = 48;
+            }
+        }
+    }
+    if (age < 48u || age >= 176u || (age & 7u)) return;
+    if (stage_bg_active == SB_STAGE_ICE) {
+        if (age & 8u) return;
+        for (int k = 0; k < 6; k++) {
+            int d = (k * 16 / 6 + ((age >> 4) & 1u)) & 15;
+            for (int speed = 2; speed <= 4; speed++)
+                spawn_ebullet(cx, cy, (dir16_x[d] * speed) >> 4,
+                              (dir16_y[d] * speed) >> 4, (k & 1) ? 5 : 2);
+        }
+    } else if (stage_bg_active == SB_STAGE_LAVA) {
+        if (age & 8u) return;
+        for (int k = 0; k < CUT_SLOTS; k++)
+            for (int vx = -2; vx <= 2; vx += 2)
+                spawn_ebullet(beam_x[k], GAME_BOTTOM - 24, vx, -6, 6);
+        spawn_ebullet_orb(cx, cy, 0, 4, 0);
+    } else {
+        int phase = (int)((age >> 3) & 7u);
+        int vx = 2 + (phase < 4 ? phase : 7 - phase);
+        for (int side = 0; side < 2; side++)
+            for (int k = 0; k < 2; k++)
+                spawn_ebullet(side ? GAME_RIGHT - 80 : GAME_LEFT + 80, 160 + k * 20,
+                              side ? -vx - k : vx + k, 3 + (phase & 1), side ? 2 : 4);
+    }
+}
+
+static int boss_is_skill_busy(void)
+{
+    if (boss_signature_timer > 0) return 1;
+    if (boss_laser > 0) return 1;
+    if (lockon_arm > 0) return 1;
+    if (wave == 0) {
+        return (boss1_cast->age > 0 && boss1_cast->age < 210u);
+    } else {
+        return (spell->age > 0 && spell->age < 360u);
+    }
 }
 
 static void boss_update(void)
@@ -4196,26 +4265,45 @@ static void boss_update(void)
             }
         }
 
+        if (!is_stress_stage && boss_hp > 0) {
+            if (!boss_signature_used && !boss_laser && boss_hp <= boss_hp_max / 2) {
+                boss_clear_lasers();
+                boss_signature_used = 1;
+                boss_signature_timer = 192;
+            }
+            if (boss_signature_timer) { boss_signature_tick(); break; }
+        }
+
         /* Two spell cards, spent when the bar crosses two thirds and one
          * third.  Waiting for a threshold is what turns the opener from "the
          * boss says hello" into a beat the player causes: the fight pauses,
          * the field locks, and the screen opens up. */
-        if (boss_opener_stage < 2u &&
-            boss_hp <= (int16_t)((int32_t)boss_hp_max *
-                                 (int16_t)(2 - boss_opener_stage) / 3)) {
-            /* Hold the field FIRST and fire afterwards.  Releasing it here
-             * made the card one more pattern; the hold, the shaking scenery
-             * and the plate swap are what turn it into a beat the player sees
-             * coming and then survives. */
-            boss_opener_stage++;
-            boss_pending_opener = 1;
-            boss_shake          = BOSS_SHAKE_FRAMES;
-            boss_freeze_timer   = BOSS_CARD_HOLD;
-            boss_state          = BOSS_FREEZE;
-            boss_clear_lasers();
-            boss_card_active    = 1;
+        /* Two spell cards, spent when the bar crosses two thirds and one third.
+         * Requirement: lock HP at the threshold line, wait for currently active skill
+         * to complete before triggering the threshold opener (or trigger immediately
+         * if no skill is currently active), then release HP lock. */
+        if (!is_stress_stage && boss_opener_stage < 2u) {
+            int16_t mark = (int16_t)((int32_t)boss_hp_max * (int16_t)(2 - boss_opener_stage) / 3);
+            if (boss_hp <= mark) {
+                boss_hp = mark;
+                boss_hp_locked = 1;
+            }
+            if (boss_hp_locked) {
+                if (!boss_is_skill_busy()) {
+                    boss_opener_stage++;
+                    boss_pending_opener = 1;
+                    boss_shake          = BOSS_SHAKE_FRAMES;
+                    boss_freeze_timer   = BOSS_CARD_HOLD;
+                    boss_state          = BOSS_FREEZE;
+                    boss_clear_lasers();
+                    boss_card_active    = 1;
+                    boss_hp_locked      = 0;
+                    break;
+                }
+            }
         }
 
+        if (is_stress_stage || (wave == 0 ? boss1_cast->age >= 210u : spell->age >= 360u)) {
         if (boss_move_timer) boss_move_timer--;
         if (!boss_move_timer ||
             (boss_x == boss_target_x && boss_y == boss_target_y)) {
@@ -4234,16 +4322,37 @@ static void boss_update(void)
             boss_y = (int16_t)(boss_y + dy);
         }
 
-        if (boss_pat_timer == 0) boss_next_pattern();
-        else boss_pat_timer--;
-
-        if (boss_fire_timer) boss_fire_timer--;
-        else {
-            boss_fire();
-            /* the summon pattern is slow, the bullet patterns are slower still
-             * than a bullet-hell veteran would like - this build is meant to be
-             * survivable while the systems are still being tested */
-            boss_fire_timer = (uint8_t)((boss_pattern == PAT_SUMMON) ? 65 : 28 - wave * 4);
+        }
+        if (is_stress_stage || boss_hp > 0) {
+            if (!is_stress_stage && boss_fire_timer) boss_fire_timer--;
+            else if (!is_stress_stage && wave == 0) boss1_tick();
+            else boss23_tick();
+            if (is_stress_stage) {
+                unsigned st = spell->age;
+                if (st == 30u || st == 220u) {
+                    boss_laser = 48u;
+                    laser_columns_set(BOSS_LASER_X(0), BOSS_LASER_X(1),
+                                      BOSS_LASER_X(2), BOSS_LASER_X(3));
+                } else if (st == 100u || st == 285u || st == 385u) {
+                    for (int k = 0; k < CUT_SLOTS; k++) {
+                        beam_x[k] = (int16_t)(GAME_LEFT + 190 + ((st & 32u) ? 64 : 0) + k * 280);
+                        beam_phase[k] = 1u;
+                        beam_timer[k] = 24u;
+                    }
+                }
+                if ((st & 31u) == 16u) {
+                    int ox = (st & 32u) ? (GAME_LEFT + 220 + (int)(st & 64u) * 8) : (boss_x + 32);
+                    int oy = (st & 32u) ? 260 : (boss_y + 28);
+                    for (unsigned k = 0u; k < 16u; k++) {
+                        int sp = 3 + (int)(k & 1u);
+                        spawn_ebullet_orb(ox, oy, (dir16_x[k] * sp) >> 4,
+                                          (dir16_y[k] * sp) >> 4,
+                                          (uint8_t)((k + (st >> 5)) & 7u));
+                    }
+                }
+                if (!st && !spell->kind) wave = 3 - wave;
+            }
+            break;
         }
 
         if (boss_hp <= 0) {
@@ -4302,13 +4411,14 @@ static void boss_update(void)
             boss_state = BOSS_NONE;
             wave++;
             stage_background_load(wave);
-            kills = 0;
+            kills = bomb_kills_seen = 0;
+            campaign_round = round_spawned = 0;
             stage_banner = 170;         /* announce the new stage */
-            wave_max = (uint16_t)(wave_max + 6);
+
             spawn_timer = 90;
             boss_x = (int16_t)((GAME_LEFT + GAME_RIGHT) / 2 - 32);
             boss_y = -64;
-            boss_hp_max = (int16_t)(400 + (int16_t)wave * 200);
+            boss_hp_max = (int16_t)(200 + (int16_t)wave * 100);
             boss_move_timer = 0;
             for (int i = 0; i < MAX_ENEMIES; i++) enemies[i].flags = 0;
         }
@@ -4321,37 +4431,53 @@ static void boss_update(void)
 
 /* ------------------------------------------------------------- updates  */
 
+/* Five 15-ship ranks descend centre-first, then spread out in mirrored pairs.
+ * vx holds the formation's x anchor; pad holds its destination y. */
+#define RANK_COLS    15
+
 static void wave_update(void)
 {
-    if (boss_state != BOSS_NONE || game_clear) return;
-    int alive = count_active();
-
-    if (kills < wave_max) {
+    if (game_clear || is_stress_stage) return;
+    if (boss_state != BOSS_NONE) return;
+    if (round_spawned < MAX_ACTIVE_ENEMY) {
         if (spawn_timer) spawn_timer--;
-        else if (alive < MAX_ACTIVE_ENEMY + (int)wave) {
-            uint32_t r = xorshift32();
-            int type = (int)(r & 3u);
-            /* Span the WHOLE playfield.  The literal 540 was the old
-             * 640-wide playfield's usable width, so every minion used to spawn
-             * in the left half and the right half never had any pressure on it
-             * - a fairness bug the moment the playfield grew to 1004 wide. */
-            int x = GAME_LEFT + 40 +
-                    (int)((r >> 8) % (uint32_t)(GAME_RIGHT - GAME_LEFT - 80));
-            spawn_enemy(type, x, -20);
-            spawn_timer = (uint16_t)(36 - (wave > 4 ? 4 : wave) * 4);
+        else {
+            for (int n = 0; n < 5 && round_spawned < MAX_ACTIVE_ENEMY; n++) {
+                int row = round_spawned / RANK_COLS;
+                int k = round_spawned % RANK_COLS;
+                int wing = (k + 1) / 2;
+                int col = 7 + ((k & 1) ? -wing : wing);
+                int dest_x = GAME_LEFT + 68 + col * 60;
+                enemy_rec_t *e = spawn_enemy((row + campaign_round) & 3,
+                                             dest_x, -28);
+                if (!e) break;
+                e->vx = (int16_t)dest_x;
+                e->y = -28; /* turret construction normally overrides y */
+                e->pad = (uint16_t)(312 - row * 56 + wing * 4);
+                e->flags = EF_ACTIVE | EF_FORMATION;
+                e->fire_cd = (uint8_t)(60 + round_spawned);
+                round_spawned++;
+            }
+            spawn_timer = 8;
         }
-    } else if (alive == 0 && boss_state == BOSS_NONE) {
-        /* the boss only shows up once the quota is met AND the field is clear:
-         * every minion that was already out there has to be dealt with first */
+    } else if (count_active() == 0) {
+        if (++campaign_round < CAMPAIGN_ROUNDS) {
+            round_spawned = 0;
+            spawn_timer = 75; /* one second between cleared rounds */
+            return;
+        }
+        /* Five completed minion rounds, then the sixth round is the boss. */
         boss_state = BOSS_DIALOG;
         boss_y = -64;
         boss_x = (int16_t)((GAME_LEFT + GAME_RIGHT) / 2 - 32);
         boss_move_timer = 0;
         boss_hp = boss_hp_max;
         boss_opener_stage = 0;
+        boss_hp_locked = 0;
+        boss_signature_used = 0;
         boss_pattern = PAT_FAN;
         boss_prev_pat = PAT_FAN;
-        pat_recent_n = 0;
+        spell->age=0;spell->kind=0;boss23_clear();
         boss_pat_timer = 60;
         boss_fire_timer = 30;
         dialog_line = 0;
@@ -4402,46 +4528,117 @@ static void dialog_update(const gamepad_state_t *pad)
 
 static void enemies_update(void)
 {
+    int sway = (int)((frame_tick >> 1) & 63u);
+    if (sway >= 32) sway = 63 - sway;
+    sway -= 16;
     for (int i = 0; i < MAX_ENEMIES; i++) {
         enemy_rec_t *e = &enemies[i];
         if (!(e->flags & EF_ACTIVE)) continue;
 
-        e->x = (int16_t)(e->x + e->vx);
-        e->y = (int16_t)(e->y + e->vy);
-        if (e->x < GAME_LEFT + 4)       { e->x = GAME_LEFT + 4;       e->vx = (int16_t)-e->vx; }
-        if (e->x > GAME_RIGHT - 28)     { e->x = GAME_RIGHT - 28;     e->vx = (int16_t)-e->vx; }
-        /* leave enough room that the 24x24 sprite never reaches past screen bottom */
-        if (e->y > (int)GAME_BOTTOM - 24) { e->flags = 0; continue; }
+        if (e->flags & EF_FORMATION) {
+            e->x = (int16_t)(e->vx + sway);
+            if (e->y < (int16_t)e->pad) {
+                e->y = (int16_t)(e->y + 3);
+                if (e->y > (int16_t)e->pad) e->y = (int16_t)e->pad;
+            }
+            if (e->y == (int16_t)e->pad) {
+                e->flags = EF_ACTIVE | EF_FREE;
+                e->phase = (uint8_t)(45 + i);
+                e->vx = (i & 1) ? -2 : 2;
+                e->vy = (i & 2) ? -1 : 1;
+            }
+        } else {
+            if (e->flags & EF_FREE) {
+                if (!--e->phase) {
+                    uint32_t r = xorshift32();
+                    e->vx = (r & 1u) ? -2 : 2;
+                    e->vy = (r & 2u) ? -1 : 1;
+                    e->phase = (uint8_t)(45 + ((r >> 2) & 63u));
+                }
+                if (e->y <= 48) e->vy = 1;
+                if (e->y >= 460) e->vy = -1;
+            }
+            e->x = (int16_t)(e->x + e->vx);
+            e->y = (int16_t)(e->y + e->vy);
+            if (e->x < GAME_LEFT + 4)       { e->x = GAME_LEFT + 4;       e->vx = (int16_t)-e->vx; }
+            if (e->x > GAME_RIGHT - 28)     { e->x = GAME_RIGHT - 28;     e->vx = (int16_t)-e->vx; }
+            /* leave enough room that the 24x24 sprite never reaches past screen bottom */
+            if (e->y > (int)GAME_BOTTOM - 24) { e->flags = 0; continue; }
+        }
 
+        /* Waiting above the screen must not produce invisible shooters. */
+        if (e->y < 0) continue;
         if (e->fire_cd) e->fire_cd--;
-        else {
+        else if (!is_stress_stage || active_ebullets_count < (int)stress_target - 64) {
             int cx = e->x + 12;
             int cy = e->y + 12;
+            int orb_burst = (int)((unsigned)(i + (frame_tick >> 6)) & 1u);
             switch (e->type) {
             case ENEMY_FAIRY:
-                /* a three-shot aimed spread instead of one, and still slow */
-                aimed_shot(cx, cy, player_x, player_y, SPD_AIM_FAST, 0);
-                aimed_shot_off(cx, cy, player_x, player_y, SPD_AIM_SLOW, 1, 0);
-                aimed_shot_off(cx, cy, player_x, player_y, SPD_AIM_SLOW, -1, 0);
-                e->fire_cd = 90;
+                if (orb_burst) {
+                    /* 专属光球技能【精灵星曜】：向自机打出一颗高亮 Alpha 混合光球，两侧伴生扇形四弹 */
+                    int dx = player_x - cx, dy = player_y - cy;
+                    int aim = aim_index(dx, dy);
+                    spawn_ebullet_orb(cx, cy, (dir16_x[aim] * 3) >> 4, (dir16_y[aim] * 3) >> 4, 4);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_AIM_SLOW, 1, 0);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_AIM_SLOW, -1, 0);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_AIM_SLOW, 2, 4);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_AIM_SLOW, -2, 4);
+                    e->fire_cd = 100;
+                } else {
+                    aimed_shot(cx, cy, player_x, player_y, SPD_AIM_FAST, 0);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_AIM_SLOW, 1, 0);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_AIM_SLOW, -1, 0);
+                    e->fire_cd = 90;
+                }
                 break;
             case ENEMY_SHARD:
-                for (int k = -3; k <= 3; k++)
-                    spawn_ebullet(cx, cy, k, SPD_AIM_SLOW + ((i + frame_tick / 110u) & 1u), 3);
-                e->fire_cd = 110;
+                if (orb_burst) {
+                    /* 专属光球技能【晶棱裂变】：向左右两下斜向各发射成对的高速 Alpha 混合光球，中间铺设碎弹 */
+                    spawn_ebullet_orb(cx, cy, -3, 3, 3);
+                    spawn_ebullet_orb(cx, cy, 3, 3, 3);
+                    for (int k = -2; k <= 2; k++)
+                        spawn_ebullet(cx, cy, k, SPD_AIM_SLOW + 1, 3);
+                    e->fire_cd = 105;
+                } else {
+                    for (int k = -3; k <= 3; k++)
+                        spawn_ebullet(cx, cy, k, SPD_AIM_SLOW + ((i + frame_tick / 110u) & 1u), 3);
+                    e->fire_cd = 110;
+                }
                 break;
             case ENEMY_TURRET:
-                /* a ring of eight, slow enough to walk between */
-                for (int k = (frame_tick / 120u + (unsigned)i) & 1u; k < 16; k += 2)
-                    spawn_ebullet(cx, cy, (dir16_x[k] * SPD_RING) >> 4,
-                                  (dir16_y[k] * SPD_RING) >> 4, 5);
-                e->fire_cd = 120;
+                if (orb_burst) {
+                    /* 专属光球技能【四极重核】：十字向喷发 4 颗慢速 Alpha 混合大光球，斜向穿插 4 颗快速普通子弹 */
+                    for (int k = 0; k < 16; k += 4)
+                        spawn_ebullet_orb(cx, cy, (dir16_x[k] * 2) >> 4, (dir16_y[k] * 2) >> 4, 6);
+                    for (int k = 2; k < 16; k += 4)
+                        spawn_ebullet(cx, cy, (dir16_x[k] * 3) >> 4, (dir16_y[k] * 3) >> 4, 5);
+                    e->fire_cd = 115;
+                } else {
+                    for (int k = (frame_tick / 120u + (unsigned)i) & 1u; k < 16; k += 2)
+                        spawn_ebullet(cx, cy, (dir16_x[k] * SPD_RING) >> 4,
+                                      (dir16_y[k] * SPD_RING) >> 4, 5);
+                    e->fire_cd = 120;
+                }
                 break;
             default:
-                spawn_ebullet_orb(cx, cy, 0, SPD_MINION, 6);
-                aimed_shot_off(cx, cy, player_x, player_y, SPD_MINION, 2, 6);
-                aimed_shot_off(cx, cy, player_x, player_y, SPD_MINION, -2, 6);
-                e->fire_cd = 110;
+                if (orb_burst) {
+                    /* 专属光球技能【彗尾魔火】：向自机直接打出 1 颗高速大号 Alpha 混合光球，尾随展开 4 颗护卫弹 */
+                    int dx = player_x - cx, dy = player_y - cy;
+                    int aim = aim_index(dx, dy);
+                    spawn_ebullet_orb(cx, cy, (dir16_x[aim] * SPD_MINION) >> 4,
+                                      (dir16_y[aim] * SPD_MINION) >> 4, 0);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_MINION - 1, 1, 6);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_MINION - 1, -1, 6);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_MINION - 1, 2, 0);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_MINION - 1, -2, 0);
+                    e->fire_cd = 100;
+                } else {
+                    spawn_ebullet_orb(cx, cy, 0, SPD_MINION, 6);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_MINION, 2, 6);
+                    aimed_shot_off(cx, cy, player_x, player_y, SPD_MINION, -2, 6);
+                    e->fire_cd = 110;
+                }
                 break;
             }
         }
@@ -4464,7 +4661,7 @@ static void stress_coprocessor_finish(void)
         unsigned index = candidates > 512u ? pos : indices[pos];
         if (index >= (unsigned)ORB_FIRST) continue;
         bullet_t *bullet = &ebullets[index];
-        if (!(bullet->flags & EF_ACTIVE) || (bullet->flags & EF_LANCE)) continue;
+        if (!(bullet->flags & EF_ACTIVE) || (bullet->flags & (EF_LANCE|EF_SUBPIXEL|EF_SKILL_LASER))) continue;
         if ((unsigned)(bullet->x - player_x + 11) < 23u &&
             (unsigned)(bullet->y - player_y + 11) < 23u) {
             bullet->flags = 0;
@@ -4474,26 +4671,29 @@ static void stress_coprocessor_finish(void)
         }
     }
     active_ebullets_count = active_count;
+    if (eb_free_hint > ORB_FIRST) eb_free_hint = 0;
 }
 
 static void bullets_update(void)
 {
     bullet_t *b;
 
-    /* The craft's shot tests every enemy slot, and it does it once per
-     * sub-step - eight shots at up to eight sub-steps is 256 flag loads a
-     * frame for a pool that usually holds one or two enemies.  Snapshot the
-     * live ones once, in slot order, and let the inner loop walk that.  The
-     * flags are still re-read inside the loop, so an enemy killed by an
-     * earlier shot of this frame drops out exactly as before; the snapshot
-     * only decides which slots are worth looking at.
-     *
-     * static, not a stack array: this runs on a 1 KiB stack. */
-    enemy_rec_t ** const elive = (enemy_rec_t **)MM_RUNTIME_WORK;
+    /* Sort live pointers by x once per tick, in the existing DDR workspace.
+     * Binary-search each shot's swept left edge, then test only nearby enemies
+     * at the original substeps. Overlaps still choose the lowest pool slot. */
+    enemy_rec_t ** const elive = (enemy_rec_t **)MM_ENEMY_WORK;
     int en;
     en = 0;
-    for (int j = 0; j < MAX_ENEMIES; j++)
-        if (enemies[j].flags & EF_ACTIVE) elive[en++] = &enemies[j];
+    for (int j = 0; j < MAX_ENEMIES; j++) {
+        enemy_rec_t *e = &enemies[j];
+        if (!(e->flags & EF_ACTIVE)) continue;
+        int k = en++;
+        while (k && elive[k - 1]->x > e->x) {
+            elive[k] = elive[k - 1];
+            k--;
+        }
+        elive[k] = e;
+    }
 
     FOR_EACH_PBULLET(b) {
         /* Task 12: the pressure stage's wing missiles re-aim HERE.  They are
@@ -4518,7 +4718,7 @@ static void bullets_update(void)
         int dx = (b->vx < 0) ? -b->vx : b->vx;
         if (dx > remaining) remaining = dx;
 
-        int sub = (remaining + BULLET_STEP - 1) / BULLET_STEP;
+        int sub = is_stress_stage ? 1 : (remaining + BULLET_STEP - 1) / BULLET_STEP;
         if (sub < 1) sub = 1;
         if (sub > 8) sub = 8;
 
@@ -4526,6 +4726,13 @@ static void bullets_update(void)
         int py = b->y;
         int svx = b->vx / sub;
         int svy = b->vy / sub;
+        int lo = 0, hi = en;
+        int left = px - remaining - 26;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (elive[mid]->x < left) lo = mid + 1;
+            else hi = mid;
+        }
         for (int s = 0; s < sub; s++) {
             /* the last sub-step carries the remainder, so the bullet lands on
              * exactly the pixel the un-stepped version would have reached */
@@ -4559,26 +4766,31 @@ static void bullets_update(void)
              * against 7), so "has it left the field" is asked per kind. */
             int x_lim = (b->flags & PF_LOCKON) ? (GAME_RIGHT - MM_MISSILE_TILE_W)
                                                : (GAME_RIGHT - MM_PBULLET_TILE_W);
-            if (b->y < PLAYFIELD_TOP + 1 || b->y > GAME_BOTTOM - 26 ||
-                b->x < GAME_LEFT || b->x > x_lim) {
+            if ((unsigned)(py - (PLAYFIELD_TOP + 1)) >
+                    (unsigned)(GAME_BOTTOM - 26 - (PLAYFIELD_TOP + 1)) ||
+                (unsigned)(px - GAME_LEFT) > (unsigned)(x_lim - GAME_LEFT)) {
                 b->flags = 0;
                 break;
             }
 
-            int hit = 0;
-            for (int j = 0; j < en; j++) {
+            enemy_rec_t *target = (enemy_rec_t *)0;
+            for (int j = lo; j < en; j++) {
                 enemy_rec_t *e = elive[j];
+                if (e->x > px + 2) break;
                 if (!(e->flags & EF_ACTIVE)) continue;
-                if (b->x < e->x - 2 || b->x > e->x + 26) continue;
-                if (b->y < e->y - 2 || b->y > e->y + 26) continue;
+                if (px > e->x + 26) continue;
+                if ((unsigned)(py - e->y + 2) > 28u) continue;
+                if (!target || e < target) target = e;
+            }
+            if (target) {
+                enemy_rec_t *e = target;
                 e->hp = (int16_t)(e->hp - (int16_t)atk);
                 b->flags = 0;
-                hit = 1;
                 audio_event(AUDIO_EVENT_HIT);
-                for (int s = 0; s < 6; s++) {
+                for (int s = 0; s < 2; s++) {
                     int a = (int)(xorshift32() & 15u);
                     uint8_t pt = (weapon == W_LASER) ? PARTICLE_CYAN : ((s & 1) ? PARTICLE_HIT : PARTICLE_CRIT);
-                    spawn_particle(b->x, b->y, dir16_x[a] >> 1, dir16_y[a] >> 1, pt, 16);
+                    spawn_particle(b->x, b->y, dir16_x[a] >> 1, dir16_y[a] >> 1, pt, 14);
                 }
                 if (e->hp <= 0) {
                     e->flags = 0;
@@ -4587,15 +4799,15 @@ static void bullets_update(void)
                     score_award(100u + (uint32_t)e->type * 50u,
                                 e->x + 12, e->y + 12);
                     visual_burst(e->x + 12, e->y + 12);
-                    for (int p = 0; p < 8; p++) {
-                        int pa = (p * 2 + (int)(xorshift32() & 1u)) & 15;
+                    for (int p = 0; p < 4; p++) {
+                        int pa = (p * 4 + (int)(xorshift32() & 1u)) & 15;
                         uint8_t pt = (uint8_t)(p % 5);
                         spawn_particle(e->x + 12, e->y + 12,
                                        dir16_x[pa] >> 1, dir16_y[pa] >> 1,
-                                       pt, 18);
+                                       pt, 16);
                     }
                     /* 8.3: the armoured ones come apart into a ring of shots. */
-                    if (e->type == ENEMY_TURRET || e->type == ENEMY_MINION) {
+                    if (!is_stress_stage && (e->type == ENEMY_TURRET || e->type == ENEMY_MINION)) {
                         for (int q = 0; q < 8; q++) {
                             int qa = q * 2;
                             spawn_ebullet(e->x + 8, e->y + 8,
@@ -4607,12 +4819,11 @@ static void bullets_update(void)
                 }
                 break;
             }
-            if (hit) break;
 
             if (boss_state == BOSS_FIGHT &&
                 b->x >= boss_x && b->x <= boss_x + 64 &&
                 b->y >= boss_y && b->y <= boss_y + 64) {
-                boss_hp = (int16_t)(boss_hp - (int16_t)atk);
+                boss_take_damage((int16_t)atk);
                 visual_burst(b->x, b->y);
                 for (int s = 0; s < 4; s++) {
                     int a = (int)(xorshift32() & 15u);
@@ -4646,19 +4857,46 @@ static void bullets_update(void)
     int live_eb = 0;
     for (int _run = 0; _run < 2; _run++) {
         for (int _pos = (_run == 0 ? 0 : ORB_FIRST),
-                 _end = (_run == 0 ? (motion ? lance_count : eb_hi) : MAX_EBULLETS);
+                 _end = (_run == 0 ? (motion && lance_count<MM_LANCE_INDEX_MAX ? lance_count : eb_hi) : MAX_EBULLETS);
              _pos < _end; _pos++) {
-            int _i = motion && !_run ? eb_lances[_pos] : _pos;
+            int _i = motion && !_run && lance_count<MM_LANCE_INDEX_MAX ? eb_lances[_pos] : _pos;
             b = &ebullets[_i];
             uint8_t flags = b->flags;
             if (!(flags & EF_ACTIVE)) continue;
-            if (motion && !_run && !(flags & EF_LANCE)) continue;
+            if (motion && !_run && !(flags & (EF_LANCE|EF_SUBPIXEL|EF_SKILL_LASER))) continue;
             if (motion) active_ebullets_count--;
             int bx = b->x + b->vx;
             int by = b->y + b->vy;
 
+            if (flags & EF_SKILL_LASER) {
+                if (!--b->vx) {
+                    b->flags = 0;
+                    if (_i < eb_free_hint) eb_free_hint = _i;
+                    continue;
+                }
+                bx = b->x; by = b->y;
+                b->color = b->vx > 62 ? 6u : 0x85u;
+            } else if ((flags & (EF_SUBPIXEL | EF_LANCE)) == EF_SUBPIXEL) {
+                unsigned f = bullet_frac[_i];
+                int fx = (int)(f & 15u) + b->vx;
+                int fy = (int)(f >> 4) + b->vy;
+                bx = b->x + (fx >> 4); by = b->y + (fy >> 4);
+                bullet_frac[_i] = (uint8_t)((fx & 15) | ((fy & 15) << 4));
+            }
+
+            if ((flags & (EF_EMBER | EF_LANCE)) == EF_EMBER) {
+                ember_age_t *a=&ember_ages[_i];
+                if(++a->age>=a->burst) {
+                    if(spell->burst_count<75u) {
+                        unsigned n=spell->burst_count++;
+                        spell->burst_xy[n][0]=b->x;spell->burst_xy[n][1]=b->y;
+                    }
+                    b->flags=0;if(_i<eb_free_hint)eb_free_hint=_i;continue;
+                }
+                if(a->age>=a->freeze){bx=b->x;by=b->y;}
+            }
             if (!(flags & EF_LANCE)) {
-                if ((unsigned)(by - bound_y0) >= bound_h ||
+                if (((unsigned)(by - bound_y0) >= bound_h && !((flags & EF_EMBER) && by<1 && by>=-64)) ||
                     (unsigned)(bx - bound_x0) >= bound_w) {
                     b->flags = 0;
                     if (_i < eb_free_hint) eb_free_hint = _i;
@@ -4696,10 +4934,11 @@ static void bullets_update(void)
                 b->vx = (int8_t)bvx;
                 b->vy = (int8_t)bvy;
                 b->flags = flags;
-                if (_i < ORB_FIRST && eb_lance_count < MM_LANCE_INDEX_MAX)
-                    eb_lances[eb_lance_count++] = (uint16_t)_i;
+
             }
 
+            if(motion && _i<ORB_FIRST && eb_lance_count<MM_LANCE_INDEX_MAX)eb_lances[eb_lance_count++]=(uint16_t)_i;
+            if ((flags & EF_SKILL_LASER) && b->vx > 62) { live_eb++; continue; }
             if (check_hit &&
                 (unsigned)(bx - danger_x0) <= 128u &&
                 (unsigned)(by - danger_y0) <= 128u) {
@@ -4737,9 +4976,11 @@ static void bullets_update(void)
             if (motion) active_ebullets_count++;
         }
     }
-    if (eb_free_hint >= eb_hi && eb_hi < ORB_FIRST) eb_free_hint = eb_hi;
+    if (eb_free_hint > ORB_FIRST) eb_free_hint = 0;
+    else if (eb_free_hint >= eb_hi && eb_hi < ORB_FIRST) eb_free_hint = eb_hi;
     if (!motion) active_ebullets_count = live_eb;
     active_count = (uint16_t)active_ebullets_count;
+    spell_embers_release();
 }
 
 /* ---- pickup test -------------------------------------------------------
@@ -5430,12 +5671,7 @@ static void burst_frames_build(void)
        -127,-125,-117,-106, -90, -71, -49, -25,
           0,  25,  49,  71,  90, 106, 117, 125
     };
-    static const int8_t sin32[32] = {
-          0,  25,  49,  71,  90, 106, 117, 125,
-        127, 125, 117, 106,  90,  71,  49,  25,
-          0, -25, -49, -71, -90,-106,-117,-125,
-       -127,-125,-117,-106, -90, -71, -49, -25
-    };
+
 
     for (unsigned a = 0; a < BURST_FRAMES; a++) {
         volatile uint32_t *pix = (volatile uint32_t *)(MM_BURST_FRAME + a * MM_BURST_FRAME_BYTES);
@@ -5467,26 +5703,23 @@ static void burst_frames_build(void)
         for (int k = 0; k < 6; k++) {
             int angle = (int)((a + (unsigned)k * 32u / 6u) & 31u);
             vx[k] = cx + ((int)cos32[angle] * 39) / 128;
-            vy[k] = cy + ((int)sin32[angle] * 39) / 128;
+            vy[k] = cy + ((int)cos32[(angle + 24) & 31] * 39) / 128;
         }
 
         /* 3. Draw the two interlocking equilateral triangles of the Hexagram */
         uint32_t hex_col = (a & 1u) ? 0x00FF80D0u : 0x00FF60B0u; /* mystical radiant magenta */
-        draw_mc_line(pix, vx[0], vy[0], vx[2], vy[2], hex_col);
-        draw_mc_line(pix, vx[2], vy[2], vx[4], vy[4], hex_col);
-        draw_mc_line(pix, vx[4], vy[4], vx[0], vy[0], hex_col);
-
-        draw_mc_line(pix, vx[1], vy[1], vx[3], vy[3], hex_col);
-        draw_mc_line(pix, vx[3], vy[3], vx[5], vy[5], hex_col);
-        draw_mc_line(pix, vx[5], vy[5], vx[1], vy[1], hex_col);
+        for (int k = 0; k < 6; k++) {
+            int n = (k + 2) < 6 ? k + 2 : k - 4;
+            draw_mc_line(pix, vx[k], vy[k], vx[n], vy[n], hex_col);
+        }
 
         /* 4. Draw 12 outer runic ticks on the outer boundary */
         for (int k = 0; k < 12; k++) {
             int angle = (int)((a / 2u + (unsigned)k * 32u / 12u) & 31u);
             int x0 = cx + ((int)cos32[angle] * 45) / 128;
-            int y0 = cy + ((int)sin32[angle] * 45) / 128;
+            int y0 = cy + ((int)cos32[(angle + 24) & 31] * 45) / 128;
             int x1 = cx + ((int)cos32[angle] * 51) / 128;
-            int y1 = cy + ((int)sin32[angle] * 51) / 128;
+            int y1 = cy + ((int)cos32[(angle + 24) & 31] * 51) / 128;
             draw_mc_line(pix, x0, y0, x1, y1, 0x0060E0FFu);
         }
 
@@ -5543,66 +5776,106 @@ static void burst_frames_build(void)
 #define FX_RINGS 1
 #define FX_RING_SLOTS 4
 
-static void fx_rings_upload(void)
+static uint32_t fx_tint(uint32_t rgb, unsigned energy)
 {
-    uint32_t a[FX_RING_SLOTS], b[FX_RING_SLOTS], c[FX_RING_SLOTS];
+    return (((((rgb >> 16) & 255u) * energy) >> 8) << 16) |
+           (((((rgb >> 8) & 255u) * energy) >> 8) << 8) |
+           (((rgb & 255u) * energy) >> 8);
+}
+
+static __attribute__((noinline)) void fx_rings_upload(void)
+{
     static const uint32_t core_fade[4] = {
-        0x00FFFFFFu, 0x00C8C8C8u, 0x00808080u, 0x00404040u
+        0x00FFF4DCu, 0x00FFCFA0u, 0x00C87848u, 0x00783820u
     };
-    int slot = 0;
-
-    for (int i = 0; i < FX_RING_SLOTS; i++) { a[i] = 0u; b[i] = 0u; c[i] = 0u; }
-
-    if (hit_ring_timer) {
-        int age = HIT_RING_FRAMES - (int)hit_ring_timer;
-        int r = 14 + age * 10;
-        int alpha = 210 - age * 9;
-        if (alpha < 40) alpha = 40;
-        a[slot] = (1u << 31) | (1u << 30) | ((uint32_t)r << 21) |
-                  ((uint32_t)(hit_ring_y & 1023) << 11) |
-                  (uint32_t)(hit_ring_x & 2047);
-        b[slot] = ((uint32_t)(r > 7 ? r - 7 : 0) << 16) | (uint32_t)(alpha & 0xFF);
-        c[slot] = (hit_ring_timer > HIT_RING_FRAMES / 2) ? 0x00FFFFFFu : 0x00FFC060u;
-        slot++;
-    }
-    for (int i = 0; i < 16 && slot < FX_RING_SLOTS; i++) {
-        const visual_fx_t *f = &visual_fx[i];
-        int age, r, ri, alpha;
-        uint32_t rgb;
-        if (!f->active) continue;
-        age = (int)f->age;
-        if (age > 23) continue;
-        if (age < 4) {
-            r = 8 + age * 6;
-            ri = 0;
-            alpha = 0;
-            rgb = core_fade[age];
+    int impact = 0;
+    for (int slot = 0; slot < FX_RING_SLOTS; slot++) {
+        int x = 0, y = 0, r = 0, ri = 0, alpha = 0, add = 0, soft = 0;
+        uint32_t rgb = 0u;
+        int spell_slot = slot - (hit_ring_timer != 0);
+        if (hit_ring_timer && slot == 0) {
+            int age = HIT_RING_FRAMES - hit_ring_timer;
+            x = hit_ring_x; y = hit_ring_y;
+            r = 14 + age * 12 - age * age / 4;
+            ri = r - 7; alpha = 12 + hit_ring_timer * 12;
+            rgb = 0x00FFC090u;
+        } else if (bomb_flash && spell_slot < 3) {
+            int age = BOMB_FLASH_FRAMES - bomb_flash;
+            x = bomb_x; y = bomb_y;
+            if (spell_slot < 2) {
+                int orbit = 24 + age * 4;
+                int angle = ((age >> 1) + spell_slot * 8) & 15;
+                x += (dir16_x[angle] * orbit) >> 4;
+                y += (dir16_y[angle] * orbit) >> 4;
+                r = age < 6 ? 12 + age * 4 : 36;
+                add = soft = 1;
+                rgb = fx_tint(spell_slot ? 0x00FF5088u : 0x0040C8FFu,
+                              bomb_flash < 10 ? (unsigned)bomb_flash * 25u : 256u);
+            } else {
+                r = 20 + age * 18 - age * age / 5;
+                ri = r - 6; alpha = bomb_flash * 5;
+                rgb = 0x0080DFFFu;
+            }
+        } else if (boss_signature_timer && slot >= 2 && !is_stress_stage) {
+            int age = 192 - boss_signature_timer;
+            x = boss_x + 32; y = boss_y + 28;
+            r = 28 + ((age * (slot == 2 ? 2 : 3)) & 63);
+            ri = r - 3; alpha = 160;
+            rgb = 0x0060DFFFu;
+            if (stage_bg_active == SB_STAGE_LAVA) {
+                rgb = 0x00FF7020u;
+                if (slot == 2) { r = 28; ri = 0; add = soft = 1; }
+            } else if (stage_bg_active == SB_STAGE_DREAM) {
+                x = slot == 2 ? GAME_LEFT + 80 : GAME_RIGHT - 80;
+                y = 160;
+                r = 24 + ((age >> 2) & 7); ri = r - 4;
+                rgb = slot == 2 ? 0x00D080FFu : 0x0060B0FFu;
+                add = 1;
+            }
+        } else if(wave>0 && boss_state==BOSS_FIGHT && spell->fx[slot].ttl) {
+            const spell_fx_t *f=&spell->fx[slot];
+            unsigned age=f->life-f->ttl;
+            x=f->x;y=f->y;r=f->r0+(f->rmax-f->r0)*age*(2u*f->life-age)/(f->life*f->life);
+            ri=f->soft?0:r-2;add=1;soft=f->soft;
+            rgb=fx_tint(palette[f->hue&7u],f->ttl*256u/f->life);
+        } else if (is_stress_stage && slot >= 2 && boss_state == BOSS_FIGHT) {
+            unsigned ph = (frame_tick * 3u + (unsigned)(slot - 2) * 48u) & 95u;
+            x = boss_x + 32;
+            y = boss_y + 28;
+            r = 24 + (int)(ph * 2u);
+            ri = r - 4;
+            add = 1;
+            rgb = fx_tint(palette[((frame_tick >> 4) + (unsigned)slot * 3u) & 7u],
+                          256u - ph * 2u);
         } else {
-            r = 26 + (age - 4) * 6;
-            ri = r - 7;
-            alpha = 170 - (age - 4) * 8;
-            if (alpha < 30) alpha = 30;
-            rgb = (age < 10) ? 0x00FFE8B0u : 0x00FF8040u;
+            while (impact < 16 && (!visual_fx[impact].active || visual_fx[impact].age > 23)) impact++;
+            if (impact < 16) {
+                const visual_fx_t *f = &visual_fx[impact++];
+                int age = f->age;
+                x = f->x; y = f->y;
+                if (age < 4) {
+                    r = 8 + age * 5;
+                    add = soft = 1;
+                    rgb = core_fade[age];
+                } else {
+                    int t = age - 4;
+                    r = 26 + t * 9 - t * t / 4;
+                    ri = r - (age < 12 ? 5 : 3);
+                    alpha = 1 + (24 - age) * (24 - age) / 2;
+                    rgb = age < 10 ? 0x00FFE8C0u : 0x00FF9060u;
+                }
+            }
         }
-        a[slot] = (1u << 31) | (((uint32_t)(age < 4)) << 30) |
-                  ((uint32_t)(r > 511 ? 511 : r) << 21) |
-                  ((uint32_t)(f->y & 1023) << 11) |
-                  (uint32_t)(f->x & 2047);
-        b[slot] = ((uint32_t)(ri > 511 ? 511 : ri) << 16) | (uint32_t)(alpha & 0xFF);
-        c[slot] = rgb & 0xFFFFFFu;
-        slot++;
-    }
-
-    /* Unconditional: it is twelve APB writes (about 48 core cycles) and it is
-     * also what clears the slots of impacts that just expired. */
-    for (int i = 0; i < FX_RING_SLOTS; i++) {
-        GPU2D_REG_FX_RING(i, 0) = a[i];
-        GPU2D_REG_FX_RING(i, 1) = b[i];
-        GPU2D_REG_FX_RING(i, 2) = c[i];
+        /* Exactly twelve writes per frame, including expired/unused slots. */
+        GPU2D_REG_FX_RING(slot, 0) = (r ? 0x80000000u : 0u) | ((uint32_t)add << 30) |
+            ((uint32_t)r << 21) | ((uint32_t)(y & 1023) << 11) | (uint32_t)(x & 2047);
+        GPU2D_REG_FX_RING(slot, 1) = ((uint32_t)ri << 16) | (uint32_t)alpha;
+        GPU2D_REG_FX_RING(slot, 2) = ((uint32_t)soft << 24) | rgb;
     }
 }
 
-static __attribute__((unused)) void burst_render(uint32_t fb, int x, int y, int age)
+#if !FX_RINGS
+static void burst_render(uint32_t fb, int x, int y, int age)
 {
     uint32_t src = MM_BURST_FRAME + (uint32_t)age * MM_BURST_FRAME_BYTES;
     int radius = 8 + age * 2;
@@ -5637,6 +5910,7 @@ static __attribute__((unused)) void burst_render(uint32_t fb, int x, int y, int 
                src, (uint32_t)w, (uint32_t)h,
                MM_BURST_FRAME_STRIDE, SCREEN_STRIDE, 255);
 }
+#endif
 
 /* ---- UI weather occlusion -------------------------------------------------
  *
@@ -5764,12 +6038,12 @@ static void card_bg_build(void)
      * than any of the three stage plates, because a screen full of bullets
      * has to stay readable on top of it. */
     static const uint32_t sky[CARD_BG_BANDS] = {
-        0x00020206u, 0x00030209u, 0x0004030Du, 0x00060412u,
-        0x00080517u, 0x000A071Du, 0x000D0823u, 0x00100A29u,
-        0x00130C2Fu, 0x00170F34u, 0x001B1238u, 0x001F163Bu,
-        0x00241A3Du, 0x00291F3Eu, 0x002F243Eu, 0x00352A3Du,
-        0x003B303Bu, 0x00413739u, 0x00483E37u, 0x004E4534u,
-        0x00554D32u, 0x005B5530u, 0x00615D2Eu, 0x0067652Du,
+        0x00141A32u, 0x00181E3Au, 0x001D2242u, 0x0022274Au,
+        0x00272D52u, 0x002C325Au, 0x00323862u, 0x00383E6Au,
+        0x003E4472u, 0x00444A78u, 0x004A507Eu, 0x00505682u,
+        0x00565C84u, 0x005C6284u, 0x00626782u, 0x00676C7Eu,
+        0x006C7078u, 0x00707470u, 0x00747766u, 0x00787A5Cu,
+        0x007B7B50u, 0x007D7B44u, 0x007D7938u, 0x007C762Eu,
     };
     /* Center of the ward outwards: cold white, then a dying red. */
     static const uint32_t glow[CARD_BG_WARD / CARD_BG_STEP] = {
@@ -5822,7 +6096,7 @@ static void card_bg_build(void)
     /* Ruined towers along the bottom edge, each with a lit upper lip. */
     for (unsigned bx = 0; bx < SB_BG_W; bx += 16u) {
         s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-        unsigned hgt = 24u + (s % 76u);
+        unsigned hgt = 24u + (s & 63u);
         volatile uint32_t *p = (volatile uint32_t *)
             (MM_CARD_BG + (SB_BG_H - hgt) * SCREEN_STRIDE + bx * 4u);
         for (unsigned y = 0; y < hgt; y++) {
@@ -6296,6 +6570,42 @@ static void bullet_store_build(void)
             }
     }
 
+    /* Slots 27/28: warning dots and continuous blue-white laser samples.
+     * These use the unused tail of the existing tile RAM. */
+    for (unsigned tile = 0; tile < 2; tile++)
+        for (int y = 0; y < 26; y++)
+            for (int x = 0; x < 32; x++) {
+                int d2 = (x - 8) * (x - 8) + (y - 8) * (y - 8);
+                unsigned role = 0;
+                if (!tile) role = (x >= 7 && x <= 8 && y >= 7 && y <= 8) ? BROLE_NEON : 0;
+                else if (d2 <= 9) role = BROLE_WHITE;
+                /* Transparent outside the core: later sample halos must not
+                 * erase earlier white centres. The existing Bloom adds glow. */
+                GPU2D_REG_BTILE_DATA = role;
+            }
+
+    /* Slots 29..36: HTML-style round sparks, soft additive halo and short
+     * directional tails.  Eight 832-byte tiles fit the existing 32 KiB RAM.
+     * No framebuffer blits or extra per-frame sprite instances are needed. */
+    for (unsigned t = 0; t < 8; t++)
+        for (int y = 0; y < 26; y++)
+            for (int x = 0; x < 32; x++) {
+                int dx = x - 13, dy = y - 13;
+                int d2 = dx * dx + dy * dy;
+                int along = dx * dir16_x[t * 2] + dy * dir16_y[t * 2];
+                int cross = dx * dir16_y[t * 2] - dy * dir16_x[t * 2];
+                unsigned role = 0;
+                if (x < 26) {
+                    if (d2 <= 6) role = BROLE_WHITE;
+                    else if (d2 <= 22) role = BROLE_EB_CORE;
+                    else if (d2 <= 45) role = BROLE_NEON;
+                    else if (d2 <= 144) role = BROLE_EB_HALO + (d2 - 46) * 17 / 98;
+                    if (d2 > 45 && along < 0 && along > -208 && cross > -24 && cross < 24)
+                        role = BROLE_EB_HALO + (unsigned)(-along) / 13;
+                }
+                GPU2D_REG_BTILE_DATA = role;
+            }
+
     /* The scanout blends a bullet against what is behind it using the palette
      * entry's top byte, and the register is a pointer that advances on every
      * write - so all 256 entries go out once, below, each carrying its colour
@@ -6429,9 +6739,10 @@ static void bullet_store_build(void)
  * that says why it has to be per table.  It is 192 bytes now, small enough for
  * bss - it has not been moved because it is read and written in one sequential
  * pass and costs a cache line either way. */
-const uint16_t bt_tile_rows[27] __attribute__((used, retain)) = {
+const uint16_t bt_tile_rows[37] __attribute__((used, retain)) = {
     647, 647, 710, 742, 742, 742, 710, 647, 647, 647, 677, 676, 676, 676, 677, 647, 832, 481, 832,
-    768, 768, 768, 768, 768, 768, 768, 768
+    768, 768, 768, 768, 768, 768, 768, 768, 295, 389,
+    832, 832, 832, 832, 832, 832, 832, 832
 };
 
 #define MM_BUCKET_TABLE_BYTES   (MM_BUCKET_STRIDE * MM_BUCKET_ROWS)
@@ -6524,7 +6835,7 @@ static void __attribute__((used, retain, noinline)) bucket_build_start(unsigned 
     const uint16_t * const tile_rows = bt_tile_rows;
     uint16_t * const counts = bt_count;
     const uint32_t fast_mask = 0x80000000u |
-        ((uint32_t)(EF_ACTIVE | EF_LANCE | EF_ORB | EF_HELD) << 16);
+        ((uint32_t)(EF_ACTIVE | EF_LANCE | EF_ORB | EF_HELD | EF_SKILL_LASER | EF_SUBPIXEL) << 16);
     const uint32_t fast_val  = 0x80000000u | ((uint32_t)EF_ACTIVE << 16);
 
     for (int _run = 0; _run < 2; _run++) {
@@ -6549,16 +6860,29 @@ static void __attribute__((used, retain, noinline)) bucket_build_start(unsigned 
                 w0 = ((const int32_t *)b)[0];
                 bx = (w0 << 16) >> 16;
                 int by = w0 >> 16;
-                if (w1 & (EF_LANCE << 16)) {
+                if (w1 & (EF_SKILL_LASER << 16)) {
+                    row = by - 8;
+                    bx -= 8;
+                    slot = (w1 & 0x80000000u) ? 28u : 27u;
+                    tw = 16;
+                } else if (w1 & (EF_LANCE << 16)) {
                     row = by - 12;
                     bx -= 12;
                     slot = 19u + ((unsigned)aim_index(b->vx, b->vy) >> 1);
                     tw = 24;
+                } else if (w1 & (EF_SUBPIXEL << 16)) {
+                    row = by - 13; bx -= 13; tw = 26;
+                    slot = 29u + ((unsigned)aim_index(b->vx, b->vy) >> 1);
                 } else if (w1 & (EF_ORB << 16)) {
                     row  = by - 8;
                     bx  -= 8;
                     slot = BTILE_SLOT_ORB;
                     tw   = MM_ORB_TILE_W;
+                } else if ((w1 & 0xC0000000u) == 0x40000000u) {
+                    int held = (b->flags & EF_HELD) || !(b->vx | b->vy);
+                    slot = 29u + ((unsigned)aim_index(held ? player_x-bx : b->vx,
+                                                    held ? player_y-by : b->vy) >> 1);
+                    row = by - 13; bx -= 13; tw = 26;
                 } else {
                     int dx, dy, cache_it = 0;
                     if ((w1 & (EF_HELD << 16)) || (w1 & 0xFFFFu) == 0u) {
@@ -6814,7 +7138,7 @@ static void game_render(uint32_t fb)
         if (boss_state == BOSS_FREEZE || boss_spell_vfx_timer > 0) {
             int bcx = boss_x + 32;
             int bcy = boss_y + 28;
-            int frame = (int)((frame_tick >> 1) & 31u);
+            int frame = (int)((frame_tick >> 1) % MM_BURST_FRAME_COUNT);
             uint32_t src = MM_BURST_FRAME + (uint32_t)frame * MM_BURST_FRAME_BYTES;
             int bx = bcx - (int)(MM_BURST_FRAME_W / 2);
             int by = bcy - (int)(MM_BURST_FRAME_W / 2);
@@ -6828,12 +7152,21 @@ static void game_render(uint32_t fb)
             }
         }
         draw_boss_art(fb, boss_x, boss_y);
+        if (boss_signature_timer > 136u) {
+            static const char * const names[3] = {"FROST CROWN", "SOLAR CRUCIBLE", "PRISM MIRROR"};
+            draw_text(fb, GAME_LEFT + 24, 54, names[stage_bg_active], 1, 0x00E0E8FFu);
+        }
     }
 
     /* minions */
     for (int i = 0; i < MAX_ENEMIES; i++) {
         enemy_rec_t *e = &enemies[i];
         if (!(e->flags & EF_ACTIVE)) continue;
+        /* Do not clamp entering sprites into the HUD gutter; draw only once
+         * the whole sprite is inside the playfield. */
+        if ((unsigned)(e->x - GAME_LEFT) > (unsigned)(GAME_RIGHT - GAME_LEFT - 24))
+            continue;
+        if ((unsigned)e->y > SCREEN_HEIGHT - 24u) continue;
         uint32_t spr = wave == 0 ? MM_ENEMY_SPRITE :
                        wave == 1 ? MM_ENEMY2_SPRITE : MM_SHADE_SPRITE;
         int stride = 96;
@@ -6972,6 +7305,7 @@ static void game_render(uint32_t fb)
      * the framebuffer is not touched at all - no engine command, no DDR
      * traffic, and nothing for the next frame's damage_restore to repair. */
     fx_rings_upload();
+    spell_beams_upload();
 #else
     for (int i = 0; i < 16; i++)
         if (visual_fx[i].active)
@@ -7106,19 +7440,7 @@ static void game_render(uint32_t fb)
                (uint32_t)((player_x + 6) * 4), 1, 14, 0x00FF8080u, SCREEN_STRIDE);
     }
 
-    /* the spell card's shockwave, rippling out from the craft */
-    if (bomb_flash) {
-        int r = 12 + (int)(BOMB_FLASH_FRAMES - bomb_flash) * 8;
-        uint32_t col = (bomb_flash > 20) ? 0x00FFF0C0u : 0x00FFB060u;
-        for (int k = 0; k < 16; k++) {
-            int px = player_x + ((dir16_x[k] * r) >> 4);
-            int py = player_y + ((dir16_y[k] * r) >> 4);
-            if (px >= GAME_LEFT && px <= GAME_RIGHT - 2 &&
-                py >= GAME_TOP && py <= GAME_BOTTOM - 3)
-                r_fill(fb + (uint32_t)(py * SCREEN_STRIDE) +
-                       (uint32_t)(px * 4), 2, 2, col, SCREEN_STRIDE);
-        }
-    }
+    /* Player spell is drawn by the scanout descriptors above. */
 
     /* Phase 2 Task 03: the shockwave of a HIT.  It cannot ride the spell
      * card's ring above - that one is pinned to the craft, and the craft has
@@ -7148,6 +7470,9 @@ static void game_render(uint32_t fb)
 #endif
     }
 
+    /* Score popups ride on top of the playfield and under the HUD layer */
+    popup_render(fb);
+
     /* ---- HUD gutters ----------------------------------------------------
      * The ten bands below are the gutter repair.  They used to run on every
      * frame; they now run only where the ledger above says something moved
@@ -7168,7 +7493,7 @@ static void game_render(uint32_t fb)
             hud_dirty[1] |= HUD_BAND_ALL;
         }
         hud_watch(HUD_SIG_STAGE,
-                  (uint32_t)wave * 2u + (boss_state == BOSS_NONE ? 0u : 1u),
+                  (uint32_t)wave * 16u + (uint32_t)campaign_round * 2u + (boss_state == BOSS_NONE ? 0u : 1u),
                   HUD_BAND_STAGE);
         hud_watch(HUD_SIG_LIVES, (uint32_t)lives, HUD_BAND_LIVES);
         /* The countdown, not just whether there is one: its digits move every
@@ -7181,7 +7506,8 @@ static void game_render(uint32_t fb)
                   HUD_BAND_WEAPON);
         hud_watch(HUD_SIG_ATK, (uint32_t)atk, HUD_BAND_ATK);
         hud_watch(HUD_SIG_BACKEND, hw_accel ? 1u : 0u, HUD_BAND_BACKEND);
-        hud_watch(HUD_SIG_SCORE, score, HUD_BAND_SCORE);
+        if (!is_stress_stage || (frame_tick & 15u) == 0u)
+            hud_watch(HUD_SIG_SCORE, score, HUD_BAND_SCORE);
         /* The live FPS readout.  It is a hardware counter, so a locked display
          * leaves it alone - which is exactly the steady state this ledger is
          * for - but a frame that slipped still has to erase its old digits. */
@@ -7278,9 +7604,6 @@ static void game_render(uint32_t fb)
     /* (The two playfield border columns are drawn up in the backdrop block,
      * once per plate rather than once per frame - see the note there.) */
 
-    /* Score popups ride on top of the playfield and under the HUD. */
-    popup_render(fb);
-
     /* ---- HUD labels ------------------------------------------------------
      * The plate used to have these baked into it as pixels.  They are drawn
      * here now, with the same vector font as their readouts, which is what
@@ -7313,6 +7636,9 @@ static void game_render(uint32_t fb)
      * game_render() picks the value, this picks the word - so the second label
      * and its whole box are gone (section 4). */
     hud_label(fb, boss_state == BOSS_NONE ? HUD_LBL_WAVE : HUD_LBL_BOSS_LIFE);
+    { char label[4] = {(char)('1' + campaign_round), '/', (char)('1' + CAMPAIGN_ROUNDS), 0};
+      draw_text(fb, HUD_ROUND_X, HUD_ROUND_Y, label, 1, 0x00FFE4A0u); }
+
     hud_label(fb, HUD_LBL_BACKEND);
     hud_label(fb, HUD_LBL_FPS_TAG);
     hud_label(fb, HUD_LBL_VERTEX);
@@ -7376,8 +7702,9 @@ static void game_render(uint32_t fb)
 
     /* wave progress / boss health */
     if (boss_state == BOSS_NONE) {
-        uint32_t done = (kills >= wave_max) ? wave_max : (uint32_t)kills;
-        int w = (int)(done * HUD_WAVE_BAR_W / (wave_max ? wave_max : 1u));
+        int alive = count_active();
+        uint32_t done = round_spawned > alive ? round_spawned - alive : 0;
+        int w = (int)(done * HUD_WAVE_BAR_W / MAX_ACTIVE_ENEMY);
         r_fill(fb + (uint32_t)(HUD_WAVE_BAR_Y * SCREEN_STRIDE) +
                    (uint32_t)(HUD_WAVE_BAR_X * 4), (uint32_t)HUD_WAVE_BAR_W, 8,
                    0x00202020u, SCREEN_STRIDE);
@@ -7679,9 +8006,20 @@ static void telemetry_write(void)
     tlm[TLM_PBULLETS] = (uint32_t)np;
     tlm[TLM_EBULLETS] = (uint32_t)nb;
     tlm[TLM_ITEMS]    = (uint32_t)ni;
-    /* Population, not draw calls: decorative FX/laser/weather layers are
-     * excluded. The HUD samples this after publication, alongside FPS. */
-    tlm[TLM_SPRITES]  = (uint32_t)(ne + np + nb + ni) + (lives != 0) +
+    /* Every pooled shot is in nb, including Q4 spells and reserved orbs.
+     * Scanout beams have no pool record: count each warning/live beam once. */
+    unsigned beams = 0;
+    if (boss_state == BOSS_FIGHT) {
+        unsigned bars = 0;
+        for (unsigned i = 0; i < 6; i++) beams += wave > 0 && spell->beams[i].ttl != 0;
+        for (unsigned i = 0; i < CUT_SLOTS; i++) {
+            beams += beam_phase[i] != 0;
+            bars |= beam_phase[i] == 2;
+        }
+        if (boss_laser && !bars) beams += BOSS_LASER_COLS;
+    }
+    tlm[TLM_BOSS_BEAMS] = beams;
+    tlm[TLM_SPRITES]  = (uint32_t)(ne + np + nb + ni) + beams + (lives != 0) +
                         (boss_state != BOSS_NONE && boss_hp > 0);
     tlm[TLM_TAKEN]    = items_taken;
     tlm[TLM_BOSS_ST]  = boss_state;
@@ -7783,7 +8121,7 @@ static void game_init(void)
     for (int i = 0; i < POPUP_SLOTS; i++) popups[i].age = 0;
     kills = 0;
     wave = 0;
-    wave_max = 14;
+    campaign_round = round_spawned = 0;
     spawn_timer = 30;
     frame_tick = 0;
     strip_scroll = 0;
@@ -7793,10 +8131,10 @@ static void game_init(void)
 
     boss_state = BOSS_NONE;
     boss_hp = 0;
-    boss_hp_max = 400;
+    boss_hp_max = 200;
     boss_pattern = PAT_FAN;
     boss_prev_pat = PAT_FAN;
-    pat_recent_n = 0;
+
     boss_pat_timer = 0;
     boss_fire_timer = 0;
     boss_dead_timer = 0;
@@ -7829,6 +8167,9 @@ static void game_init(void)
     lockon_arm = 0;
     lockon_timer = 0;
     boss_opener_stage = 0;
+    boss_hp_locked = 0;
+    boss_signature_used = boss_signature_timer = 0;
+    boss1_cast->kind = 0;
 
     rng_state = 0x9E3779B9u;
     game_over = 0;
@@ -7853,6 +8194,8 @@ static void stress_stage_init(void)
         ebullets[i].flags = 0;
     stress_target = STRESS_STORM_TARGET;
     stress_prev_y = 0xFFu;    /* release the entry chord before changing load */
+    stress_prev_a = 0xFFu;
+    stress_load_hold = 0u;
 
     /* Zero-delay direct to BOSS fight (Task 11) */
     gpu2d_set_colorkey(1, MAGENTA_KEY);
@@ -7860,7 +8203,7 @@ static void stress_stage_init(void)
     stage_banner = 0;          /* no stage intro banner */
     spawn_timer  = 0;          /* start spawning minions immediately */
     wave         = 1;          /* Volcano boss (ART_BOSS) */
-    wave_max     = 9999;       /* Minion quota */
+    campaign_round = CAMPAIGN_ROUNDS;
     kills        = 0;
     stage_bg_active = SB_STAGE_LAVA; /* Volcano stage weather (rising volcanic ash) */
 
@@ -7873,10 +8216,7 @@ static void stress_stage_init(void)
     stress_storm_step = 0;
 
     for (int i = 0; i < MAX_ENEMIES; i++) enemies[i].flags = 0;
-    spawn_enemy(ENEMY_FAIRY, GAME_LEFT + 100, 80);
-    spawn_enemy(ENEMY_TURRET, GAME_LEFT + 260, 110);
-    spawn_enemy(ENEMY_SHARD, GAME_RIGHT - 260, 90);
-    spawn_enemy(ENEMY_MINION, GAME_RIGHT - 100, 120);
+    stress_minions_refill();
 
     /* Boss setup: 0 delay, battle ready at station */
     boss_state   = BOSS_FIGHT; /* ??????????? skip BOSS_DIALOG & BOSS_ENTER straight to BOSS_FIGHT */
@@ -7973,16 +8313,41 @@ static void clear_frame(uint32_t fb)
 
 static void game_update(gamepad_state_t *pad)
 {
-    if (is_stress_stage && pad->btn_y &&
-        (!stress_prev_y || ++stress_load_hold >= 37u)) {
-        stress_load_hold = 0;
-        stress_target = stress_target >= STRESS_STORM_MAX ? STRESS_STORM_TARGET :
-                        stress_target + 128u > STRESS_STORM_MAX ? STRESS_STORM_MAX : stress_target + 128u;
-        hud_sig[HUD_SIG_STRESS] = 0u;
-        bt_drop_peak = 0u;
+    if (is_stress_stage) {
+        if (pad->btn_y) {
+            if (!stress_prev_y || ++stress_load_hold >= 8u) {
+                stress_load_hold = 0;
+                if (stress_target < STRESS_STORM_MAX) {
+                    stress_target = (stress_target + 128u > STRESS_STORM_MAX) ?
+                                    STRESS_STORM_MAX : (stress_target + 128u);
+                    hud_sig[HUD_SIG_STRESS] = 0u;
+                    bt_drop_peak = 0u;
+                }
+            }
+        } else if (pad->btn_a) {
+            if (!stress_prev_a || ++stress_load_hold >= 8u) {
+                stress_load_hold = 0;
+                if (stress_target > STRESS_STORM_TARGET) {
+                    stress_target = (stress_target - 128u < STRESS_STORM_TARGET) ?
+                                    STRESS_STORM_TARGET : (stress_target - 128u);
+                    hud_sig[HUD_SIG_STRESS] = 0u;
+                    bt_drop_peak = 0u;
+                    for (int k = eb_hi - 1; k >= 0 && active_ebullets_count > (int)stress_target; k--) {
+                        if ((ebullets[k].flags & (uint8_t)~EF_GRAZED) == EF_ACTIVE) {
+                            ebullets[k].flags = 0;
+                            if (k < eb_free_hint) eb_free_hint = k;
+                            active_ebullets_count--;
+                            active_count--;
+                        }
+                    }
+                }
+            }
+        } else {
+            stress_load_hold = 0;
+        }
     }
     stress_prev_y = pad->btn_y;
-    if (!pad->btn_y) stress_load_hold = 0;
+    stress_prev_a = pad->btn_a;
 
     /* ---- game over (only when infinite respawn is switched off) -------- */
     if (game_over) {
@@ -8107,6 +8472,8 @@ static void game_update(gamepad_state_t *pad)
     boss_update();
     enemies_update();
     bullets_update();
+    spell_beams_collision();
+    if (is_stress_stage) stress_minions_refill();
     /* Top the storm up AFTER the cull, not before it.  The old order measured
      * the pool at the previous frame's end, spawned up to the target, and only
      * then let bullets_update() retire this frame's leavers, so in steady
@@ -8154,7 +8521,9 @@ static void update_screen_effects(void)
         /* Task 09: Spell Card Declaration red energy pulse */
         uint8_t phase = (uint8_t)((frame_tick * 8u) & 0x7Fu);
         uint8_t pulse = (phase < 64u) ? (phase * 3u) : ((128u - phase) * 3u);
-        gpu2d_set_color_matrix(COLOR_MATRIX_RED_PULSE, (uint8_t)(90u + pulse));
+        uint32_t int_val = 90u + pulse;
+        if (int_val > 255u) int_val = 255u;
+        gpu2d_set_color_matrix(COLOR_MATRIX_RED_PULSE, (uint8_t)int_val);
     } else if (color_matrix_flash_timer > 0) {
         /* Task 03: the envelope.  Rise from the table, then decay by -3.5% a
          * frame.  Age is taken BEFORE the decrement, so age 0 is the frame the
@@ -8403,6 +8772,8 @@ int main(void)
 
     gamepad_init();
     entities_init();
+    gpu2d_asset_copy(MM_STAGE_RLE, 16384u);
+    asset_unpack_boot();
     sprites_build();
     /* Merged sprite tiles: each of these folds what used to be two or three
      * commands per object into one.  They need the asset bank (sprites_build)

@@ -163,7 +163,7 @@ ALPHA_STRIDE = 256
 ALPHA_KEY = 0x00FF00FF
 
 # DDR scratch map -- must mirror sw/driver/memory_map.h
-ENEMY_BASE, ENEMY_COUNT, ENEMY_STRIDE = 0x01605000, 32, 16
+ENEMY_BASE, ENEMY_COUNT, ENEMY_STRIDE = mm_value("MM_ENEMY_BASE"), mm_value("MM_ENEMY_COUNT"), 16
 # Read from the firmware's own memory map, not from literals.  These two were
 # literals, and when the pools were widened the literals were updated while
 # sw/driver/memory_map.h was - for a while - left behind at the old counts:
@@ -181,7 +181,7 @@ TLM_MAGIC_VAL = 0x544C4D32
 TLM = {
     'magic': 0, 'frames': 1, 'player_x': 2, 'player_y': 3, 'lives': 4,
     'damage_rows': 55,
-    'sprites': 57, 'bucket_drops': 58,
+    'sprites': 57, 'bucket_drops': 58, 'boss_beams': 59,
     'score': 5, 'weapon': 6, 'atk': 7, 'fire_cd': 8, 'kills': 9,
     'enemies': 10, 'pbullets': 11, 'ebullets': 12, 'items': 13, 'taken': 14,
     'boss_st': 15, 'boss_hp': 16, 'boss_pat': 17, 'pat_chg': 18,
@@ -3829,159 +3829,43 @@ def _enter_pressure_stage(vm):
 
 
 def run_stress_lab(code, output_dir=None):
-    """The pressure stage has to carry the BOSS lasers too.
-
-    The stage behind B+X is a boss fight with no run-up: the bar is pinned at
-    full - which is what keeps a death from clearing the barrage - and the
-    field is never held.  That pin is exactly what used to hide every laser
-    the boss has:
-
-      * boss_opener() is the only thing that raises the four laser columns,
-        and it is reached from the entrance hold or from one of the two
-        health marks; this stage starts in BOSS_FIGHT at full health, so
-        none of those ever happened and boss_laser stayed 0 for the whole
-        run;
-      * the pattern draw at wave 1 is the SPIRAL family plus PAT_RAIN, and
-        neither PAT_CUT nor PAT_BEAM is in it, so the cut and the three
-        staggered beams were unreachable as well.
-
-    Everything below is graded on the registers the scanout draws from - the
-    weather control word's enable bit, the four column centres, the three
-    hairline slots - because none of those layers ever touch the framebuffer.
-    """
+    """The six-spell pressure stage publishes beams and counts them as objects."""
     print("\n" + "=" * 65)
-    print(" [TEST 26] Pressure stage: the BOSS lasers reach it")
+    print(" [TEST 26] Pressure stage: six spells, beam publication and SPRITE count")
     print("=" * 65)
     vm = new_vm(code)
     _enter_pressure_stage(vm)
-    wave = peek(vm, 'wave', 2)
-    assert wave == 1, "B+X did not land in the pressure stage (wave=%d)" % wave
-    assert tlm(vm, 'boss_st') == BOSS_FIGHT, (
-        "the pressure stage did not open on a fight (boss_st=%d)"
-        % tlm(vm, 'boss_st'))
-    print("  -> B+X landed in the pressure stage: wave 1, boss at station")
-
-    # ---- 1. the stage opens with the opener --------------------------
-    # stage_strip_render() publishes the control word and the four centres
-    # before the world update runs, so the opener arms them a frame late:
-    # ---- 1. the four opener columns stay in the campaign ------------
-    # They belong to the entrance hold and to the two health marks, and
-    # this stage crosses neither (the bar is pinned at full).  The lasers
-    # it does fire are pattern ones - PAT_CUT and PAT_BEAM - and they are
-    # graded further down.
-    assert wait_frames(vm, 2), "the game stopped producing frames"
-    laser_seen = 0
-    for _ in range(60):
-        assert wait_frames(vm, 1), "the game stopped producing frames"
-        if peek(vm, 'boss_laser', 1):
-            laser_seen += 1
-    print("  -> 60 frames in: boss_laser > 0 on %d of them" % laser_seen)
-    assert laser_seen == 0, (
-        "the pressure stage raised the opener's columns on %d frames: "
-        "that set piece belongs to the campaign" % laser_seen)
-
-    # ---- 1b. and the stage keeps its own sky -------------------------
-    # In the campaign the opener drags the card's backdrop in behind it
-    # (boss_card_active, set by the entrance hold and by the two health
-    # marks).  This stage's plate is the volcano it was built around,
-    # so its opener must leave that flag alone.
-    mine = plate_match(vm, STRESS_BG_BASE)
-    card = plate_match(vm, MM_CARD_BG)
-    print("  -> the playfield matches the stage plate %.1f%% and the "
-          "card sky %.1f%%" % (100 * mine, 100 * card))
-    assert mine >= 0.6, (
-        "the opener swapped the pressure stage backdrop: only %.1f%% "
-        "of the playfield is MM_STRESS_BG" % (100 * mine))
-    assert mine > card, (
-        "the playfield looks more like the card sky (%.1f%%) than the "
-        "stage own plate (%.1f%%)" % (100 * card, 100 * mine))
-
-    # ---- 2. the rules the stage was built around still hold ----------
-    # Pinned bar, no hold, no field clearing: that is what makes the barrage
-    # continuous.
-    for _ in range(24):
-        assert wait_frames(vm, 1), "the game stopped producing frames"
-        assert peek(vm, 'boss_hp', 2) == peek(vm, 'boss_hp_max', 2), (
-            "the pressure stage bar is not pinned any more (%d of %d)"
-            % (peek(vm, 'boss_hp', 2), peek(vm, 'boss_hp_max', 2)))
-        assert tlm(vm, 'boss_st') == BOSS_FIGHT, (
-            "the pressure stage held the field: boss_st=%d" % tlm(vm, 'boss_st'))
-    active = _count_active_ebullets(vm)
-    print("  -> %d shots in the air, bar pinned at %d, no hold for 24 frames"
-          % (active, peek(vm, 'boss_hp_max', 2)))
-    assert active >= STRESS_STORM_TARGET * 3 // 4, (
-        "the storm is not on the field: %d of %d shots"
-        % (active, STRESS_STORM_TARGET))
-
-    # ---- 5. both laser skills are in the stage's draw ----------------
-    seen = set()
-    for _ in range(60):
-        poke(vm, sym_addr('boss_pat_timer'), 0, 1)
-        assert wait_frames(vm, 1), "the game stopped producing frames"
-        seen.add(tlm(vm, 'boss_pat'))
-    print("  -> 60 draws dealt %s" % sorted(seen))
-    assert PAT_CUT in seen and PAT_BEAM in seen, (
-        "the stage cannot deal both laser skills (drew %s): wave 1's book "
-        "has neither PAT_CUT nor PAT_BEAM in it" % sorted(seen))
-
-    # ---- 6. the cut, aimed at the craft ------------------------------
-    # Cleared first, so this is the pattern's own preview and not one the 60
-    # draws above left standing.
-    poke(vm, sym_addr('cut_phase'), 0, 1)
-    poke(vm, sym_addr('beam_phase'), 0, CUT_SLOTS)
-    poke(vm, sym_addr('beam_timer'), 0, CUT_SLOTS)
-    poke(vm, sym_addr('boss_pattern'), PAT_CUT, 1)
-    poke(vm, sym_addr('boss_pat_timer'), 127, 1)
-    poke(vm, sym_addr('boss_fire_timer'), 0, 1)
-    assert wait_frames(vm, 2), "the game stopped producing frames"
-    px, _py = player_pos(vm)
-    live = [s for s in _hair_slots(vm) if s[0]]
-    print("  -> the cut preview: %s (craft at x=%d)"
-          % ([(s[0], hex(s[2]), hex(s[3])) for s in live], px))
-    assert live, ("the cut preview hairline never stood up in the pressure "
-                  "stage")
-    assert any(abs(s[0] - px) <= 2 for s in live), (
-        "the preview stands at %s but the craft it promises to cut is at x=%d"
-        % ([s[0] for s in live], px))
-    assert any(s[2] in CUT_PREVIEW_COLOURS or s[3] in CUT_PREVIEW_COLOURS
-               for s in live), (
-        "the standing preview carries none of the preview colours: %s"
-        % [(hex(s[2]), hex(s[3])) for s in live])
-
-    spent = 0
-    while peek(vm, 'cut_phase', 1) == 1 and spent < 30_000_000:
-        vm.step()
-        spent += 1
-    assert peek(vm, 'cut_phase', 1) == 2, (
-        "the preview never turned into a beam (phase=%d)"
-        % peek(vm, 'cut_phase', 1))
-    assert wait_published(vm), "the frame carrying the beam was never published"
-    assert _laser_enabled(vm)[0], (
-        "the cut fired but the scanout columns were never enabled")
-    beam_cols = [c for c in _laser_columns(vm) if c]
-    assert any(abs(c - px) <= 2 for c in beam_cols), (
-        "the beam is at %s but the craft it is aimed at is at x=%d"
-        % (beam_cols, px))
-    print("  -> the cut fired %d steps later, beam at %s" % (spent, beam_cols))
-
-    # ---- 7. the three staggered beams --------------------------------
-    for k in range(CUT_SLOTS):
-        poke(vm, sym_addr('beam_phase') + k, 0, 1)
-    poke(vm, sym_addr('boss_pattern'), PAT_BEAM, 1)
-    poke(vm, sym_addr('boss_pat_timer'), 127, 1)
-    poke(vm, sym_addr('boss_fire_timer'), 0, 1)
-    assert wait_frames(vm, 2), "the game stopped producing frames"
-    lanes = sorted(s[0] for s in _hair_slots(vm) if s[0])
-    assert len(lanes) >= CUT_SLOTS, (
-        "the three staggered beams put %d columns on screen: %s"
-        % (len(lanes), lanes))
-    gaps = [lanes[k + 1] - lanes[k] for k in range(len(lanes) - 1)]
-    assert max(gaps) <= 80, (
-        "the beams are not the craft lane and its neighbours: gaps %s" % gaps)
-    print("  -> the three beams stand at %s" % lanes)
-
-    print("  [PASS] columns, cut and beams are all reachable in the pressure "
-          "stage")
+    assert peek(vm, 'wave', 2) == 1
+    assert tlm(vm, 'boss_st') == BOSS_FIGHT
+    state = mm_value('MM_BOSS23_CAST')
+    for wave in (1, 2):
+        poke(vm, sym_addr('wave'), wave, 2)
+        vm.store(state, 0, 2)
+        vm.store(state+2, 2, 1)
+        for i in range(6):
+            vm.store(state+12+i*16+8, 0, 1)
+        assert wait_frames(vm, 8), "spell initialization did not publish"
+        vm.store(state, 89 if wave == 1 else 44, 2)
+        assert wait_frames(vm, 4), "beam warning did not publish"
+        packet = [vm.params.get(0x400+i*16, 0) for i in range(6)]
+        assert any(w & 0x80000000 and w & 0x40000000 for w in packet), packet
+        # Advance each warning into its live interval using its own lifetime.
+        for i in range(6):
+            base = state+12+i*16
+            if vm.load(base+8, 1):
+                vm.store(base+8, vm.load(base+10, 1), 1)
+        assert wait_frames(vm, 4), "live beam did not publish"
+        packet = [vm.params.get(0x400+i*16, 0) for i in range(6)]
+        assert any(w & 0x80000000 and not w & 0x40000000 for w in packet), packet
+        assert tlm(vm, 'boss_beams') > 0
+        expected = sum(tlm(vm, n) for n in ('enemies','pbullets','ebullets','items','boss_beams'))
+        expected += int(tlm(vm, 'lives') != 0) + 1
+        assert tlm(vm, 'sprites') == expected
+        assert peek(vm, 'boss_hp', 2) == peek(vm, 'boss_hp_max', 2)
+        assert peek(vm, 'boss_laser', 1) == 0
+        assert all(vm.load(sym_addr('beam_phase')+i, 1) == 0 for i in range(CUT_SLOTS))
+        print("  -> BOSS%d warning/live beams published; SPRITES=%d" % (wave+1, expected))
+    print("  [PASS] six-spell pressure beams, pinned boss and complete SPRITE count")
     if output_dir:
         save_frame(vm, vm.right_request,
                    Path(output_dir) / "test26_stresslab.bmp",

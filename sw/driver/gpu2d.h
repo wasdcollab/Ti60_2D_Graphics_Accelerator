@@ -219,6 +219,8 @@ extern uint32_t gpu2d_stalled;
  * DDR traffic, no BitBlt command and no damage-repair rectangle - see
  * rtl/display_engine/2_layer_generators/video_fx_ring.v.  `add` uses the
  * saturated-add path and ignores `alpha`; clear it for a blended ring. */
+#define GPU2D_REG_SPELL_STATUS (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x460u))
+#define GPU2D_REG_SPELL(slot, word) (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x400u + (slot)*16u + (word)*4u))
 #define GPU2D_REG_FX_RING(slot, word) \
     (*(volatile uint32_t *)(GPU2D_BASE_ADDR + 0x200u + \
                             ((uint32_t)(slot) << 4) + ((uint32_t)(word) << 2)))

@@ -85,7 +85,7 @@ def main():
 
     alloc_cases, alloc_steps = 0, 0
     for name, base, hi in (("alloc_pbullet", T.PBULLET_BASE, T.PBULLET_COUNT),
-                           ("alloc_ebullet", T.EBULLET_BASE, T.EBULLET_COUNT - 32)):
+                           ("alloc_ebullet", T.EBULLET_BASE, T.EBULLET_COUNT - 128)):
         off = base - T.SCRATCH_BASE
         for i in range(hi):
             vm.scratch[off + i * 8 + 6] = 1

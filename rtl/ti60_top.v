@@ -844,6 +844,8 @@ module ti60_top #(
     wire [71:0] cfg_hair_mid;
 
     wire [127:0] cfg_fx_a, cfg_fx_b, cfg_fx_c;
+    wire [767:0] cfg_spell_beams;
+    wire cfg_spell_commit,cfg_spell_ack;
 
     wire [27:0] cfg_bucket_base;
     wire [14:0] cfg_btile_addr;
@@ -980,6 +982,9 @@ module ti60_top #(
         .fx_a                   (cfg_fx_a),
         .fx_b                   (cfg_fx_b),
         .fx_c                   (cfg_fx_c),
+        .spell_beams            (cfg_spell_beams),
+        .spell_commit           (cfg_spell_commit),
+        .spell_ack              (cfg_spell_ack),
 
         // Bullet Bucket Table & Tile Store Write Port
         .bucket_base            (cfg_bucket_base),
@@ -1014,7 +1019,7 @@ module ti60_top #(
         .bucket_eb_cand(cfg_bucket_cand),.hb_we(),.hb_val()
     );
 
-    dma_bucket_coprocessor #(.EB_CAPACITY(20480),.BURST_READ_LEN(16),
+    dma_bucket_coprocessor #(.EB_CAPACITY(30720),.BURST_READ_LEN(16),
         .SINGLE_GROUP_REG(0),.TABLE_SLOTS(BUCKET_SLOTS)) u_bucket_coprocessor (
         .clk(core_clk),
         .rst_n(ddr_rstn),
@@ -1311,6 +1316,9 @@ module ti60_top #(
         .fx_a                   (cfg_fx_a),
         .fx_b                   (cfg_fx_b),
         .fx_c                   (cfg_fx_c),
+        .spell_beams            (cfg_spell_beams),
+        .spell_commit           (cfg_spell_commit),
+        .spell_ack              (cfg_spell_ack),
 
         // HUD & FPS Telemetry
         .hud_enable             (~force_hud_disable),

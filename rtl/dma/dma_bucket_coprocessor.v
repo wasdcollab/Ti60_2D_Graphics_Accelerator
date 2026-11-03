@@ -143,7 +143,7 @@ module dma_bucket_coprocessor #(
     localparam [14:0] CAND_CAP          = 15'd512;
     localparam [14:0] FREE_CAP          = EB_CAPACITY - CAND_CAP;
     localparam [27:0] MM_EB_CAND_LIST   = MM_EBULLET_LIST + FREE_CAP * 2;
-    localparam [14:0] EB_FRONT_RUN      = EB_CAPACITY - 32;
+    localparam [14:0] EB_FRONT_RUN      = EB_CAPACITY - 128;
     localparam [14:0] EB_TOTAL_LIMIT    = EB_CAPACITY;
 
     localparam [4:0]  BTILE_SLOT_PBULLET = 5'd16;
@@ -168,7 +168,7 @@ module dma_bucket_coprocessor #(
 
     // Tile bounding rows lookup table
     function [9:0] get_tile_rows;
-        input [4:0] slot;
+        input [5:0] slot;
         begin
             case (slot)
                 5'd0:  get_tile_rows = 10'd647;
@@ -192,6 +192,10 @@ module dma_bucket_coprocessor #(
                 5'd18: get_tile_rows = 10'd832;
                 5'd19, 5'd20, 5'd21, 5'd22, 5'd23, 5'd24, 5'd25, 5'd26:
                     get_tile_rows = 10'd768;
+                6'd29, 6'd30, 6'd31, 6'd32, 6'd33, 6'd34, 6'd35, 6'd36:
+                    get_tile_rows = 10'd832;
+                5'd27: get_tile_rows = 10'd295;
+                5'd28: get_tile_rows = 10'd389;
                 default: get_tile_rows = 10'd0;
             endcase
         end
@@ -316,20 +320,26 @@ module dma_bucket_coprocessor #(
     wire aim_player=!bullet_buf[51] && (bullet_buf[50] || bullet_buf[47:32]==16'd0);
     wire [3:0] direction=aim_index(aim_player ? player_x-position_x : velocity_x,
                                    aim_player ? player_y-position_y : velocity_y);
-    reg [4:0] tile_slot, tile_width;
+    reg [5:0] tile_slot;
+    reg [4:0] tile_width;
     reg signed [17:0] tile_x, tile_y, row_first, row_end;
     reg [9:0] tile_bounds;
     always @* begin
         tile_slot=is_player ? (bullet_buf[49] ? 5'd18 : 5'd16) :
+                  bullet_buf[55] ? (bullet_buf[63] ? 5'd28 : 5'd27) :
                   bullet_buf[51] ? 5'd19+{2'b00,direction[3:1]} :
+                  (bullet_buf[53] || (!bullet_buf[54] && bullet_buf[63:62]==2'b01)) ? 6'd29+{3'b000,direction[3:1]} :
                   bullet_buf[54] ? 5'd17 :
                   bullet_buf[50] ? {1'b0,direction} :
                   bullet_buf[63] ? {1'b0,bullet_buf[62:59]} : {1'b0,direction};
         tile_width=is_player ? (bullet_buf[49] ? 5'd13 : 5'd7) :
+                   bullet_buf[55] ? 5'd16 :
                    bullet_buf[51] ? 5'd24 : bullet_buf[54] ? 5'd16 : 5'd26;
         tile_x=position_x-(is_player ? 18'sd0 :
+                          bullet_buf[55] ? 18'sd8 :
                           bullet_buf[51] ? 18'sd12 : bullet_buf[54] ? 18'sd8 : 18'sd13);
         tile_y=position_y-(is_player ? 18'sd0 :
+                          bullet_buf[55] ? 18'sd8 :
                           bullet_buf[51] ? 18'sd12 : bullet_buf[54] ? 18'sd8 : 18'sd13);
         tile_bounds=get_tile_rows(tile_slot);
         row_first=tile_y+$signed({13'd0,tile_bounds[4:0]});
@@ -339,10 +349,11 @@ module dma_bucket_coprocessor #(
     end
     reg [5:0] tile_row;
     reg [10:0] tile_left;
-    reg [4:0] tile_slot_r, tile_width_r;
+    reg [5:0] tile_slot_r;
+    reg [4:0] tile_width_r;
     reg [2:0] hue_r;
     wire [5:0] packed_row={group_index,3'b000}-tile_row+6'd8;
-    wire [31:0] packed_entry={hue_r,tile_width_r,2'b00,tile_slot_r,packed_row,tile_left};
+    wire [31:0] packed_entry={hue_r,tile_width_r,1'b0,tile_slot_r,packed_row,tile_left};
     wire [COUNT_BITS-1:0] group_count=cur_count[group_index];
     wire cache_write=state==ST_WRITE_GROUPS && group_count<TABLE_SLOTS && group_count[1:0]!=3;
     wire [8:0] cache_waddr=group_index*9'd3+{7'd0,group_count[1:0]};
@@ -473,7 +484,7 @@ module dma_bucket_coprocessor #(
                     state<=ST_MOVE;
                 end
                 ST_MOVE:begin
-                    if(motion_r && !is_player && !orb_tail && bullet_buf[48] && !bullet_buf[51]) begin
+                    if(motion_r && !is_player && !orb_tail && bullet_buf[48] && !(bullet_buf[51] || bullet_buf[53] || bullet_buf[55])) begin
                         moved_x<=position_x+velocity_x;moved_y<=position_y+velocity_y;
                         state<=ST_CHECK;
                     end else begin

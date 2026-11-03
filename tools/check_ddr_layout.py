@@ -39,9 +39,15 @@ ASSETS = ROOT / "sw" / "app" / "visual_assets.c"
 # Surface sizes in bytes.  name -> (size, where the size comes from)
 # ---------------------------------------------------------------------------
 SIZES = {
+    "MM_BOSS23_CAST": (mm.mm_eval("MM_BOSS23_CAST_BYTES"), "BOSS2/3 cast, beams and lightfields"),
+    "MM_ASSET_UNPACK": (mm.mm_eval("MM_ASSET_UNPACK_BYTES"), "lossless boot resource unpack"),
+    "MM_BULLET_AUX": (mm.mm_eval("MM_BULLET_AUX_BYTES"), "per-ember age/freeze/burst"),
+    "MM_BOSS1_CAST": (mm.mm_eval("MM_BOSS1_CAST_BYTES"), "BOSS1 cast state"),
+    "MM_BULLET_FRAC": (mm.mm_eval("MM_BULLET_FRAC_BYTES"), "packed Q4 projectile fractions"),
+    "MM_ENEMY_WORK": (mm.mm_eval("MM_ENEMY_WORK_BYTES"), "live collision pointers"),
     "MM_BGM_PCM": (mm.mm_eval("MM_BGM_CAPACITY"), "CPU-fed PCM store"),
     "MM_ENTITY_BASE":     (650 * 28,         "docstring: 650 entities x 28 B"),
-    "MM_ENEMY_BASE":      (32 * 16,          "32 enemies x 16 B"),
+    "MM_ENEMY_BASE":      (mm.mm_eval("MM_ENEMY_COUNT") * 16, "enemy records"),
     # Read from the macro, not a literal.  A literal here is how a pool that
     # had been left at its OLD count still passed: the address arithmetic was
     # checked against the size this table claimed, so 512*8 of room was

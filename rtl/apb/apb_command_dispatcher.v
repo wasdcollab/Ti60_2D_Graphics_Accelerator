@@ -104,6 +104,9 @@ module apb_command_dispatcher #(
     output wire [127:0] fx_a,
     output wire [127:0] fx_b,
     output wire [127:0] fx_c,
+    output reg [767:0] spell_beams,
+    output reg spell_commit,
+    input wire spell_ack,
 
     // Bullet Bucket Table & Tile Store Write Port
     output reg  [27:0] bucket_base,
@@ -150,6 +153,8 @@ module apb_command_dispatcher #(
     // Impact ring slots (bank 2).  One flat register per word, gathered into
     // the three 128-bit buses the scanout takes: slot 0 in bits [31:0].
     // -------------------------------------------------------------------------
+    (* async_reg = "true" *) reg spell_ack_s1,spell_ack_s2;
+    wire spell_busy=spell_commit!=spell_ack_s2;
     reg [31:0] fx_a0, fx_a1, fx_a2, fx_a3;
     reg [31:0] fx_b0, fx_b1, fx_b2, fx_b3;
     reg [31:0] fx_c0, fx_c1, fx_c2, fx_c3;
@@ -304,6 +309,7 @@ module apb_command_dispatcher #(
             hair_out             <= 72'd0;
             hair_lft             <= 72'd0;
             hair_mid             <= 72'd0;
+            spell_beams <= 768'd0;spell_commit<=0;spell_ack_s1<=0;spell_ack_s2<=0;
             fx_a0 <= 32'd0; fx_a1 <= 32'd0; fx_a2 <= 32'd0; fx_a3 <= 32'd0;
             fx_b0 <= 32'd0; fx_b1 <= 32'd0; fx_b2 <= 32'd0; fx_b3 <= 32'd0;
             fx_c0 <= 32'd0; fx_c1 <= 32'd0; fx_c2 <= 32'd0; fx_c3 <= 32'd0;
@@ -338,6 +344,7 @@ module apb_command_dispatcher #(
             hb_we                <= 1'b0;
             hb_val               <= 8'd0;
         end else begin
+            spell_ack_s1<=spell_ack;spell_ack_s2<=spell_ack_s1;
             btile_we <= 1'b0;
             bpal_we  <= 1'b0;
             audio_event_strobe <= 1'b0;
@@ -417,6 +424,37 @@ module apb_command_dispatcher #(
             if (apb_psel && apb_penable && !apb_pwrite && (apb_paddr == 16'h0058)) begin
                 sw0_latched <= 1'b0;
                 sw2_latched <= 1'b0;
+            end
+
+            // Bank 4: six 128-bit arbitrary-angle spell beam descriptors.
+            if(apb_write && apb_paddr[15:8]==8'd4 && !spell_busy)begin
+                case(apb_paddr[7:0])
+                    8'h00:spell_beams[0+:32]<=apb_pwdata;
+                    8'h04:spell_beams[32+:32]<=apb_pwdata;
+                    8'h08:spell_beams[64+:32]<=apb_pwdata;
+                    8'h0C:spell_beams[96+:32]<=apb_pwdata;
+                    8'h10:spell_beams[128+:32]<=apb_pwdata;
+                    8'h14:spell_beams[160+:32]<=apb_pwdata;
+                    8'h18:spell_beams[192+:32]<=apb_pwdata;
+                    8'h1C:spell_beams[224+:32]<=apb_pwdata;
+                    8'h20:spell_beams[256+:32]<=apb_pwdata;
+                    8'h24:spell_beams[288+:32]<=apb_pwdata;
+                    8'h28:spell_beams[320+:32]<=apb_pwdata;
+                    8'h2C:spell_beams[352+:32]<=apb_pwdata;
+                    8'h30:spell_beams[384+:32]<=apb_pwdata;
+                    8'h34:spell_beams[416+:32]<=apb_pwdata;
+                    8'h38:spell_beams[448+:32]<=apb_pwdata;
+                    8'h3C:spell_beams[480+:32]<=apb_pwdata;
+                    8'h40:spell_beams[512+:32]<=apb_pwdata;
+                    8'h44:spell_beams[544+:32]<=apb_pwdata;
+                    8'h48:spell_beams[576+:32]<=apb_pwdata;
+                    8'h4C:spell_beams[608+:32]<=apb_pwdata;
+                    8'h50:spell_beams[640+:32]<=apb_pwdata;
+                    8'h54:spell_beams[672+:32]<=apb_pwdata;
+                    8'h58:spell_beams[704+:32]<=apb_pwdata;
+                    8'h5C:begin spell_beams[736+:32]<=apb_pwdata;spell_commit<=~spell_commit;end
+                    default:;
+                endcase
             end
 
             // Bank 2: procedural impact ring slots (0x200..0x23F).  Four slots
@@ -589,6 +627,7 @@ module apb_command_dispatcher #(
                 default: apb_prdata = 32'd0;
             endcase
         end
+        if(apb_psel && !apb_pwrite && apb_paddr==16'h0460)apb_prdata={31'd0,spell_busy};
         if (apb_psel && !apb_pwrite && apb_paddr[15:8] == 8'd2) begin
             case (apb_paddr[7:0])
                 8'h00: apb_prdata = fx_a0;

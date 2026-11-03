@@ -1,9 +1,0 @@
-FATAL: tests/tb_bucket_coprocessor_axi.sv:478: fault/drop mismatch fault=1 cycles=4002209 drops=0 expected=0
-       Time: 40022150000  Scope: tb_bucket_coprocessor_axi.run_frame
-board contention test failed
-At D:\Ti60_Recovery_20261024\Ti60_2D_Graphics_Accelerator\tools\sim_bucket_board.ps1:15 char:31
-+     if($LASTEXITCODE -ne 0) { throw 'board contention test failed' }
-+                               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : OperationStopped: (board contention test failed:String) [], RuntimeException
-    + FullyQualifiedErrorId : board contention test failed
- 

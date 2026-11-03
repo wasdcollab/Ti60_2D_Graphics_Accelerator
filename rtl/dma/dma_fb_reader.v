@@ -59,12 +59,9 @@ module dma_fb_reader #(
     // burst size (1024 B) or the left/right base switch lands mid-burst, so
     // the split moves 2560 -> 2048 B (640 -> 512 px) in step with
     // SCAN_HALF_PIXELS in sw/app/main.c.
-    localparam [4:0]  BURSTS_PER_ROW = (H_ACT + 255) / 256; // 1366 -> 6
     localparam [13:0] ROW_STRIDE     = 14'd8192;            // framebuffer row pitch (bytes)
-    localparam [12:0] HALF_OFFSET    = 13'd2048;            // 512 px = 2 bursts of 1024 B
-    localparam [14:0] TOTAL_BURSTS   = BURSTS_PER_ROW * V_ACT;
+    localparam [12:0] HALF_OFFSET    = 13'd2736;            // 684 px = 171 beats = 2736 B (50/50 split)
     localparam [8:0]  WORDS_PER_ROW  = (H_ACT + 3) / 4;                    // 1366 -> 342
-    localparam [8:0]  TAIL_BEATS     = WORDS_PER_ROW - (BURSTS_PER_ROW - 5'd1) * 9'd64; // 1366 -> 22
 
     localparam S_IDLE = 2'd0;
     localparam S_AR   = 2'd1;
@@ -75,8 +72,49 @@ module dma_fb_reader #(
     reg        start_pending;
     reg [27:0] row_addr;
 
-    wire        last_burst    = (burst_in_row == BURSTS_PER_ROW - 5'd1);
-    wire [12:0] next_col      = last_burst ? 13'd0 : (col_off + 13'd1024);
+    // Distinguish between unified full-screen mode (Menu, Game, Stress) where
+    // active_base == right_base, and 50/50 split-screen mode (SCREEN_BITBLT) where
+    // active_base != right_base.
+    // Unified mode uses 6 bursts (5x64 + 1x22) to retain 30% DDR headroom, eliminating
+    // scanout FIFO underflow / menu flicker under BitBlt contention.
+    wire        is_split       = (active_base != right_base);
+    wire [4:0]  bursts_per_row = is_split ? 5'd7 : 5'd6;
+    wire [14:0] total_bursts   = is_split ? (15'd7 * V_ACT[14:0]) : (15'd6 * V_ACT[14:0]);
+    wire        last_burst     = (burst_in_row == bursts_per_row - 5'd1);
+
+    // Burst table for 1366x768 row (342 beats = 5472 B):
+    // Unified 6-burst mode: 64, 64, 64, 64, 64, 22
+    // Split 7-burst mode:
+    //   Left  (active_base): 64, 64, 43 (=171 beats = 2736 B = 684 px)
+    //   Right (right_base):  64, 21, 64, 22 (=171 beats = 2736 B = 684 px, bounded at 4KB)
+    reg [7:0]  cur_arlen;
+    reg [12:0] next_col_comb;
+    always @(*) begin
+        if (!is_split) begin
+            case (burst_in_row)
+                5'd0: begin cur_arlen = 8'd63; next_col_comb = 13'd1024; end
+                5'd1: begin cur_arlen = 8'd63; next_col_comb = 13'd2048; end
+                5'd2: begin cur_arlen = 8'd63; next_col_comb = 13'd3072; end
+                5'd3: begin cur_arlen = 8'd63; next_col_comb = 13'd4096; end
+                5'd4: begin cur_arlen = 8'd63; next_col_comb = 13'd5120; end
+                5'd5: begin cur_arlen = 8'd21; next_col_comb = 13'd0;    end
+                default: begin cur_arlen = 8'd63; next_col_comb = 13'd0; end
+            endcase
+        end else begin
+            case (burst_in_row)
+                5'd0: begin cur_arlen = 8'd63; next_col_comb = 13'd1024; end
+                5'd1: begin cur_arlen = 8'd63; next_col_comb = 13'd2048; end
+                5'd2: begin cur_arlen = 8'd42; next_col_comb = 13'd2736; end // ends at 2736 B
+                5'd3: begin cur_arlen = 8'd63; next_col_comb = 13'd3760; end // 64 beats
+                5'd4: begin cur_arlen = 8'd20; next_col_comb = 13'd4096; end // 21 beats -> 4KB boundary
+                5'd5: begin cur_arlen = 8'd63; next_col_comb = 13'd5120; end // 64 beats
+                5'd6: begin cur_arlen = 8'd21; next_col_comb = 13'd0;    end // 22 beats
+                default: begin cur_arlen = 8'd63; next_col_comb = 13'd0; end
+            endcase
+        end
+    end
+
+    wire [12:0] next_col      = next_col_comb;
     wire [27:0] next_row      = last_burst ? (row_addr + ROW_STRIDE) : row_addr;
 
     assign at_line_start = (burst_in_row == 5'd0) && (col_off == 13'd0);
@@ -150,7 +188,7 @@ module dma_fb_reader #(
                         col_off         <= 13'd0;
                         burst_in_row    <= 5'd0;
                         fb_araddr       <= active_base;
-                        bursts_left     <= TOTAL_BURSTS;
+                        bursts_left     <= total_bursts;
                         discard_frame   <= 1'b0;
                         start_pending   <= 1'b0;
                     end else if (!frame_clear_axi && !discard_frame && cal_done &&
@@ -158,9 +196,7 @@ module dma_fb_reader #(
                                  !bk_act && !(bk_pend && at_line_start)) begin
                         fb_araddr  <= ((col_off >= HALF_OFFSET) ? right_base : active_base)
                                       + row_addr + {15'd0, col_off};
-                        // Freeze the whole request until ARREADY, even if
-                        // frame_clear arrives while a tail burst is stalled.
-                        fb_arlen   <= last_burst ? (TAIL_BEATS[7:0] - 8'd1) : 8'd63;
+                        fb_arlen   <= cur_arlen;
                         fb_arvalid <= 1'b1;
                         state      <= S_AR;
                     end

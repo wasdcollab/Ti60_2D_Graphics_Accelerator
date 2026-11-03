@@ -60,7 +60,7 @@ SCREEN_W = 1366
 SCREEN_H = 768
 SCREEN_STRIDE = 8192       # framebuffer row pitch (bytes)
 SCREEN_PITCH = SCREEN_STRIDE // 4   # ... in pixels
-HALF_PIXELS = 512
+HALF_PIXELS = 684
 FRAME_BASES = (0x00800000, 0x00E00000)
 FRAME_BYTES = SCREEN_H * SCREEN_STRIDE
 # The two framebuffers must not overlap: frame_of() returns the FIRST base whose
@@ -507,6 +507,9 @@ class SapphireSoCVM:
 
         if addr == APB_BASE + 0x13C:
             return 255
+        if addr==APB_BASE+0x460:return 0  # functional model acknowledges immediately
+        if APB_BASE + 0x400 <= addr < APB_BASE + 0x460:
+            return 0  # bank 4 is write-only in hardware
         if APB_BASE + 0x200 <= addr < APB_BASE + 0x240:
             # Procedural impact ring slots (APB bank 2): read back what was
             # written, so a test can check the descriptor the firmware built.
@@ -567,6 +570,9 @@ class SapphireSoCVM:
             return
         if addr == APB_BASE + 0x124:
             self.params[0x124] = val
+            return
+        if APB_BASE + 0x400 <= addr < APB_BASE + 0x460:
+            self.params[addr-APB_BASE]=val
             return
         if APB_BASE + 0x200 <= addr < APB_BASE + 0x240:
             # Procedural impact ring slots (APB bank 2).  The scanout model
@@ -1202,7 +1208,7 @@ class SapphireSoCVM:
 # =============================================================================
 import os as _os
 
-if _os.environ.get("SIM_PURE_PYTHON") or not _os.environ.get("SIM_USE_NATIVE"):
+if _os.environ.get("SIM_PURE_PYTHON") in ("1", "true", "True"):
     # Escape hatch for A/B runs: same scenarios, reference implementation.
     _native = None
     NATIVE = False

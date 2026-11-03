@@ -200,9 +200,9 @@ def main():
                     else:
                         drops += 1
         # Allocators normally maintain these bounds; injection names them
-        # explicitly, including the reserved 32-entry orb tail.
+        # explicitly, including the reserved 128-entry orb tail.
         T.poke(vm, sym["pb_hi"], players)
-        T.poke(vm, sym["eb_hi"], min(enemies, T.EBULLET_COUNT - 32))
+        T.poke(vm, sym["eb_hi"], min(enemies, T.EBULLET_COUNT - 128))
         buf = index & 1
         fb = framebuffers[buf]
         vm.active = vm.request = vm.right_active = vm.right_request = framebuffers[buf ^ 1]

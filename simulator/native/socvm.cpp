@@ -234,8 +234,15 @@ uint32_t SapphireSoCVM::load(uint32_t addr, int size, bool sgn) {
     if (addr == APB_BASE + 0x120) return bucket_status;
     if (addr == APB_BASE + 0x124) return bucket_player_xy;
     if (addr == APB_BASE + 0x128) return bucket_info;
-    if (addr >= APB_BASE && addr < APB_BASE + 0x100)
+    if (addr == APB_BASE + 0x13C) return 255;
+    if (addr == APB_BASE + 0x460) return 0;
+    if (addr >= APB_BASE + 0x400 && addr < APB_BASE + 0x460) return 0;
+    if (addr >= APB_BASE + 0x200 && addr < APB_BASE + 0x240) return params_get(addr - APB_BASE, 0);
+    if (addr >= APB_BASE && addr < APB_BASE + 0x200)
         return params_get(addr - APB_BASE, 0);
+
+    if (addr == 0xF8014004) return 256;
+    if (addr == 0xF8014000) return 255;
 
     if (addr >= UART_BASE && addr < UART_BASE + 0x40)
         return ((addr - UART_BASE) == 0x04) ? (0xFFu << 16) : 0u;
@@ -258,14 +265,14 @@ void SapphireSoCVM::bucket_accel(uint32_t control) {
     if (!(control & 0x80000000u)) return;
     const unsigned buffer = control & 1u;
     const uint32_t table = 0x04800000u + buffer * (96u * 4096u);
-    const unsigned EB_CAP = 20480u, FRONT = EB_CAP - 32u, SLOTS = 1024u;
+    const unsigned EB_CAP = 20480u, FRONT = EB_CAP - 128u, SLOTS = 1024u;
     const uint32_t cand_base = 0x01675400u + EB_CAP * 8u + (EB_CAP - 512u) * 2u;
     unsigned counts[96] = {}, drops = 0, live = 0;
     const bool motion = (control & 0x20000000u) != 0;
     const unsigned eb = std::min((((control >> 16) & 0x1FFFu) | ((control & 0xC000u) >> 1)), FRONT);
     const unsigned pb = std::min((control >> 4) & 1023u, 512u);
     const int px = (int16_t)bucket_player_xy, py = (int16_t)(bucket_player_xy >> 16);
-    const unsigned rows[27] = {647,647,710,742,742,742,710,647,647,647,677,676,676,676,677,647,832,481,832,768,768,768,768,768,768,768,768};
+    const unsigned rows[37] = {647,647,710,742,742,742,710,647,647,647,677,676,676,676,677,647,832,481,832,768,768,768,768,768,768,768,768,295,389,832,832,832,832,832,832,832,832};
     std::vector<unsigned> candidates;
     auto aim = [](int dx, int dy) {
         int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
@@ -280,7 +287,7 @@ void SapphireSoCVM::bucket_accel(uint32_t control) {
         int vx = (int8_t)b[4], vy = (int8_t)b[5];
         unsigned flags = b[6], color = b[7];
         if (!(flags & 1)) return;
-        if (!player && motion && !tail && !(flags & 8)) {
+        if (!player && motion && !tail && !(flags & (8|32|128))) {
             x = (int16_t)(x + vx); y = (int16_t)(y + vy);
             if (x < 182 || x > 1169 || y < 1 || y > 767) {
                 store(address + 6, flags & ~1u, 1);
@@ -292,8 +299,11 @@ void SapphireSoCVM::bucket_accel(uint32_t control) {
         if (!player) ++live;
         int slot, width, row, bx;
         if (player) { slot = flags & 2 ? 18 : 16; width = slot == 18 ? 13 : 7; row = y; bx = x; }
+        else if (flags & 128) { slot = color & 128 ? 28 : 27; width = 16; row = y - 8; bx = x - 8; }
         else if (flags & 8) { slot = 19 + (aim(vx, vy) >> 1); width = 24; row = y - 12; bx = x - 12; }
+        else if (flags & 32) { slot = 29 + (aim(vx, vy) >> 1); width = 26; row = y - 13; bx = x - 13; }
         else if (flags & 64) { slot = 17; width = 16; row = y - 8; bx = x - 8; }
+        else if ((color & 192) == 64) { slot = 29 + ((flags & 4 || !(vx || vy) ? aim(px-x, py-y) : aim(vx, vy)) >> 1); width = 26; row = y - 13; bx = x - 13; }
         else {
             if (flags & 4 || !(vx || vy)) slot = aim(px - x, py - y);
             else if (color & 128) slot = (color >> 3) & 15;
@@ -345,9 +355,12 @@ void SapphireSoCVM::store(uint32_t addr, uint32_t val, int size) {
     if (size != 4)
         throw VMError("only word stores are modelled outside RAM/scratch");
 
+    if (addr == 0xF8014000 || (addr >= 0xF8014008 && addr <= 0xF801402C)) return;
     if (addr == APB_BASE + 0x120) { bucket_accel(val); return; }
     if (addr == APB_BASE + 0x124) { bucket_player_xy = val; return; }
-    if (addr >= APB_BASE && addr < APB_BASE + 0x100) {
+    if (addr >= APB_BASE + 0x400 && addr < APB_BASE + 0x460) { params[py::int_(addr - APB_BASE)] = py::int_(val); return; }
+    if (addr >= APB_BASE + 0x200 && addr < APB_BASE + 0x240) { params[py::int_(addr - APB_BASE)] = py::int_(val); return; }
+    if (addr >= APB_BASE && addr < APB_BASE + 0x200) {
         apb_store(addr - APB_BASE, val);
         return;
     }

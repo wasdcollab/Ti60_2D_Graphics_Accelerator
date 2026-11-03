@@ -68,7 +68,20 @@ module tb_fx_ring;
     // r^2 +- 4r + 4, and slot 0 winning ties.
     integer ref_vis, ref_add, ref_alpha, ref_rgb;
     integer i, dx, dy, d2, ro, ri, a, ro2, ro2p, ri2, ri2m;
-    integer inband, inner;
+    integer inband, inner, level, colour, ch, value, power2, gain, soft_disc;
+
+    function integer energy_scale(input integer value, level);
+        begin
+            case (level)
+                0: energy_scale = value;
+                1: energy_scale = value - value / 4;
+                2: energy_scale = value / 2;
+                3: energy_scale = value / 4;
+                4: energy_scale = value / 8;
+                default: energy_scale = value / 16;
+            endcase
+        end
+    endfunction
 
     task reference(input integer px, py);
         begin
@@ -82,22 +95,46 @@ module tb_fx_ring;
                     ri  = p_b[i*32 + 16 +: 9];
                     a   = p_b[i*32 + 0 +: 8];
                     ro2 = ro*ro;
-                    ro2p = ro2 + 4*ro + 4;
+                    ro2p = (ro + 4) * (ro + 4);
                     ri2 = ri*ri;
-                    ri2m = (ri > 2) ? (ri2 - 4*ri + 4) : 0;
+                    ri2m = (ri > 4) ? (ri - 4) * (ri - 4) : 0;
                     inband = (d2 <= ro2) && (d2 >= ri2);
                     inner  = (ri2 != 0) && (d2 < ri2) && (d2 >= ri2m);
-                    if (!ref_vis && (inband || (d2 <= ro2p) || inner)) begin
+                    soft_disc = p_c[i*32+24] && ri == 0;
+                    if (!ref_vis && ro > 0 && ri <= ro &&
+                        (p_a[i*32 + 30] || a != 0) &&
+                        (!soft_disc || d2 < ro2) &&
+                        d2 <= ro2p && d2 >= ri2m) begin
+                        gain = 256;
+                        if (soft_disc) begin
+                            power2 = 1;
+                            while (power2 * 2 <= ro2) power2 = power2 * 2;
+                            gain = (ro2 - d2) * 256 / power2;
+                            if (gain > 255) gain = 255;
+                            gain = gain + 1;
+                            level = 0;
+                        end else if (inband) level = 0;
+                        else if ((d2 > ro2 && d2 <= (ro+2)*(ro+2)) ||
+                                 (d2 < ri2 && (ri <= 2 || d2 >= (ri-2)*(ri-2)))) level = 2;
+                        else level = 3;
                         ref_vis   = 1;
                         ref_add   = p_a[i*32 + 30];
-                        ref_alpha = inband ? a : (a >> 1);
-                        ref_rgb   = p_c[i*32 + 0 +: 24];
+                        ref_alpha = soft_disc ? (a * gain) / 256 : energy_scale(a, level);
+                        colour = p_c[i*32 + 0 +: 24];
+                        if (ref_add) begin
+                            for (ch = 0; ch < 3; ch = ch + 1) begin
+                                value = (colour >> (ch*8)) & 255;
+                                colour = (colour & ~(255 << (ch*8))) |
+                                         ((soft_disc ? (value * gain) / 256 : energy_scale(value, level)) << (ch*8));
+                            end
+                        end
+                        ref_rgb = colour;
                     end
                 end
             end
-            if (mask_x[31] &&
+            if (px < 181 || px >= 1185 || (mask_x[31] &&
                 px >= mask_x[10:0] && px <= mask_x[21:11] &&
-                py >= mask_y[10:0] && py <= mask_y[21:11]) begin
+                py >= mask_y[10:0] && py <= mask_y[21:11])) begin
                 ref_vis = 0; ref_add = 0; ref_alpha = 0; ref_rgb = 0;
             end
         end
@@ -199,6 +236,34 @@ module tb_fx_ring;
         set_slot(1, 0, 0, 30, 0, 600, 300, 8'hFF, 24'hFFFFFF);
         for (qy = 295; qy < 306; qy = qy + 1)
             for (qx = 595; qx < 606; qx = qx + 1) pixel(qx, qy);
+        blank;
+
+        // Soft ADD orb: continuous intensity from a hot centre to zero at the rim.
+        set_slot(0, 1, 1, 36, 0, 600, 300, 8'hFF, 24'h40C8FF);
+        p_c[24] = 1;
+        for (qy = 258; qy < 343; qy = qy + 1)
+            for (qx = 558; qx < 643; qx = qx + 1) pixel(qx, qy);
+        blank;
+        p_c[24] = 0;
+
+        // A ring's hole must reveal a lower slot, including its bright core.
+        set_slot(0, 1, 0, 40, 34, 600, 300, 8'hC0, 24'hFF8040);
+        set_slot(1, 1, 1, 12, 0, 600, 300, 8'hFF, 24'h4080FF);
+        for (qy = 250; qy < 351; qy = qy + 1)
+            for (qx = 550; qx < 651; qx = qx + 1) pixel(qx, qy);
+        blank;
+        // Fully transparent top slot cannot hide the lower orb.
+        set_slot(0, 1, 0, 40, 0, 600, 300, 8'h00, 24'hFFFFFF);
+        pixel(600, 300); pixel(605, 300); blank;
+        set_slot(1, 0, 0, 0, 0, 0, 0, 0, 0);
+
+        // Largest encoded radius: (511+4)^2 must not wrap at 18 bits.
+        set_slot(0, 1, 0, 511, 505, 600, 300, 8'hFF, 24'h80DFFF);
+        for (qx = 1100; qx < 1118; qx = qx + 1) pixel(qx, 300);
+        blank;
+        // Explicit horizontal clipping at the HUD gutters.
+        set_slot(0, 1, 1, 20, 0, 181, 300, 8'hFF, 24'hFF8040);
+        for (qx = 160; qx < 205; qx = qx + 1) pixel(qx, 300);
         blank;
 
         drain = 1;                     // let the queue empty, then judge

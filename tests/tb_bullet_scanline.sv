@@ -42,7 +42,7 @@ module tb_bullet_scanline;
             for(j=0;j<1024;j=j+1) begin
                 bx=entries[j][10:0]; row=entries[j][16:11]-8+(yy%8);
                 slot=entries[j][23:17]; w=entries[j][28:24]; hue=entries[j][31:29];
-                if (xx>=bx && xx<bx+w && row>=0 && row<26 && slot<27) begin
+                if (xx>=bx && xx<bx+w && row>=0 && row<26 && slot<37) begin
                     index=tiles[base(slot)+row*stride(slot)+xx-bx]&31;
                     if(index!=0) begin valid=1; color=pal[hue*32+index]; end
                 end
@@ -82,7 +82,7 @@ module tb_bullet_scanline;
         // All 1024 entries, all 19 tile kinds/hues, unaligned X, clipping and
         // dense overlaps. The top slot is not special-cased by the oracle.
         for(i=0;i<1024;i=i+1) begin
-            slot=i%27; w=slot<16 ? 26 : slot==16 ? 7 : slot==17 ? 16 : slot==18 ? 13 : 24;
+            slot=i%37; w=slot<16 || slot>=29 ? 26 : slot==16 ? 7 : slot==17 || slot>=27 ? 16 : slot==18 ? 13 : 24;
             bx=(i*37)%1400;
             row=(i*13)%27;
             entries[i]=(i%8<<29)|(w<<24)|(slot<<17)|(row<<11)|bx;
@@ -107,7 +107,7 @@ module tb_bullet_scanline;
             end
         end
         if(errors) $fatal(1,"%0d errors / %0d pixels",errors,checks);
-        $display("PASS scanline: %0d pixels, 1024 overlapping entries, 27 kinds, masks",checks);
+        $display("PASS scanline: %0d pixels, 1024 overlapping entries, 37 kinds, masks",checks);
         $finish;
     end
 endmodule

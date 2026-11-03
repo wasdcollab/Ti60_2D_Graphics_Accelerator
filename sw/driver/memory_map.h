@@ -117,7 +117,7 @@
 #define MM_ENTITY_BASE          0x01600000UL   /* 650 entity records, 28 B each */
 
 /* ---- bullet-hell pools ----------------------------------------------- */
-#define MM_ENEMY_BASE           0x01605000UL   /* 32 x 16 B */
+#define MM_ENEMY_BASE           0x04900000UL   /* 75 x 16 B */
 #define MM_PBULLET_BASE         0x01620000UL   /* 512 x 8 B -> 0x0162_1000, see the layout note above */
 #define MM_EBULLET_BASE         0x01675400UL
 #define MM_EBULLET_ACTIVE_BASE  (MM_EBULLET_BASE + MM_EBULLET_COUNT * 8UL)
@@ -125,15 +125,13 @@
 #define MM_ITEM_BASE            0x01605A00UL   /* 16 x  8 B */
 #define MM_TELEMETRY_BASE       0x01605B00UL   /* MM_TELEMETRY_WORDS x 32-bit */
 
-#define MM_ENEMY_COUNT          32
+#define MM_ENEMY_COUNT          75
 #define MM_PBULLET_COUNT        512
-/* 20480 records. The coprocessor front run is COUNT-32 and the last 32 slots
- * are the orb tail. The stress stage's Y control stops at 20000, inside that
- * front run. The records end at 0x0169D400 and the free/candidate index lists
- * (COUNT * 2 bytes) end at 0x016A7400, still below the font bank at 0x019B0000.
- * APB 0x120 carries this count in 15 bits: [28:16] = count[12:0], [15:14] =
- * count[14:13]. */
-#define MM_EBULLET_COUNT        20480
+/* 30720 records. The coprocessor front run is COUNT-128 and the last 128 slots
+ * are the orb tail. The stress stage's Y/A control steps up to 30000, inside
+ * that front run. APB 0x120 carries this count in 15 bits: [28:16] =
+ * count[12:0], [15:14] = count[14:13]. */
+#define MM_EBULLET_COUNT        30720
 #define MM_ITEM_COUNT           16
 /* 64, not 52: the block starts at 0x0160_5B00 and the next surface starts at
  * 0x0160_5C00, so the twelve words from 0x5BD0 to 0x5C00 were already reserved
@@ -524,12 +522,10 @@
 #define MM_PICK_MASK_BYTES      120UL
 #define MM_RUNTIME_WORK         0x048C6700UL
 #define MM_RUNTIME_WORK_BYTES   320UL
-/* Live lance indices. This used to be MM_EBULLET_COUNT * 2, which filled the
- * gap in front of MM_RUNTIME_WORK exactly when the pool was 10240. Growing
- * that formula with the pool would overwrite the runtime block, so the index
- * is a fixed cap. A lance pattern is a handful of shafts, not the storm. */
-#define MM_LANCE_INDEX          0x048C1600UL
-#define MM_LANCE_INDEX_MAX      1024
+/* CPU-owned special-shot indices: lances, Q4 trajectories and timed lasers.
+ * Kept after the Q4 auxiliary arena; a full index falls back to a pool scan. */
+#define MM_LANCE_INDEX          0x04940000UL
+#define MM_LANCE_INDEX_MAX      4096
 #define MM_LANCE_INDEX_BYTES    (MM_LANCE_INDEX_MAX * 2UL)
 
 #define MM_ORB_TILE             0x033F5000UL
@@ -638,9 +634,24 @@
 #define TLM_P_MAXG     53u   /* worst frame: its engine idle-wait total */
 #define TLM_P_MAXR     54u   /* worst frame: its BitBlt row count       */
 #define TLM_DAMAGE_ROWS 55u   /* damage_restore rows this frame          */
-#define TLM_SPRITES     57u   /* active actors, items and projectiles; no FX */
+#define TLM_SPRITES     57u   /* actors, items, pooled shots and BOSS beams */
 #define TLM_BUCKET_DROPS 58u  /* rejected scanline entries, not whole sprites */
+#define TLM_BOSS_BEAMS   59u  /* warning/live scanout beams, one per descriptor */
 
 #define TLM_MAGIC_VAL 0x544C4D32UL   /* "TLM2" */
+
+#define MM_ENEMY_WORK 0x04901000UL
+#define MM_ENEMY_WORK_BYTES (MM_ENEMY_COUNT * 4UL)
+#define MM_BOSS1_CAST 0x04902000UL
+#define MM_BOSS1_CAST_BYTES 16UL
+#define MM_BULLET_FRAC 0x04944000UL
+#define MM_BULLET_FRAC_BYTES MM_EBULLET_COUNT
+
+#define MM_BOSS23_CAST 0x0490A000UL
+#define MM_BOSS23_CAST_BYTES 0x1000UL
+#define MM_ASSET_UNPACK 0x04910000UL
+#define MM_ASSET_UNPACK_BYTES 0x8000UL
+#define MM_BULLET_AUX 0x04920000UL
+#define MM_BULLET_AUX_BYTES (MM_EBULLET_COUNT * 4UL)
 
 #endif /* MEMORY_MAP_H */

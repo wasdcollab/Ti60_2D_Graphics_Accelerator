@@ -8,6 +8,7 @@
         <efx:top_module name="ti60_top" />
         <efx:design_file name="rtl/ti60_top.v" version="default" library="default" />
         <efx:design_file name="rtl/common/simple_dual_port_ram.v" version="default" library="default" />
+        <efx:design_file name="rtl/common/spell_beam_cdc.v" version="default" library="default" />
         <efx:design_file name="rtl/common/Axi_Mux_Param.vh" version="default" library="default" />
         <efx:design_file name="rtl/common/Axi_Mux.v" version="default" library="default" />
         <efx:design_file name="rtl/common/i2c_gamepad_top.v" version="default" library="default" />
@@ -37,6 +38,7 @@
         <efx:design_file name="rtl/display_engine/2_layer_generators/video_laser.v" version="default" library="default" />
         <efx:design_file name="rtl/display_engine/2_layer_generators/video_beam.v" version="default" library="default" />
   <efx:design_file name="rtl/display_engine/2_layer_generators/video_fx_ring.v" version="default" library="default" />
+        <efx:design_file name="rtl/display_engine/2_layer_generators/video_spell_beams.v" version="default" library="default" />
         <efx:design_file name="rtl/display_engine/2_layer_generators/video_dual_hud.v" version="default" library="default" />
         <efx:design_file name="rtl/display_engine/3_compositor/video_pixel_compositor.v" version="default" library="default" />
         <efx:design_file name="rtl/display_engine/4_post_process/video_bloom_filter.v" version="default" library="default" />
@@ -132,8 +134,9 @@
     <efx:place_and_route tool_name="efx_pnr">
         <efx:param name="work_dir" value="work_pnr" value_type="e_string" />
         <efx:param name="verbose" value="off" value_type="e_bool" />
-        <efx:param name="seed" value="1" value_type="e_integer" />
-        <efx:param name="placer_effort_level" value="2" value_type="e_option" />
+        <efx:param name="seed" value="3" value_type="e_integer" />
+        <efx:param name="optimization_level" value="CONGESTION_2" value_type="e_option" />
+        <efx:param name="placer_effort_level" value="4" value_type="e_option" />
         <efx:param name="max_threads" value="-1" value_type="e_integer" />
         <efx:param name="beneficial_skew" value="on" value_type="e_option" />
         <efx:param name="print_critical_path" value="10" value_type="e_integer" />
